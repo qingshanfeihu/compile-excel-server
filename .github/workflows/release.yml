@@ -12,18 +12,22 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: macos-14          # arm64
+          - os: macos-14
             tag: darwin-arm64
-          - os: macos-13          # x86_64
+            pyarch: arm64
+          - os: macos-14          # arm64 runner 经 Rosetta 跑 x64 Python 出 x86_64 包
             tag: darwin-x86_64
-          - os: ubuntu-22.04      # x86_64
+            pyarch: x64
+          - os: ubuntu-22.04
             tag: linux-x86_64
+            pyarch: x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          architecture: ${{ matrix.pyarch }}
       - name: Build onedir
         run: |
           python -m pip install --upgrade pip
