@@ -41,6 +41,22 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
 
+
+def _resolve_data_dir_from_argv() -> str:
+    """提前解析 --data（argv 扫描）：模块初始化就要读数据目录，
+    不能等 main()；环境变量 CES_DATA_DIR 优先级更高。"""
+    import sys as _sys
+
+    if os.environ.get("CES_DATA_DIR"):
+        return ""
+    argv = _sys.argv[1:]
+    for index, arg in enumerate(argv):
+        if arg == "--data" and index + 1 < len(argv):
+            return argv[index + 1]
+        if arg.startswith("--data="):
+            return arg.split("=", 1)[1]
+    return ""
+
 DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 ACCESS_TTL = int(os.environ.get("CES_ACCESS_TTL", "900"))
 REFRESH_TTL = int(os.environ.get("CES_REFRESH_TTL", str(7 * 24 * 3600)))
@@ -53,7 +69,9 @@ RECEIPT_SCHEMA = "ist.excel.promotion-receipt"
 app = FastAPI(title="compile-excel-server")
 
 # ── 数据目录（部署侧灌入；仓库内 .gitignore 排除）───────────────────────
-DATA_DIR = Path(os.environ.get("CES_DATA_DIR") or DEFAULT_DATA_DIR)
+DATA_DIR = Path(os.environ.get("CES_DATA_DIR")
+                or _resolve_data_dir_from_argv()
+                or DEFAULT_DATA_DIR)
 ARTIFACTS_DIR = DATA_DIR / "artifacts"
 DOCS_DIR = DATA_DIR / "docs"
 META_PATH = DATA_DIR / "artifacts_meta.json"
