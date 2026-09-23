@@ -322,3 +322,45 @@ def test_manifest_requires_auth(server):
     except urllib.error.HTTPError as exc:
         status = exc.code
     assert status == 401
+
+
+def test_ces_entrypoint_without_install(tmp_path):
+    """ces 入口在未安装时应给出明确指引（退出码 2）。"""
+    proc = subprocess.run(
+        [PY, str(REPO_ROOT / "ces_main.py"), "status"],
+        capture_output=True, text=True, timeout=60,
+        env={**os.environ, "CES_CONFIG_ROOT": str(tmp_path)},
+    )
+    assert proc.returncode == 2
+    assert "ces setup" in (proc.stdout + proc.stderr)
+
+
+def test_ces_setup_options_file_end_to_end(tmp_path):
+    """ces setup --options-file 全链路（安装→登记→工件/手册落位，不起服务）。"""
+    art = tmp_path / "tree.xml"
+    art.write_text("<cmdtree/>", encoding="utf-8")
+    docs = tmp_path / "manuals"
+    docs.mkdir()
+    (docs / "m.md").write_text("# 手册\n工件下发", encoding="utf-8")
+    data = tmp_path / "d"
+    options = tmp_path / "opt.json"
+    options.write_text(json.dumps({
+        "data": str(data), "device_build": "CES_E2E", "kms": "127.0.0.1:8443",
+        "port": 8917, "start": False, "force": False,
+        "artifacts": [f"{art}:0.1"], "docs": [str(docs)],
+    }), encoding="utf-8")
+    proc = subprocess.run(
+        [PY, str(REPO_ROOT / "ces_main.py"), "setup", "--options-file", str(options)],
+        capture_output=True, text=True, timeout=180,
+        env={**os.environ, "CES_CONFIG_ROOT": str(tmp_path / "cfg")},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    meta = json.loads((data / "artifacts_meta.json").read_text(encoding="utf-8"))
+    assert meta["device_build"] == "CES_E2E"
+    assert meta["kms_addr"] == "127.0.0.1:8443"
+    assert (data / "artifacts" / "tree.xml").is_file()
+    assert (data / "docs" / "m.md").is_file()
+    install_state = json.loads(
+        (tmp_path / "cfg" / "install.json").read_text(encoding="utf-8"))
+    assert install_state["data"] == str(data)
+    assert install_state["port"] == 8917

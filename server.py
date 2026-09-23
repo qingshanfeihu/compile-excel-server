@@ -159,6 +159,8 @@ def _snapshot_manifest() -> dict[str, Any]:
 
 
 MANIFEST_SNAPSHOT = _snapshot_manifest()
+if META.get("kms_addr"):
+    MANIFEST_SNAPSHOT["kms_addr"] = str(META["kms_addr"])
 
 
 async def _parse_payload(request: Request) -> dict[str, str]:
@@ -206,7 +208,11 @@ def _issue_tokens(username: str, scope: str) -> dict[str, Any]:
 
 @app.get("/healthz")
 async def healthz() -> dict[str, Any]:
-    return {"ok": True, "service": "compile-excel-server", "device_build": DEVICE_BUILD}
+    payload = {"ok": True, "service": "compile-excel-server",
+               "device_build": DEVICE_BUILD}
+    if META.get("kms_addr"):
+        payload["kms_addr"] = str(META["kms_addr"])
+    return payload
 
 
 @app.post("/device_authorize")
