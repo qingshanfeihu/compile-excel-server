@@ -60,8 +60,8 @@ fetch_asset() {  # $1=url $2=输出
     if command -v gh >/dev/null 2>&1; then
         local tag="${CES_VERSION:-}"
         [[ -n "$tag" ]] || tag="v$(resolve_version)"
-        gh release download "${tag#v}" --repo "${CES_REPO}" \
-           --pattern "$(basename "$1")" --output "$2" >/dev/null 2>&1 && return 0
+        gh release download "$tag" --repo "${CES_REPO}" \
+           --pattern "$(basename "$1")" --output "$2" --clobber >/dev/null 2>&1 && return 0
     fi
     return 1
 }
