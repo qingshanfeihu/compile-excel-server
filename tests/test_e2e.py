@@ -198,12 +198,16 @@ def client_env(server, tmp_path):
 
 
 # ── 防泄漏守卫：git 跟踪内容不得出现内部资产指纹 ──────────────────────
-# 标记串运行时拼装（源码只存分片，避免守卫扫到自身）
+# 标记串运行时拼装（源码只存分片，避免守卫扫到自身）。
+# 出现新的内部值（网段/口令/构建名/SHA）时必须同步近这里。
 _INTERNAL_MARKERS = [
     "46aa14df" + "ffbe767ec486dc6b" + "186d582458d666de8a8f6aec2294f920077a45f9",  # 真模板 SHA
     "ca32544f" + "34bbd8662e14320e" + "1cec7ca7892df63a3852a24f496ae2e2eb1fdf6c",  # 契约 SHA
     "Info" + "secOS",   # 内部构建名
     "APV" + "_HG_K",     # 内部构建号段
+    "10.4." + "127.",    # 真实自动化环境网段
+    "clic" + "k1",       # 环境口令
+    "sk-" + "sp-",       # 真实 API key 前缀
 ]
 INTERNAL_MARKERS = [m for m in _INTERNAL_MARKERS if m]
 
