@@ -22,6 +22,7 @@ BIN_DIR="${CES_BIN_DIR:-$HOME/.local/bin}"
 PREFIX="${CES_PREFIX:-$HOME/.local/share/compile-excel-server}"
 DATA_HOME="${CES_DATA_HOME:-$HOME/ces-data}"
 BIN_NAME="ces"
+tmp=""
 
 log()  { printf '[ces-install] %s\n' "$*" >&2; }
 die()  { printf '[ces-install] 错误: %s\n' "$*" >&2; exit 1; }
@@ -74,7 +75,7 @@ install_binary() {
     asset="$(detect_asset)"
     url="https://github.com/${CES_REPO}/releases/download/v${version}/${asset}"
     tmp="$(mktemp -d)"
-    trap 'rm -rf "$tmp"' EXIT
+    trap '[ -n "${tmp:-}" ] && rm -rf "$tmp"' EXIT
 
     log "下载 $url"
     fetch_asset "$url" "$tmp/$asset" || die "下载失败（私有仓需 gh auth login 且账号有仓库权限）"
@@ -82,6 +83,7 @@ install_binary() {
     rm -rf "$PREFIX/current"
     mkdir -p "$PREFIX/current"
     tar -xzf "$tmp/$asset" -C "$PREFIX/current"
+    trap - EXIT; rm -rf "$tmp"; tmp=""
 
     local exe
     if [[ -x "$PREFIX/current/compile-excel-server/compile-excel-server" ]]; then
