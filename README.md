@@ -171,6 +171,10 @@ cexg serve --config ~/.config/cexg/gateway.toml      # systemd 样例见 gateway
 - 规则文件（`projections/domain_grammar.json`）从服务端该构建的 stable 包取并缓存；取不到且没有缓存就拒绝上机。
 - 判据代码 `gateway/vendor/` 由 `tools/sync_gateway_vendor.py` 从 compile-excel-skills 的 `cex_core`
   与 InfoTest 的凭据字面量提取器同步，`--check` 查漂移，不在 vendor 里手改。
+  `gateway/vendor/cex_core/` **不入库**（它带真实模板/契约身份，本仓守零内部资产）：
+  跑网关测试时由 `tests/gateway/conftest.py` 从同级 skills 仓（或 `CEX_SKILLS_ROOT`）现生成；
+  发版时 release 流程用只读令牌检出 skills 仓再生成（仓库 secret `CEX_SKILLS_READ_TOKEN`）。
+  本地打包前手动跑 `python3 tools/sync_gateway_vendor.py --only cex_core --skills-root <skills 检出>`。
 - 测试用假框架目录（真 pytest 跑假 `test_xlsx`、假结果库）与假串口控制台；真跳板机与设备上的验收另做。
 
 ## 环境变量

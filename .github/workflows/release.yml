@@ -36,10 +36,18 @@ jobs:
             --name compile-excel-server --onedir \
             --collect-all uvicorn --collect-all fastapi \
             ces_main.py
+      - name: Check out compile-excel-skills (gateway criteria source; linux only)
+        if: startsWith(matrix.tag, 'linux')
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/compile-excel-skills
+          token: ${{ secrets.CEX_SKILLS_READ_TOKEN }}
+          path: compile-excel-skills
       - name: Build gateway (cexg, jumphost; linux only)
         if: startsWith(matrix.tag, 'linux')
         run: |
           python -m pip install openpyxl
+          python tools/sync_gateway_vendor.py --only cex_core --skills-root compile-excel-skills
           pyinstaller --clean --noconfirm \
             --name cexg --onedir \
             --collect-submodules gateway \

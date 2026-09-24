@@ -1,13 +1,13 @@
 """compile-excel-server 端到端测试（自包含：合成数据，零内部资产）。
 
-覆盖：provision 部署初始化与实例凭据生成、login 设备流（客户端脚本来自
-skill 仓）、fetch SHA 校验与不符即拒、断网明示回退、docs 检索、token 过期
-自动 refresh、错误 token 401、审计日志 HMAC 完整性、以及**防泄漏守卫**
-（git 跟踪内容出现内部资产指纹即失败）。
+覆盖：provision 部署初始化与实例凭据生成、设备流登录、数据包同步的 SHA 校验与不符即拒、
+断网明示回退、docs 检索、token 过期自动 refresh、错误 token 拒绝、审计日志 HMAC 完整性、
+以及**防泄漏守卫**（git 跟踪内容出现内部资产指纹即失败）。客户端是 skills 仓的 `bin/cex_tool`
+（与 skill 在各 harness 里用的是同一套工具）。
 
 跑法（仓库根，带 fastapi 的解释器）：python -m pytest tests/ -v
-env：SKILL_SCRIPTS_DIR 缺省为同级目录 ../compile-excel-skills/skills/compile-excel/scripts；
-找不到客户端脚本时，依赖它们的用例跳过（不算失败）。
+env：CEX_TOOL 缺省为同级目录 ../compile-excel-skills/bin/cex_tool；
+找不到时，依赖它的用例跳过（不算失败）。
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ import hashlib
 import hmac
 import json
 import os
-import re
 import socket
 import stat
 import subprocess
@@ -30,27 +29,15 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-def _default_skill_scripts() -> Path:
-    """skills 仓当前布局 skills/compile-excel/scripts；旧布局 compile-excel/scripts 作回退。"""
-    skills_repo = REPO_ROOT.parent / "compile-excel-skills"
-    for candidate in (skills_repo / "skills" / "compile-excel" / "scripts",
-                      skills_repo / "compile-excel" / "scripts"):
-        if (candidate / "login.py").is_file():
-            return candidate
-    return skills_repo / "skills" / "compile-excel" / "scripts"
-
-
-SKILL_SCRIPTS = Path(os.environ.get("SKILL_SCRIPTS_DIR") or _default_skill_scripts())
+CEX_TOOL = Path(os.environ.get("CEX_TOOL")
+                or REPO_ROOT.parent / "compile-excel-skills" / "bin" / "cex_tool")
 PY = sys.executable
-LOGIN = SKILL_SCRIPTS / "login.py"
-FETCH = SKILL_SCRIPTS / "fetch.py"
-DOCS = SKILL_SCRIPTS / "docs_query.py"
 SAMPLE_BUILD = "SAMPLE_BUILD_LOCAL"
 DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 
-needs_skill_scripts = pytest.mark.skipif(
-    not LOGIN.is_file(),
-    reason=f"找不到 skill 仓客户端脚本 {SKILL_SCRIPTS}（设 SKILL_SCRIPTS_DIR，"
+needs_cex_tool = pytest.mark.skipif(
+    not CEX_TOOL.is_file(),
+    reason=f"找不到 skills 仓客户端 {CEX_TOOL}（设 CEX_TOOL，"
            "或把 compile-excel-skills 放在同级目录）",
 )
 
@@ -163,45 +150,46 @@ def short_ttl_server(data_dir):
 
 
 class ClientEnv:
-    def __init__(self, base: str, tmp: Path):
-        self.env = {
-            **os.environ,
-            "COMPILE_EXCEL_SERVER": base,
-            "COMPILE_EXCEL_CONFIG_DIR": str(tmp / "config"),
-            "COMPILE_EXCEL_CACHE_DIR": str(tmp / "cache"),
-        }
-        self.tmp = tmp
+    """一个项目文件夹 + skills 仓的 cex_tool（子进程，与 harness 里走同一套工具）。"""
 
-    def run(self, script: Path, *args: str) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            [PY, str(script), *args],
+    def __init__(self, base: str, tmp: Path):
+        self.workspace = tmp / "project"
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        self.env = {**os.environ, "CEX_WORKSPACE": str(self.workspace)}
+        self.env.pop("CEX_HOME", None)
+        init = self.tool("cex_init", server=base, device_build=SAMPLE_BUILD)
+        assert init["ok"], init
+
+    def tool(self, name: str, **args) -> dict:
+        proc = subprocess.run(
+            [PY, str(CEX_TOOL), name, json.dumps({"workspace": str(self.workspace), **args})],
             capture_output=True, text=True, env=self.env, timeout=120,
         )
+        assert proc.returncode in (0, 1), proc.stdout + proc.stderr
+        return json.loads(proc.stdout)
 
     def login(self, server: Server, username: str = "tester") -> dict:
-        proc = subprocess.Popen(
-            [PY, str(LOGIN), "--no-browser"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            env=self.env,
-        )
-        user_code = None
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            match = re.search(r"DEVICE_FLOW user_code=(\S+)", line)
-            if match:
-                user_code = match.group(1)
-                break
-        assert user_code, "login.py 未输出设备码"
+        started = self.tool("cex_login_start")
+        assert started["ok"], started
         status, _body = server.post_form(
-            "/activate", {"user_code": user_code, "username": username,
+            "/activate", {"user_code": started["user_code"], "username": username,
                           "access_code": access_code(server.data, username)})
         assert status == 200
-        stdout, stderr = proc.communicate(timeout=60)
-        assert proc.returncode == 0, stdout + stderr
-        return json.loads(stdout.strip().splitlines()[-1])
+        done = self.tool("cex_login_wait", timeout_s=30)
+        assert done["ok"], done
+        return done
+
+    def sync(self) -> dict:
+        return self.tool("cex_sync")
+
+    def docs(self, query: str, limit: int = 3) -> dict:
+        return self.tool("cex_docs_query", q=query, limit=limit)
+
+    def bundle_dir(self) -> Path:
+        return self.workspace / ".compile-excel" / "bundle" / SAMPLE_BUILD
 
     def token_path(self) -> Path:
-        return Path(self.env["COMPILE_EXCEL_CONFIG_DIR"]) / "token"
+        return self.workspace / ".compile-excel" / "token.json"
 
 
 @pytest.fixture()
@@ -256,11 +244,11 @@ def test_provision_generates_instance_credentials(data_dir):
     assert meta["device_build"] == SAMPLE_BUILD  # --sample 覆盖了骨架占位
 
 
-@needs_skill_scripts
+@needs_cex_tool
 def test_audit_log_hmac(data_dir, server, client_env):
     client_env.login(server)
-    client_env.run(FETCH)
-    client_env.run(DOCS, "--q", "manifest sha256")
+    assert client_env.sync()["ok"]
+    assert client_env.docs("manifest sha256")["ok"]
     time.sleep(0.3)
     key = bytes.fromhex((data_dir / "audit_hmac_key").read_text().strip())
     lines = (data_dir / "audit.log").read_text(encoding="utf-8").strip().splitlines()
@@ -277,69 +265,66 @@ def test_audit_log_hmac(data_dir, server, client_env):
         assert secret not in joined
 
 
-# ── 分发闭环（客户端在 skill 仓）─────────────────────────────────────
+# ── 分发闭环（客户端在 skills 仓）────────────────────────────────────
 
-@needs_skill_scripts
-def test_full_loop_login_fetch_docs(client_env, server):
+# 旧 artifacts 目录导成的 legacy-import 包：条目路径是 <kind>/<文件名>
+LEGACY_ENTRIES = {"template/sample_runtime_template.xlsx", "framework/framework_tree.tar.gz",
+                  "cmdtree/cmdtree_sample.xml"}
+
+
+@needs_cex_tool
+def test_full_loop_login_sync_docs(client_env, server):
     result = client_env.login(server, username="e2e-user")
     assert result["ok"] is True
     mode = stat.S_IMODE(os.stat(client_env.token_path()).st_mode)
     assert mode == 0o600
 
-    fetched = client_env.run(FETCH)
-    assert fetched.returncode == 0, fetched.stdout + fetched.stderr
-    payload = json.loads(fetched.stdout)
-    assert payload["source"] == "server"
-    assert payload["device_build"] == SAMPLE_BUILD
-    names = {a["name"] for a in payload["artifacts"]}
-    assert names == {"sample_runtime_template.xlsx", "framework_tree.tar.gz",
-                     "cmdtree_sample.xml"}
-    cache = Path(client_env.env["COMPILE_EXCEL_CACHE_DIR"]) / SAMPLE_BUILD
-    for entry in payload["artifacts"]:
-        data = (cache / entry["name"]).read_bytes()
+    synced = client_env.sync()
+    assert synced["ok"] and synced["source"] == "server", synced
+    assert synced["build"] == SAMPLE_BUILD and synced["downloaded"] == len(LEGACY_ENTRIES)
+    manifest = json.loads((client_env.bundle_dir() / "manifest.json").read_text(encoding="utf-8"))
+    assert {e["path"] for e in manifest["entries"]} == LEGACY_ENTRIES
+    for entry in manifest["entries"]:
+        data = (client_env.bundle_dir() / entry["path"]).read_bytes()
         assert hashlib.sha256(data).hexdigest() == entry["sha256"]
 
-    docs = client_env.run(DOCS, "--q", "device_authorize user_code", "--limit", "2")
-    assert docs.returncode == 0, docs.stdout
-    assert json.loads(docs.stdout)["results"]
+    docs = client_env.docs("device_authorize user_code", limit=2)
+    assert docs["ok"] and docs["results"], docs
 
 
-@needs_skill_scripts
+@needs_cex_tool
 def test_wrong_token_rejected(client_env):
-    config_dir = Path(client_env.env["COMPILE_EXCEL_CONFIG_DIR"])
-    config_dir.mkdir(parents=True, exist_ok=True)
-    token_path = config_dir / "token"
+    token_path = client_env.token_path()
     token_path.write_text(json.dumps({
-        "access_token": "bogus", "refresh_token": "bogus",
-        "expires_at": 0, "server": client_env.env["COMPILE_EXCEL_SERVER"],
+        "access_token": "bogus", "refresh_token": "bogus", "expires_at": 0,
+        "server": json.loads((client_env.workspace / ".compile-excel" / "config.json")
+                             .read_text(encoding="utf-8"))["server"],
     }), encoding="utf-8")
     os.chmod(token_path, 0o600)
-    assert client_env.run(FETCH).returncode != 0
-    assert client_env.run(DOCS, "--q", "x").returncode != 0
+    assert client_env.sync()["ok"] is False
+    assert client_env.docs("x")["ok"] is False
 
 
-@needs_skill_scripts
+@needs_cex_tool
 def test_sha_mismatch_rejected(client_env, server, data_dir):
     client_env.login(server)
-    first = client_env.run(FETCH)
-    assert first.returncode == 0, first.stdout
-    build = SAMPLE_BUILD
-    cache = Path(client_env.env["COMPILE_EXCEL_CACHE_DIR"]) / build
-    good = (cache / "framework_tree.tar.gz").read_bytes()
+    first = client_env.sync()
+    assert first["ok"], first
+    target = client_env.bundle_dir() / "framework" / "framework_tree.tar.gz"
+    manifest = json.loads((client_env.bundle_dir() / "manifest.json").read_text(encoding="utf-8"))
+    sha = next(e["sha256"] for e in manifest["entries"] if e["path"] == "framework/framework_tree.tar.gz")
+    target.unlink()  # 本地缺了这一件，下次同步必须重新下载
 
     # 下载发的是注册表里的不可变 blob：演练篡改 blob 本身，客户端必须按清单 SHA 拒收
-    sha = next(a["sha256"] for a in json.loads(first.stdout)["artifacts"]
-               if a["name"] == "framework_tree.tar.gz")
     blob = data_dir / "registry" / "blobs" / "sha256" / sha[:2] / sha
     original = blob.read_bytes()
     os.chmod(blob, 0o644)
     try:
         blob.write_bytes(original + b"\x00tamper")
-        second = client_env.run(FETCH)
-        assert second.returncode != 0
-        assert "SHA256" in second.stdout
-        assert (cache / "framework_tree.tar.gz").read_bytes() == good
-        assert not list(cache.glob("*.part"))
+        second = client_env.sync()
+        assert second["ok"] is False and "SHA256" in second["error"], second
+        assert not target.exists()
+        assert not list(target.parent.glob("*.part"))
     finally:
         blob.write_bytes(original)
         os.chmod(blob, 0o444)
@@ -366,30 +351,28 @@ def test_live_artifact_edits_do_not_leak_into_downloads(server, data_dir):
         live.write_bytes(original)
 
 
-@needs_skill_scripts
+@needs_cex_tool
 def test_offline_fallback_explicit(client_env, server):
     client_env.login(server)
-    assert client_env.run(FETCH).returncode == 0
+    assert client_env.sync()["source"] == "server"
     server.stop()
-    second = client_env.run(FETCH)
-    assert second.returncode == 0, second.stdout + second.stderr
-    payload = json.loads(second.stdout)
-    assert payload["source"] == "cache"
-    assert "缓存" in payload["note"]
-    assert client_env.run(DOCS, "--q", "x").returncode != 0
+    second = client_env.sync()
+    assert second["ok"] and second["source"] == "cache", second
+    assert "cached bundle" in second["note"]
+    assert client_env.docs("x")["ok"] is False
 
 
-@needs_skill_scripts
+@needs_cex_tool
 def test_token_expiry_auto_refresh(short_ttl_server, tmp_path):
     env = ClientEnv(short_ttl_server.base, tmp_path)
     env.login(short_ttl_server)
     old = json.loads(env.token_path().read_text(encoding="utf-8"))
     time.sleep(2.5)
-    fetched = env.run(FETCH)
-    assert fetched.returncode == 0, fetched.stdout + fetched.stderr
+    assert env.sync()["ok"]
     new = json.loads(env.token_path().read_text(encoding="utf-8"))
     assert new["access_token"] != old["access_token"]
-    assert env.run(DOCS, "--q", "token").returncode == 0
+    assert new["refresh_token"] != old["refresh_token"]
+    assert env.docs("token")["ok"]
 
 
 def test_manifest_requires_auth(server):

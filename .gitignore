@@ -8,3 +8,6 @@ __pycache__/
 dist/
 build/
 *.spec
+
+# 网关判据代码由 tools/sync_gateway_vendor.py 从 compile-excel-skills 生成（带内部模板身份，不入库）
+gateway/vendor/cex_core/
