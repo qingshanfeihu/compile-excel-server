@@ -9,6 +9,12 @@
   start|stop|restart|log   进程管理（pidfile + healthz）
   service install|remove|print   注册 systemd/launchd 服务
   uninstall [--purge]        停止并移除安装（--purge 连数据一起删）
+  users add|list|disable|enable|reset-code|scopes   用户与访问码（只存哈希）
+  clients add|list|remove    服务客户端（网关 introspect、发布导入器）
+  tokens revoke|purge        按用户/客户端撤销令牌、清理过期令牌
+  config show|set|unset|import-env   组织下发给客户端的地址常量
+
+管理命令默认作用于安装登记里的数据目录，可用 --data <目录> 指定。
 
 打包形态（PyInstaller onedir）与源码形态行为一致：serve/start 用
 sys.executable 自引用，不依赖用户 Python 环境。
@@ -334,6 +340,186 @@ def cmd_serve(data: str, port: int, host: str) -> None:
     uvicorn.run(server.app, host=host, port=port, log_level="warning")
 
 
+# ── 身份与客户端配置（直接读写数据目录里的 auth.db / client_config.json）──
+def _admin_args(rest: list[str]) -> tuple[Path, list[str]]:
+    """剥出 --data；没给就用安装登记里的数据目录。"""
+    data = ""
+    remaining: list[str] = []
+    index = 0
+    while index < len(rest):
+        arg = rest[index]
+        if arg == "--data" and index + 1 < len(rest):
+            data = rest[index + 1]
+            index += 2
+            continue
+        if arg.startswith("--data="):
+            data = arg.split("=", 1)[1]
+        else:
+            remaining.append(arg)
+        index += 1
+    if not data:
+        data = load_install()["data"]
+    path = Path(data).expanduser().resolve()
+    if not path.is_dir():
+        print(f"数据目录不存在: {path}（先 ces setup）")
+        raise SystemExit(2)
+    return path, remaining
+
+
+def _pop_option(args: list[str], name: str) -> str | None:
+    if name in args:
+        index = args.index(name)
+        if index + 1 >= len(args):
+            print(f"{name} 缺少取值")
+            raise SystemExit(64)
+        value = args[index + 1]
+        del args[index:index + 2]
+        return value
+    return None
+
+
+def _emit_secret(label: str, value: str, out: str | None) -> None:
+    """一次性凭据：给 --out 就写 0600 文件，否则只在这里显示一次。"""
+    if out:
+        target = Path(out).expanduser()
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(value + "\n")
+        os.chmod(target, 0o600)
+        print(f"{label}已写入 {target}（0600），交给本人后删除该文件")
+        return
+    print(f"{label}（只显示这一次，库里只存哈希）: {value}")
+
+
+def cmd_users(rest: list[str]) -> int:
+    from auth_store import DEFAULT_USER_SCOPES, SCOPES, AuthError, AuthStore
+
+    data, args = _admin_args(rest)
+    store = AuthStore(data / "auth.db")
+    action = args[0] if args else ""
+    try:
+        if action == "add" and len(args) >= 2:
+            scopes = _pop_option(args, "--scopes")
+            out = _pop_option(args, "--out")
+            code = store.add_user(args[1], scopes.split() if scopes is not None else None)
+            _emit_secret(f"用户 {args[1]} 的访问码", code, out)
+            return 0
+        if action == "list":
+            for user in store.list_users():
+                state = "停用" if user["disabled"] else "启用"
+                print(f"{user['username']:<24} {state}  {user['scopes']}")
+            return 0
+        if action in ("disable", "enable") and len(args) >= 2:
+            store.set_user_disabled(args[1], action == "disable")
+            print(f"已{'停用（并撤销其全部令牌）' if action == 'disable' else '启用'}: {args[1]}")
+            return 0
+        if action == "reset-code" and len(args) >= 2:
+            out = _pop_option(args, "--out")
+            code = store.reset_code(args[1])
+            _emit_secret(f"用户 {args[1]} 的新访问码（旧令牌已撤销）", code, out)
+            return 0
+        if action == "scopes" and len(args) >= 3:
+            granted = store.set_user_scopes(args[1], args[2].split())
+            print(f"已更新 {args[1]} 的 scope（旧令牌已撤销）: {' '.join(granted)}")
+            return 0
+    except AuthError as exc:
+        print(str(exc))
+        return 1
+    print("用法: ces users add <名> [--scopes \"a b\"] [--out 文件] | list | disable <名> | "
+          "enable <名> | reset-code <名> [--out 文件] | scopes <名> \"a b\"")
+    print(f"默认 scope: {' '.join(DEFAULT_USER_SCOPES)}")
+    print("全部 scope: " + ", ".join(f"{k}（{v}）" for k, v in SCOPES.items()))
+    return 64
+
+
+def cmd_clients(rest: list[str]) -> int:
+    from auth_store import AuthError, AuthStore
+
+    data, args = _admin_args(rest)
+    store = AuthStore(data / "auth.db")
+    action = args[0] if args else ""
+    try:
+        if action == "add" and len(args) >= 2:
+            scopes = _pop_option(args, "--scopes")
+            out = _pop_option(args, "--out")
+            if not scopes:
+                print("服务客户端必须显式给 --scopes（例：网关用 \"introspect\"）")
+                return 64
+            secret = store.add_client(args[1], scopes.split())
+            _emit_secret(f"客户端 {args[1]} 的 client secret", secret, out)
+            return 0
+        if action == "list":
+            for client in store.list_clients():
+                print(f"{client['client_id']:<24} {client['scopes']}")
+            return 0
+        if action == "remove" and len(args) >= 2:
+            store.remove_client(args[1])
+            print(f"已删除客户端并撤销其令牌: {args[1]}")
+            return 0
+    except AuthError as exc:
+        print(str(exc))
+        return 1
+    print("用法: ces clients add <id> --scopes \"introspect\" [--out 文件] | list | remove <id>")
+    return 64
+
+
+def cmd_tokens(rest: list[str]) -> int:
+    from auth_store import AuthStore
+
+    data, args = _admin_args(rest)
+    store = AuthStore(data / "auth.db")
+    action = args[0] if args else ""
+    if action == "revoke":
+        user = _pop_option(args, "--user")
+        client = _pop_option(args, "--client")
+        if bool(user) == bool(client):
+            print("用法: ces tokens revoke --user <名> | --client <id>")
+            return 64
+        kind, subject = ("user", user) if user else ("client", client)
+        count = store.revoke_subject(kind, subject)
+        print(f"已撤销 {subject} 的 {count} 个令牌")
+        return 0
+    if action == "purge":
+        print(f"已清理 {store.purge_expired()} 个过期超过一天的令牌记录")
+        return 0
+    print("用法: ces tokens revoke --user <名> | --client <id> | purge")
+    return 64
+
+
+def cmd_config(rest: list[str]) -> int:
+    import client_config
+
+    data, args = _admin_args(rest)
+    action = args[0] if args else ""
+    try:
+        if action == "show":
+            print(json.dumps(client_config.document(data), ensure_ascii=False, indent=1))
+            return 0
+        if action == "set" and len(args) == 3:
+            client_config.set_key(data, args[1], args[2])
+            print(f"已设置 {args[1]}")
+            return 0
+        if action == "unset" and len(args) == 2:
+            removed = client_config.unset_key(data, args[1])
+            print(f"{'已删除' if removed else '本来就没有'} {args[1]}")
+            return 0
+        if action == "import-env" and len(args) == 2:
+            imported, skipped = client_config.import_env(data, Path(args[1]).expanduser())
+            for line in imported:
+                print(f"导入 {line}")
+            for line in skipped:
+                print(f"跳过 {line}")
+            if not imported and not skipped:
+                print("没有可导入的地址（只导入门户与缺陷系统地址，账号口令不导入）")
+            return 0
+    except client_config.ConfigError as exc:
+        print(str(exc))
+        return 1
+    print("用法: ces config show | set <键> <地址> | unset <键> | import-env <KEY=value 文件>")
+    print("可用键: " + ", ".join(f"{k}（{v}）" for k, v in client_config.KEYS.items()))
+    return 64
+
+
 # ── 菜单 ─────────────────────────────────────────────────
 def menu() -> None:
     while True:
@@ -401,6 +587,14 @@ def main() -> int:
         cmd_uninstall("--purge" in rest)
     elif command == "setup":
         cmd_setup(rest)
+    elif command == "users":
+        return cmd_users(rest)
+    elif command == "clients":
+        return cmd_clients(rest)
+    elif command == "tokens":
+        return cmd_tokens(rest)
+    elif command == "config":
+        return cmd_config(rest)
     else:
         print(__doc__)
         return 64

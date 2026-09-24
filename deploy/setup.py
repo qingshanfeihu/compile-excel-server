@@ -618,6 +618,8 @@ def run_install(options: dict, interactive: bool = False) -> None:
         encoding="utf-8")
     launcher = "ces" if getattr(sys, "frozen", False) else f"python {REPO_ROOT / 'ces_main.py'}"
     print(f"管理：{launcher}（无参数进菜单；status/start/stop/log/service 子命令）")
+    print(f"建账号：{launcher} users add <用户名>（访问码只显示一次，交给本人；"
+          "授权页填用户名 + 访问码）")
     print(f"客户端接入：export COMPILE_EXCEL_SERVER={client_url(host, port)}"
           "  → login.py → fetch.py")
     if probe_host(host) == "127.0.0.1" and host not in ("0.0.0.0", "::"):

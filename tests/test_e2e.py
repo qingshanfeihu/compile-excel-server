@@ -54,17 +54,45 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-@pytest.fixture(scope="module")
-def data_dir(tmp_path_factory):
-    """provision --sample：部署初始化 + 合成工件/手册 + 实例审计密钥。"""
-    target = tmp_path_factory.mktemp("ces_data")
+# 私有模拟后端：测试账号由 `ces users add` 建，访问码写到 0600 文件再读回
+ACCESS_CODES: dict[str, str] = {}
+
+
+def add_user(data: Path, username: str, scopes: str | None = None) -> str:
+    out = data.parent / f"{data.name}.{username}.code"
+    argv = [PY, str(REPO_ROOT / "ces_main.py"), "users", "add", username,
+            "--data", str(data), "--out", str(out)]
+    if scopes is not None:
+        argv += ["--scopes", scopes]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    code = out.read_text(encoding="utf-8").strip()
+    assert code not in proc.stdout, "--out 时访问码不应再出现在终端输出里"
+    out.unlink()
+    ACCESS_CODES[f"{data}:{username}"] = code
+    return code
+
+
+def access_code(data: Path, username: str) -> str:
+    return ACCESS_CODES[f"{data}:{username}"]
+
+
+def provision_sample(target: Path) -> Path:
     proc = subprocess.run(
         [PY, str(REPO_ROOT / "deploy" / "provision.py"),
          "--data", str(target), "--sample"],
         capture_output=True, text=True, timeout=60,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    for username in ("tester", "e2e-user"):
+        add_user(target, username)
     return target
+
+
+@pytest.fixture(scope="module")
+def data_dir(tmp_path_factory):
+    """provision --sample：部署初始化 + 合成工件/手册 + 实例审计密钥 + 测试账号。"""
+    return provision_sample(tmp_path_factory.mktemp("ces_data"))
 
 
 class Server:
@@ -158,7 +186,8 @@ class ClientEnv:
                 break
         assert user_code, "login.py 未输出设备码"
         status, _body = server.post_form(
-            "/activate", {"user_code": user_code, "username": username})
+            "/activate", {"user_code": user_code, "username": username,
+                          "access_code": access_code(server.data, username)})
         assert status == 200
         stdout, stderr = proc.communicate(timeout=60)
         assert proc.returncode == 0, stdout + stderr
@@ -235,6 +264,10 @@ def test_audit_log_hmac(data_dir, server, client_env):
         assert hmac.new(key, body.encode("utf-8"), hashlib.sha256).hexdigest() == mac
     joined = "\n".join(lines)
     assert "access_token" not in joined and "refresh_token" not in joined
+    token = json.loads(client_env.token_path().read_text(encoding="utf-8"))
+    for secret in (token["access_token"], token["refresh_token"],
+                   access_code(data_dir, "tester")):
+        assert secret not in joined
 
 
 # ── 分发闭环（客户端在 skill 仓）─────────────────────────────────────
@@ -395,7 +428,8 @@ def _http_token(server: "Server") -> str:
         "/device_authorize", {"client_id": "e2e", "scope": "artifacts:read docs:query"})
     assert status == 200
     status, _ = server.post_form(
-        "/activate", {"user_code": flow["user_code"], "username": "tester"})
+        "/activate", {"user_code": flow["user_code"], "username": "tester",
+                      "access_code": access_code(server.data, "tester")})
     assert status == 200
     status, tokens = server.post_form(
         "/token", {"grant_type": DEVICE_GRANT, "device_code": flow["device_code"]})
@@ -415,12 +449,7 @@ def _docs_query(server: "Server", token: str, query: str) -> list[dict]:
 
 def test_docs_are_indexed_recursively_and_symlinks_stay_inside(tmp_path):
     """setup 按子目录拷贝手册；检索必须覆盖子目录，且不能经软链读到数据目录外。"""
-    data = tmp_path / "d"
-    proc = subprocess.run(
-        [PY, str(REPO_ROOT / "deploy" / "provision.py"), "--data", str(data), "--sample"],
-        capture_output=True, text=True, timeout=60,
-    )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    data = provision_sample(tmp_path / "d")
     nested = data / "docs" / "cli" / "10.5"
     nested.mkdir(parents=True)
     (nested / "cli_cn.md").write_text("# 子目录手册\nzzsubdirtoken", encoding="utf-8")
