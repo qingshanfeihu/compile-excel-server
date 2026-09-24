@@ -6,7 +6,7 @@ skill 仓）、fetch SHA 校验与不符即拒、断网明示回退、docs 检�
 （git 跟踪内容出现内部资产指纹即失败）。
 
 跑法（仓库根，带 fastapi 的解释器）：python -m pytest tests/ -v
-env：SKILL_SCRIPTS_DIR 缺省为同级目录 ../compile-excel-skills/compile-excel/scripts；
+env：SKILL_SCRIPTS_DIR 缺省为同级目录 ../compile-excel-skills/skills/compile-excel/scripts；
 找不到客户端脚本时，依赖它们的用例跳过（不算失败）。
 """
 
@@ -30,10 +30,17 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SKILL_SCRIPTS = Path(
-    os.environ.get("SKILL_SCRIPTS_DIR")
-    or (REPO_ROOT.parent / "compile-excel-skills" / "compile-excel" / "scripts")
-)
+def _default_skill_scripts() -> Path:
+    """skills 仓当前布局 skills/compile-excel/scripts；旧布局 compile-excel/scripts 作回退。"""
+    skills_repo = REPO_ROOT.parent / "compile-excel-skills"
+    for candidate in (skills_repo / "skills" / "compile-excel" / "scripts",
+                      skills_repo / "compile-excel" / "scripts"):
+        if (candidate / "login.py").is_file():
+            return candidate
+    return skills_repo / "skills" / "compile-excel" / "scripts"
+
+
+SKILL_SCRIPTS = Path(os.environ.get("SKILL_SCRIPTS_DIR") or _default_skill_scripts())
 PY = sys.executable
 LOGIN = SKILL_SCRIPTS / "login.py"
 FETCH = SKILL_SCRIPTS / "fetch.py"
