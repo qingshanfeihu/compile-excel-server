@@ -1,0 +1,187 @@
+# CSS 选择器配置（每次 HTML 改版只需更新这里；extractor 代码保持稳定）
+# v1.5.1：新增 resolution / product / reported_* / resolved_* / related_case_ids /
+# related_story_ids / related_task_ids / related_bug_ids / activated_count / priority 字段
+# ---------------------------------------------------------------------------
+
+bugzilla:
+  version: "v3"
+  root: "body"
+
+  ticket_id:
+    - "h1#bz_pagetitle"
+    - "title"
+    - "#bz_comp_id"
+  title:
+    - "span#short_desc_nonedit_display"
+    - "input#short_desc"
+  product:
+    - "td#field_container_product"
+    - "select#product option[selected]"
+  module:   # Bugzilla component
+    - "td#field_container_component"
+    - "select#component option[selected]"
+  severity:
+    - "td#field_container_bug_severity"
+    - "select#bug_severity option[selected]"
+  priority:
+    - "td#field_container_priority"
+    - "select#priority option[selected]"
+  status:
+    - "span#static_bug_status"
+    - "td#field_container_bug_status"
+    - "select#bug_status option[selected]"
+  resolution:
+    - "span#static_resolution"
+    - "td#field_container_resolution"
+    - "select#resolution option[selected]"
+
+  # 时间 / 人员
+  reported_by:
+    - "span#bz_reporter_name a"
+    - "span#bz_reporter_name"
+    - "td#field_container_reporter"
+  reported_at:
+    - "span.bz_comment_time:first-of-type"
+    - "td#bz_show_bug_creation_time"
+    - "td#field_container_creation_ts"
+  resolved_by:
+    - "td#field_container_assigned_to"
+    - "span#bz_assignee_name"
+  resolved_at:
+    - "td#field_container_delta_ts"
+    - "td#field_container_cf_resolved_ts"
+
+  description:
+    - "div#cf_description"
+    - "pre.bz_comment_text:first-of-type"
+  steps_to_reproduce:
+    - "div#cf_steps_to_reproduce"
+  description_comments:
+    - "pre.bz_comment_text"
+  fix_summary:
+    - "pre.bz_comment_text.bz_fix"
+  fix_summary_keywords:
+    - "fixed in"
+    - "fix:"
+    - "修复"
+    - "fix summary"
+    - "fixed details"
+    - "fix details"
+    - "修复方案"
+    - "修复详情"
+    - "root cause"
+    - "根本原因"
+    - "affected release"
+    - "testing suggestions"
+    - "测试建议"
+
+  affected_versions:
+    - "select#version option[selected]"
+  fixed_versions:
+    - "select#target_milestone option[selected]"
+    - "input#target_milestone"
+  fixed_commit:
+    - "span.bz_commit_hash"
+
+  related_bug_ids:
+    - "td#field_container_dependson a"
+    - "td#field_container_blocked a"
+    - "td.bz_bug_list a"
+
+  attachments:
+    - "table#attachment_table td.attach_title a"
+
+zentao:
+  version: "v2"
+  root: "#mainContent, body"
+
+  ticket_id:
+    - "h2.text-center"
+    - "div.detail-title h2"
+    - "#title"
+    - "title"
+  # 禅道字段表：<table class="table-data"> <tr><th>字段名</th><td>值</td></tr>
+  th_labels:
+    title:
+      - "Bug标题"
+      - "标题"
+      - "Bug 标题"
+      - "主题"
+    product:
+      - "所属产品"
+      - "产品"
+    module:
+      - "所属模块"
+      - "模块"
+      - "产品模块"
+    severity:
+      - "严重程度"
+      - "严重性"
+    priority:
+      - "优先级"
+    status:
+      - "Bug状态"
+      - "状态"
+    resolution:
+      - "解决方案"
+      - "解决结果"
+    description:
+      - "Bug描述"
+      - "描述"
+      - "问题描述"
+    steps_to_reproduce:
+      - "重现步骤"
+      - "复现步骤"
+      - "操作步骤"
+    fix_summary:
+      - "解决备注"
+      - "解决说明"
+      - "修复方案"
+    affected_versions:
+      - "影响版本"
+      - "发现版本"
+      - "所属版本"
+    fixed_versions:
+      - "解决版本"
+      - "修复版本"
+    fixed_commit:
+      - "关联代码"
+      - "相关代码"
+    reported_by:
+      - "由谁创建"
+      - "创建者"
+      - "提交者"
+    reported_at:
+      - "创建时间"
+      - "创建日期"
+    resolved_by:
+      - "由谁解决"
+      - "解决者"
+    resolved_at:
+      - "解决时间"
+      - "解决日期"
+    related_story:
+      - "相关需求"
+      - "相关Story"
+      - "关联需求"
+    related_case_ids:
+      - "相关用例"
+      - "关联用例"
+      - "测试用例"
+    related_task_ids:
+      - "相关任务"
+    related_bug_ids:
+      - "相关Bug"
+      - "重复Bug"
+      - "关联Bug"
+    activated_count:
+      - "激活次数"
+      - "重开次数"
+
+  description_blocks:
+    - "div.main-col div.article-content"
+    - "div.bug-content"
+  attachments:
+    - ".files-list a"
+    - "ul.file-list a"
+    - ".attachment a"

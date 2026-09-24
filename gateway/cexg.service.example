@@ -1,0 +1,16 @@
+# systemd 单元样例：以框架用户（例如 test）身份运行网关。复制到 /etc/systemd/system/cexg.service，
+# 按实际路径改 ExecStart 与 User，然后 systemctl daemon-reload && systemctl enable --now cexg。
+[Unit]
+Description=compile-excel jumphost gateway (cexg)
+After=network.target
+
+[Service]
+User=test
+ExecStart=/home/test/.local/share/cexg/current/cexg serve --config /home/test/.config/cexg/gateway.toml
+Restart=on-failure
+RestartSec=3
+# 网关要用串口与框架目录，不需要别的系统权限
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

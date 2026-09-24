@@ -68,6 +68,7 @@ ces users add alice   # 建账号；访问码只显示一次（或 --out 文件 
 | 实例凭据（审计签名密钥） | 部署时由 provision 生成 |
 | 账号、服务客户端、令牌 | 数据目录 `auth.db`（SQLite，访问码/secret 存 PBKDF2 哈希，令牌存 SHA-256） |
 | OAuth 客户端 | skill 仓（compile-excel-skills）的一部分 |
+| 跳板机网关 | 本仓库 `gateway/`（发布为独立的 `cexg-linux-x86_64.tar.gz`） |
 
 `tests/test_e2e.py::test_no_internal_assets_in_repo` 是防泄漏守卫：git 跟踪
 内容一旦出现内部资产指纹（真实模板/契约 SHA、内部构建名）即测试失败。
@@ -143,6 +144,34 @@ ces clients add publisher --scopes "bundles:publish bundles:read" --out ~/.confi
 - spec：先跑 InfoTest 自己的 spec 同步，同步失败就拒绝；代龄只记录在包的 `source` 里。
 - 命令树只发投影 JSON，不发原始 XML（原始 XML 带参数默认值，含凭据默认值）。
 - `--dry-run` 只做解析与校验。内容没变时重跑是空操作，适合每天由 cron 跑一次。
+
+## 跳板机网关（cexg，`gateway/`）
+
+装在跳板机上，以框架用户身份运行，把"上机"变成几个带鉴权的 MCP 工具（streamable HTTP，`POST /mcp`）。
+跳板机与设备口令只在这里（读框架 conf）；客户端文件夹里只有 OAuth 令牌。
+
+```bash
+cexg sample-config > ~/.config/cexg/gateway.toml     # 按跳板机实际情况填写
+ces clients add gateway --scopes "introspect bundles:read" --out ~/.config/cexg/client.secret   # 在服务端执行
+cexg check --config ~/.config/cexg/gateway.toml      # 配置与框架自检（不碰设备）
+cexg serve --config ~/.config/cexg/gateway.toml      # systemd 样例见 gateway/cexg.service.example
+```
+
+| 工具 | scope | 说明 |
+|---|---|---|
+| `lease_acquire` / `lease_heartbeat` / `lease_release` / `lease_status` | `jumphost:run` | 单床租约，带 fencing token；碰设备的工具都要带当前租约 |
+| `env_prepare` | `jumphost:run` | 框架文件、conf、设备可达、设备自述构建与网关构建一致、规则与凭据字面量可用 |
+| `case_submit` | `jumphost:run` | 冻结工作簿 → 上机前闸（zip/体积、Excel 契约、自毁命令、框架凭据字面量）→ 只读落位、sha 对账 → 起跑 |
+| `case_status` / `case_results` | `jumphost:run` | 状态；结果来自框架结果库，早于投递时间的日志标 stale；输出经脱敏 |
+| `probe_show` | `jumphost:run` | 单条 show/get，只读 |
+| `init_device` | `jumphost:admin` | 串口重置，两步：`prepare` 给出计划与一次性确认码，`confirm` 带码执行；每步核对配置模式提示符 |
+
+- 互斥：`<state>/bed.lock` 用 `flock`，锁随 pytest 进程组继承，进程结束内核自动释放；不写 pid、不删锁文件。
+- 设备初始化的命令全部来自 `gateway.toml` 的 `init_device.commands`，代码里不写设备命令。
+- 规则文件（`projections/domain_grammar.json`）从服务端该构建的 stable 包取并缓存；取不到且没有缓存就拒绝上机。
+- 判据代码 `gateway/vendor/` 由 `tools/sync_gateway_vendor.py` 从 compile-excel-skills 的 `cex_core`
+  与 InfoTest 的凭据字面量提取器同步，`--check` 查漂移，不在 vendor 里手改。
+- 测试用假框架目录（真 pytest 跑假 `test_xlsx`、假结果库）与假串口控制台；真跳板机与设备上的验收另做。
 
 ## 环境变量
 

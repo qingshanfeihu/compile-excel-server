@@ -1,0 +1,55 @@
+# cexg 网关配置样例。复制成 gateway.toml 后按跳板机实际情况填写；路径一律写绝对路径。
+# 网关不读任何 environment 文件：迁移表里“跳板机本机路径”那一组都在这里。
+
+[server]
+# compile-excel-server 地址；网关用自己的客户端身份做令牌内省、取数据包里的规则文件
+url = "https://ces.example.test"
+client_id = "gateway"
+# ces clients add gateway --scopes "introspect bundles:read" --out <这个文件>；权限必须 0600
+client_secret_file = "/home/test/.config/cexg/client.secret"
+# 这张床对应的执行构建名（数据包按它发布；env_prepare 核对设备自述版本与它一致）
+build = "SAMPLE_BUILD_LOCAL"
+
+[listen]
+host = "127.0.0.1"
+port = 8910
+# 监听非回环地址必须配 TLS；受信任的实验网可设 insecure_lan = true
+tls_cert = ""
+tls_key = ""
+insecure_lan = false
+
+[framework]
+apv_src = "/home/test/apv_src"
+py38 = "/home/test/apv_src/.python3.8/bin/python"
+# conf 名必填（<apv_src>/conf/<名>），不再按网卡地址推导
+conf_name = "bed.conf"
+staging_parent = "/home/test/apv_src/smoke_test/sdns"
+default_module = "sdns"
+run_max_s = 2400
+
+[state]
+dir = "/home/test/.local/state/cexg"
+lease_ttl_s = 1800
+
+[results]
+# 给了口令文件（0600）就直连 MySQL；不给就借框架自己的 lib.mysqldb.Result_DB
+mysql_password_file = ""
+mysql_user = "root"
+mysql_db = "smoke_test"
+
+[device]
+console_command = ["cu", "-s", "9600", "-l", "{tty}"]
+tty_name = "ttyS{idx}"
+max_devices = 3
+
+[init_device]
+# 串口重置时逐条下发的命令，每条都要等到配置模式提示符。占位符：{idx} {port1} {port2} {port3}
+# （端口名取自框架 conf 的 [comm] ports）。按本实验室的地址规划填写；留空则 init_device 不可用。
+commands = [
+  # "no page",
+  # "clear config all",
+  # "ip add {port1} 192.0.2.7{idx} 24",
+]
+long_commands = { }        # 例：{ "clear config all" = 60 }，单条命令的超时（秒）
+step_timeout_s = 5
+login_timeout_s = 10

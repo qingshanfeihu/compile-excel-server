@@ -36,10 +36,23 @@ jobs:
             --name compile-excel-server --onedir \
             --collect-all uvicorn --collect-all fastapi \
             ces_main.py
+      - name: Build gateway (cexg, jumphost; linux only)
+        if: startsWith(matrix.tag, 'linux')
+        run: |
+          python -m pip install openpyxl
+          pyinstaller --clean --noconfirm \
+            --name cexg --onedir \
+            --collect-submodules gateway \
+            --add-data "gateway/agent/jumphost_agent.py:gateway/agent" \
+            --add-data "gateway/gateway.example.toml:gateway" \
+            gateway/cexg.py
+          tar -czf "cexg-${{ matrix.tag }}.tar.gz" -C dist cexg
       - name: Package
         run: |
           tar -czf "compile-excel-server-${{ matrix.tag }}.tar.gz" \
             -C dist compile-excel-server
       - uses: softprops/action-gh-release@v2
         with:
-          files: compile-excel-server-*.tar.gz
+          files: |
+            compile-excel-server-*.tar.gz
+            cexg-*.tar.gz
