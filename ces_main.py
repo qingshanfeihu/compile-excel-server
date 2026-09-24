@@ -13,6 +13,7 @@
   clients add|list|remove    服务客户端（网关 introspect、发布导入器）
   tokens revoke|purge        按用户/客户端撤销令牌、清理过期令牌
   config show|set|unset|import-env   组织下发给客户端的地址常量
+  registry list|show|import-dir|promote|verify|gc   数据包注册表
 
 管理命令默认作用于安装登记里的数据目录，可用 --data <目录> 指定。
 
@@ -520,6 +521,84 @@ def cmd_config(rest: list[str]) -> int:
     return 64
 
 
+def cmd_registry(rest: list[str]) -> int:
+    import mimetypes
+
+    from registry import CHANNELS, KINDS, Registry, RegistryError
+
+    data, args = _admin_args(rest)
+    reg = Registry(data / "registry")
+    action = args[0] if args else ""
+    try:
+        if action == "list":
+            for build in reg.list_builds():
+                channels = ", ".join(f"{name}={info['bundle_id'][:12]}"
+                                     for name, info in sorted(build["channels"].items()))
+                print(f"{build['build']:<40} 包 {build['bundles']} 个  {channels or '（无通道）'}")
+            return 0
+        if action == "show" and len(args) >= 2:
+            channel = _pop_option(args, "--channel") or "stable"
+            bundle_id = reg.channel_bundle(args[1], channel)
+            manifest = reg.bundle_manifest(bundle_id) if bundle_id else None
+            if manifest is None:
+                print(f"{args[1]} 的 {channel} 通道没有包")
+                return 1
+            print(json.dumps({k: v for k, v in manifest.items() if k != "entries"},
+                             ensure_ascii=False, indent=1))
+            for entry in manifest["entries"]:
+                print(f"  {entry['kind']:<12} {entry['sha256'][:12]} {entry['bytes']:>10}  "
+                      f"{entry['path']}")
+            return 0
+        if action == "import-dir" and len(args) >= 4:
+            build, kind, directory = args[1], args[2], Path(args[3]).expanduser()
+            if kind not in KINDS or not directory.is_dir():
+                print(f"用法: ces registry import-dir <build> <{'|'.join(KINDS)}> <目录>")
+                return 64
+            entries = []
+            for path in sorted(directory.rglob("*")):
+                if path.is_symlink() or not path.is_file():
+                    continue
+                rel = path.relative_to(directory).as_posix()
+                media = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+                blob = reg.put_blob_file(path, media)
+                entries.append({"kind": kind, "path": f"{kind}/{rel}",
+                                "sha256": blob["sha256"], "media_type": media, "meta": {}})
+            base = reg.channel_bundle(build, "candidate")
+            if base:
+                # 在 candidate 基础上替换这一类，其余类原样保留
+                old = reg.bundle_manifest(base)
+                entries += [{k: e[k] for k in ("kind", "path", "sha256", "media_type", "meta")}
+                            for e in old["entries"] if e["kind"] != kind]
+            result = reg.submit_bundle(build, entries, publisher="ces-cli",
+                                       source={"importer": "ces registry import-dir"})
+            print(json.dumps(result, ensure_ascii=False, indent=1))
+            return 0
+        if action == "promote" and len(args) >= 3:
+            channel = _pop_option(args, "--channel") or "stable"
+            if channel not in CHANNELS:
+                print(f"通道只能是 {', '.join(CHANNELS)}")
+                return 64
+            reg.set_channel(args[1], channel, args[2], "ces-cli")
+            print(f"{args[1]} 的 {channel} 已指向 {args[2]}")
+            return 0
+        if action == "verify":
+            problems = reg.verify_all()
+            for line in problems:
+                print(line)
+            print("全部 blob 完好" if not problems else f"{len(problems)} 个 blob 有问题")
+            return 0 if not problems else 1
+        if action == "gc":
+            print(f"已删除 {reg.gc()} 个没有包引用的 blob")
+            return 0
+    except RegistryError as exc:
+        print(str(exc))
+        return 1
+    print("用法: ces registry list | show <build> [--channel c] | "
+          "import-dir <build> <kind> <目录> | promote <build> <bundle_id> [--channel c] | "
+          "verify | gc")
+    return 64
+
+
 # ── 菜单 ─────────────────────────────────────────────────
 def menu() -> None:
     while True:
@@ -595,6 +674,8 @@ def main() -> int:
         return cmd_tokens(rest)
     elif command == "config":
         return cmd_config(rest)
+    elif command == "registry":
+        return cmd_registry(rest)
     else:
         print(__doc__)
         return 64

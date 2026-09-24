@@ -1,8 +1,9 @@
 # compile-excel-server
 
 **身份 / 知识库 / 编译数据分发平台**：OAuth2 设备授权流（私有模拟后端，令牌只存哈希、可撤销、按 scope
-逐路由校验）+ 令牌内省（给跳板机网关）+ 组织下发的客户端常量 + 按构建（device_build）的
-工件清单与鉴权下载（xlsx / xml / tar.gz…，逐件 SHA256）+ 知识库关键词检索。
+逐路由校验）+ 令牌内省（给跳板机网关）+ 组织下发的客户端常量 + 按构建发布的编译数据包
+（blob 按内容寻址、candidate/stable 双通道、服务端自检）+ 旧版工件清单与下载（由 stable 包派生）
++ 知识库关键词检索。
 单一 `ces` 入口：配置向导（断点续填）、安装部署、管理菜单、系统服务。
 
 ## 一键安装（与 circle 同款形态：Release 自包含二进制，不依赖本机 Python）
@@ -54,6 +55,7 @@ ces users add alice   # 建账号；访问码只显示一次（或 --out 文件 
 | `clients add <id> --scopes "…" [--out F]` / `list` / `remove` | 服务客户端：网关（`introspect`）、发布导入器（`bundles:publish`） |
 | `tokens revoke --user <名>\|--client <id>` / `purge` | 撤销令牌、清理过期记录 |
 | `config show\|set <键> <地址>\|unset <键>\|import-env <文件>` | 下发给客户端的门户/缺陷系统/网关地址 |
+| `registry list\|show <build>\|import-dir <build> <kind> <目录>\|promote <build> <bundle_id>\|verify\|gc` | 数据包注册表：查看、手工导入一类数据、切通道、全量复核 blob、回收无引用 blob |
 
 管理命令默认作用于安装登记里的数据目录，也可以加 `--data <目录>`。
 
@@ -79,6 +81,8 @@ ces users add alice   # 建账号；访问码只显示一次（或 --out 文件 
 <data>/audit_hmac_key        # provision 生成的审计签名密钥
 <data>/auth.db               # 账号、服务客户端、令牌（只存哈希，0600）
 <data>/client_config.json    # 下发给客户端的地址常量（ces config 管理）
+<data>/registry/registry.db  # 数据包注册表（构建、包、条目、通道）
+<data>/registry/blobs/sha256/<前2位>/<sha>   # 按内容寻址的只读 blob
 <data>/audit.log  server.log  server.pid  install.options.json
 ```
 
@@ -109,6 +113,37 @@ ces users add alice   # 建账号；访问码只显示一次（或 --out 文件 
 `/v1/config/client` 只下发非机密地址；键名像凭据、URL 带账号口令的一律拒收，
 个人门户账号不保存（客户端扫码登录）。
 
+## 数据包与发布
+
+每个构建（`build`，用路径安全的 execution build）有一串数据包；包由条目组成，条目是
+`kind`（cmdtree / manual / spec / projections / template / framework / footprints）+
+相对路径 + blob SHA-256。`bundle_id` 是规范化条目清单的哈希，内容没变就是同一个包。
+
+- 新包进 `candidate`；服务端自检（blob 齐全、落盘内容复核、必备 kind 齐全）通过后才能切 `stable`。
+- 客户端读 `GET /v1/builds/{b}/bundle`（默认 stable）再逐个 `GET /v1/blobs/{sha}`，按清单 SHA 校验。
+- 旧版 `/v1/artifacts/*` 由该构建 stable 包里带 `legacy_name` 的条目派生；启动时 `artifacts/`
+  目录会被登记成一个包（`legacy-import`），但不会覆盖导入器发布的 stable。下载发的是登记时的
+  不可变 blob，运行中改 `artifacts/` 不影响已登记的内容，重启后才会重新登记。
+
+### 过渡期发布通道：`tools/import_infotest.py`
+
+在跑过 InfoTest 批入口（收敛链）的工作站上，用 InfoTest 的 venv 运行：
+
+```bash
+ces clients add publisher --scopes "bundles:publish bundles:read" --out ~/.config/ces-publisher.secret
+<InfoTest venv>/bin/python tools/import_infotest.py --infotest-root <InfoTest 仓根> \
+    --device-build "<show version 的完整版本>" --server https://<服务端> \
+    --client-secret-file ~/.config/ces-publisher.secret --promote
+```
+
+- 只调 InfoTest 自己的解析与校验函数，不调任何会写文件、部署跳板机、上设备的收敛函数。
+- 闸：InfoTest 编译预检里与数据有关的各项 + 逐类校验（Excel 晋升回执、命令树活动代际与投影
+  时新性、手册 catalog、footprint 回填收据、框架镜像身份、投影绑定）。任何一项不过就退出码 3，
+  逐项列出原因和 InfoTest 里修复它的入口。
+- spec：先跑 InfoTest 自己的 spec 同步，同步失败就拒绝；代龄只记录在包的 `source` 里。
+- 命令树只发投影 JSON，不发原始 XML（原始 XML 带参数默认值，含凭据默认值）。
+- `--dry-run` 只做解析与校验。内容没变时重跑是空操作，适合每天由 cron 跑一次。
+
 ## 环境变量
 
 | 变量 | 缺省 | 说明 |
@@ -119,6 +154,7 @@ ces users add alice   # 建账号；访问码只显示一次（或 --out 文件 
 | `CES_REFRESH_TTL` | 7d | refresh token 有效期（秒） |
 | `CES_DEVICE_TTL` | 600 | 设备码有效期（秒） |
 | `CES_AUTH_BACKEND` | `private-mock` | 认证后端 |
+| `CES_MAX_BLOB_BYTES` | 2 GiB | 单个 blob 上传上限 |
 | `CES_CONFIG_ROOT` | 平台惯例目录 | 安装登记/向导草稿位置（测试用） |
 
 ## 测试

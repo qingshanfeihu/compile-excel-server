@@ -320,17 +320,43 @@ def test_sha_mismatch_rejected(client_env, server, data_dir):
     cache = Path(client_env.env["COMPILE_EXCEL_CACHE_DIR"]) / build
     good = (cache / "framework_tree.tar.gz").read_bytes()
 
-    artifact = data_dir / "artifacts" / "framework_tree.tar.gz"
-    original = artifact.read_bytes()
+    # 下载发的是注册表里的不可变 blob：演练篡改 blob 本身，客户端必须按清单 SHA 拒收
+    sha = next(a["sha256"] for a in json.loads(first.stdout)["artifacts"]
+               if a["name"] == "framework_tree.tar.gz")
+    blob = data_dir / "registry" / "blobs" / "sha256" / sha[:2] / sha
+    original = blob.read_bytes()
+    os.chmod(blob, 0o644)
     try:
-        artifact.write_bytes(original + b"\x00tamper")
+        blob.write_bytes(original + b"\x00tamper")
         second = client_env.run(FETCH)
         assert second.returncode != 0
         assert "SHA256" in second.stdout
         assert (cache / "framework_tree.tar.gz").read_bytes() == good
         assert not list(cache.glob("*.part"))
     finally:
-        artifact.write_bytes(original)
+        blob.write_bytes(original)
+        os.chmod(blob, 0o444)
+
+
+def test_live_artifact_edits_do_not_leak_into_downloads(server, data_dir):
+    """旧版下载发的是登记时的 blob：运行中改 artifacts 目录，下载内容仍与清单一致。"""
+    token = _http_token(server)
+    headers = {"Authorization": f"Bearer {token}"}
+    with urllib.request.urlopen(urllib.request.Request(
+            server.base + "/v1/artifacts/manifest", headers=headers), timeout=10) as resp:
+        manifest = json.loads(resp.read())
+    entry = next(a for a in manifest["artifacts"] if a["name"] == "cmdtree_sample.xml")
+    live = data_dir / "artifacts" / "cmdtree_sample.xml"
+    original = live.read_bytes()
+    try:
+        live.write_bytes(original + b"<!-- edited while running -->")
+        with urllib.request.urlopen(urllib.request.Request(
+                server.base + "/v1/artifacts/cmdtree_sample.xml", headers=headers),
+                timeout=10) as resp:
+            body = resp.read()
+        assert hashlib.sha256(body).hexdigest() == entry["sha256"]
+    finally:
+        live.write_bytes(original)
 
 
 @needs_skill_scripts

@@ -16,8 +16,14 @@
   POST /v1/introspect              令牌内省（RFC 7662；服务客户端 Basic 认证，需 introspect）
   GET  /v1/whoami                  当前令牌的主体与 scope
   GET  /v1/config/client           组织下发的客户端常量（config:read）
-  GET  /v1/artifacts/manifest      工件清单（artifacts:read）
-  GET  /v1/artifacts/{name}        工件下载（artifacts:read；审计不记 token）
+  GET  /v1/builds                  构建列表与各通道指针（bundles:read）
+  GET  /v1/builds/{b}/bundle       数据包清单（?channel=stable|candidate 或 ?bundle_id=）
+  GET  /v1/blobs/{sha}             按内容寻址下载（bundles:read）
+  PUT  /v1/blobs/{sha}             上传 blob，服务端重算哈希（bundles:publish）
+  POST /v1/bundles                 登记数据包并进 candidate（bundles:publish）
+  POST /v1/builds/{b}/channels/{c} 切通道；自检没过的包进不了 stable（bundles:publish）
+  GET  /v1/artifacts/manifest      旧版工件清单：由该构建 stable 包派生（artifacts:read）
+  GET  /v1/artifacts/{name}        旧版工件下载：发不可变 blob（artifacts:read）
   POST /v1/docs/query              知识库关键词检索（docs:query）
   GET  /healthz                    探活
 
@@ -47,6 +53,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 import auth_backends
 import client_config
 from auth_store import SCOPES, AuthStore
+from registry import CHANNELS, Registry, RegistryError, valid_build, valid_sha
 
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -73,6 +80,8 @@ DEVICE_TTL = int(os.environ.get("CES_DEVICE_TTL", "600"))
 POLL_INTERVAL = int(os.environ.get("CES_POLL_INTERVAL", "1"))
 MAX_PENDING_FLOWS = 1000
 DEFAULT_REQUEST_SCOPE = "artifacts:read docs:query"
+MAX_BLOB_BYTES = int(os.environ.get("CES_MAX_BLOB_BYTES", str(2 << 30)))
+MAX_MANIFEST_BYTES = 16 << 20
 
 MANIFEST_SCHEMA = "ist.excel.artifact-manifest"
 RECEIPT_SCHEMA = "ist.excel.promotion-receipt"
@@ -96,8 +105,8 @@ def _load_meta(meta_path: Path) -> dict[str, Any]:
 def _init_data(data_dir: Path) -> None:
     """按数据目录装载全部状态；模块导入时调用一次，`--data` 覆盖时再调用一次。"""
     global DATA_DIR, ARTIFACTS_DIR, DOCS_DIR, META_PATH, AUDIT_PATH, AUDIT_KEY_PATH
-    global META, DEVICE_BUILD, ARTIFACT_META, MANIFEST_SNAPSHOT, DOCS
-    global AUTH_STORE, AUTH_BACKEND
+    global META, DEVICE_BUILD, ARTIFACT_META, DOCS
+    global AUTH_STORE, AUTH_BACKEND, REGISTRY
     DATA_DIR = Path(data_dir)
     ARTIFACTS_DIR = DATA_DIR / "artifacts"
     DOCS_DIR = DATA_DIR / "docs"
@@ -107,10 +116,10 @@ def _init_data(data_dir: Path) -> None:
     META = _load_meta(META_PATH)
     DEVICE_BUILD = str(META["device_build"])
     ARTIFACT_META = dict(META.get("artifacts") or {})
-    MANIFEST_SNAPSHOT = _snapshot_manifest()
-    if META.get("kms_addr"):
-        MANIFEST_SNAPSHOT["kms_addr"] = str(META["kms_addr"])
     DOCS = _load_docs()
+    REGISTRY = Registry(DATA_DIR / "registry")
+    # 旧 artifacts 目录登记成该构建的包；之后旧接口只从包里读，下载发的是不可变 blob
+    REGISTRY.import_legacy_dir(DEVICE_BUILD, ARTIFACTS_DIR, ARTIFACT_META)
     AUTH_STORE = AuthStore(DATA_DIR / "auth.db")
     AUTH_BACKEND = auth_backends.make_backend(
         os.environ.get("CES_AUTH_BACKEND", ""), AUTH_STORE)
@@ -142,38 +151,6 @@ def _audit(event: str, **fields: Any) -> None:
             stream.write(line + "\n")
     except OSError:
         pass
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as stream:
-        for chunk in iter(lambda: stream.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _snapshot_manifest() -> dict[str, Any]:
-    """启动时对工件快照一次（SHA 以 manifest 为准；下载读活文件，便于演练不匹配拒绝）。"""
-    artifacts = []
-    for name in sorted(ARTIFACT_META):
-        meta = ARTIFACT_META[name]
-        path = ARTIFACTS_DIR / name
-        if not path.is_file():
-            continue
-        artifacts.append({
-            "name": name,
-            "version": str(meta.get("version") or ""),
-            "sha256": _sha256_file(path),
-            "bytes": path.stat().st_size,
-            "media_type": str(meta.get("media_type") or "application/octet-stream"),
-            "receipt": meta.get("receipt") or {},
-        })
-    return {
-        "schema": MANIFEST_SCHEMA,
-        "device_build": DEVICE_BUILD,
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "artifacts": artifacts,
-    }
 
 
 async def _parse_payload(request: Request) -> dict[str, str]:
@@ -505,20 +482,171 @@ async def config_client(request: Request) -> JSONResponse:
     return JSONResponse(document)
 
 
+# ── 数据包注册表 ────────────────────────────────────────────────────────
+@app.get("/v1/builds")
+async def list_builds(request: Request) -> JSONResponse:
+    record = _require(request, "bundles:read")
+    if isinstance(record, JSONResponse):
+        return record
+    return JSONResponse({"builds": REGISTRY.list_builds()})
+
+
+@app.get("/v1/builds/{build}/bundle")
+async def get_bundle(build: str, request: Request, channel: str = "stable",
+                     bundle_id: str = "") -> JSONResponse:
+    record = _require(request, "bundles:read")
+    if isinstance(record, JSONResponse):
+        return record
+    if not valid_build(build):
+        return JSONResponse({"detail": "invalid build"}, status_code=400)
+    if bundle_id:
+        if not valid_sha(bundle_id):
+            return JSONResponse({"detail": "invalid bundle_id"}, status_code=400)
+        target = bundle_id
+    else:
+        if channel not in CHANNELS:
+            return JSONResponse({"detail": f"channel must be one of {CHANNELS}"},
+                                status_code=400)
+        target = REGISTRY.channel_bundle(build, channel)
+    manifest = REGISTRY.bundle_manifest(target) if target else None
+    if manifest is None or manifest["build"] != build:
+        return JSONResponse({"detail": f"no bundle for build {build!r}"}, status_code=404)
+    _audit("bundle_served", subject=record["subject"], build=build,
+           bundle_id=manifest["bundle_id"], channel="" if bundle_id else channel)
+    return JSONResponse(manifest)
+
+
+@app.get("/v1/blobs/{sha}")
+async def get_blob(sha: str, request: Request):
+    record = _require(request, "bundles:read")
+    if isinstance(record, JSONResponse):
+        return record
+    if not valid_sha(sha):
+        return JSONResponse({"detail": "invalid sha256"}, status_code=400)
+    info = REGISTRY.blob_info(sha)
+    if info is None:
+        return JSONResponse({"detail": "unknown blob"}, status_code=404)
+    _audit("blob_download", subject=record["subject"], sha256=sha, bytes=info["bytes"])
+    return FileResponse(REGISTRY.blob_path(sha), media_type=info["media_type"],
+                        headers={"X-Content-SHA256": sha})
+
+
+@app.put("/v1/blobs/{sha}")
+async def put_blob(sha: str, request: Request) -> JSONResponse:
+    record = _require(request, "bundles:publish")
+    if isinstance(record, JSONResponse):
+        return record
+    if not valid_sha(sha):
+        return JSONResponse({"detail": "invalid sha256"}, status_code=400)
+    if REGISTRY.blob_info(sha) is not None:
+        return JSONResponse({"sha256": sha, "created": False})
+    writer = REGISTRY.begin_blob(request.headers.get("content-type") or "",
+                                 MAX_BLOB_BYTES)
+    try:
+        async for chunk in request.stream():
+            writer.write(chunk)
+        stored = writer.finish(sha)
+    except RegistryError as exc:
+        writer.abort()
+        _audit("blob_rejected", subject=record["subject"], sha256=sha, reason=str(exc))
+        return JSONResponse({"detail": str(exc)}, status_code=422)
+    except BaseException:
+        writer.abort()
+        raise
+    _audit("blob_uploaded", subject=record["subject"], sha256=sha, bytes=stored["bytes"])
+    return JSONResponse({**stored, "created": True}, status_code=201)
+
+
+@app.post("/v1/bundles")
+async def post_bundle(request: Request) -> JSONResponse:
+    record = _require(request, "bundles:publish")
+    if isinstance(record, JSONResponse):
+        return record
+    raw = await request.body()
+    if len(raw) > MAX_MANIFEST_BYTES:
+        return JSONResponse({"detail": "manifest too large"}, status_code=413)
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return JSONResponse({"detail": "body must be JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"detail": "body must be a JSON object"}, status_code=400)
+    source = body.get("source") or {}
+    required = body.get("required_kinds")
+    if not isinstance(source, dict) or (required is not None and not isinstance(required, list)):
+        return JSONResponse({"detail": "source must be an object, required_kinds a list"},
+                            status_code=400)
+    try:
+        result = REGISTRY.submit_bundle(
+            str(body.get("build") or ""), body.get("entries"), publisher=record["subject"],
+            source=source, required_kinds=required)
+    except RegistryError as exc:
+        _audit("bundle_rejected", subject=record["subject"], reason=str(exc)[:300])
+        return JSONResponse({"detail": str(exc)}, status_code=422)
+    _audit("bundle_submitted", subject=record["subject"], build=body.get("build"),
+           bundle_id=result["bundle_id"], created=result["created"],
+           checks_ok=result["checks"]["ok"])
+    return JSONResponse(result, status_code=201 if result["created"] else 200)
+
+
+@app.post("/v1/builds/{build}/channels/{channel}")
+async def set_channel(build: str, channel: str, request: Request) -> JSONResponse:
+    record = _require(request, "bundles:publish")
+    if isinstance(record, JSONResponse):
+        return record
+    payload = await _parse_payload(request)
+    bundle_id = payload.get("bundle_id") or ""
+    try:
+        REGISTRY.set_channel(build, channel, bundle_id, record["subject"])
+    except RegistryError as exc:
+        _audit("channel_rejected", subject=record["subject"], build=build, channel=channel,
+               bundle_id=bundle_id, reason=str(exc))
+        return JSONResponse({"detail": str(exc)}, status_code=422)
+    _audit("channel_set", subject=record["subject"], build=build, channel=channel,
+           bundle_id=bundle_id)
+    return JSONResponse({"build": build, "channel": channel, "bundle_id": bundle_id})
+
+
+# ── 旧版工件接口（由 stable 包派生）───────────────────────────────────────
+def _legacy_entries(build: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    bundle_id = REGISTRY.channel_bundle(build, "stable")
+    manifest = REGISTRY.bundle_manifest(bundle_id) if bundle_id else None
+    if manifest is None:
+        return None, []
+    return manifest, [e for e in manifest["entries"] if e["meta"].get("legacy_name")]
+
+
 @app.get("/v1/artifacts/manifest")
 async def artifacts_manifest(request: Request, device_build: str = "") -> JSONResponse:
     record = _require(request, "artifacts:read")
     if isinstance(record, JSONResponse):
         _audit("manifest_rejected", status=record.status_code)
         return record
-    if device_build and device_build != MANIFEST_SNAPSHOT["device_build"]:
+    build = device_build or DEVICE_BUILD
+    manifest, entries = _legacy_entries(build) if valid_build(build) else (None, [])
+    if manifest is None:
         return JSONResponse(
-            {"detail": f"unknown device_build {device_build!r}; "
-                       f"known: {MANIFEST_SNAPSHOT['device_build']!r}"},
+            {"detail": f"unknown device_build {build!r}; known: {DEVICE_BUILD!r}"},
             status_code=404)
-    _audit("manifest_served", username=record["subject"],
-           device_build=MANIFEST_SNAPSHOT["device_build"])
-    return JSONResponse(MANIFEST_SNAPSHOT)
+    legacy = {
+        "schema": MANIFEST_SCHEMA,
+        "device_build": build,
+        "generated_at": manifest["created_at"],
+        "bundle_id": manifest["bundle_id"],
+        "artifacts": [{
+            "name": e["meta"]["legacy_name"],
+            "version": str(e["meta"].get("version") or ""),
+            "sha256": e["sha256"],
+            "bytes": e["bytes"],
+            "media_type": e["media_type"],
+            "receipt": e["meta"].get("receipt") or {},
+        } for e in entries],
+    }
+    if META.get("kms_addr"):
+        legacy["kms_addr"] = str(META["kms_addr"])
+    _audit("manifest_served", username=record["subject"], device_build=build,
+           bundle_id=manifest["bundle_id"])
+    return JSONResponse(legacy)
 
 
 @app.get("/v1/artifacts/{name}")
@@ -527,16 +655,16 @@ async def artifact_download(name: str, request: Request):
     if isinstance(record, JSONResponse):
         _audit("artifact_rejected", name=name, status=record.status_code)
         return record
-    entry = next(
-        (a for a in MANIFEST_SNAPSHOT["artifacts"] if a["name"] == name), None)
-    path = ARTIFACTS_DIR / name
-    if entry is None or not path.is_file():
+    _, entries = _legacy_entries(DEVICE_BUILD) if valid_build(DEVICE_BUILD) else (None, [])
+    entry = next((e for e in entries if e["meta"]["legacy_name"] == name), None)
+    if entry is None or REGISTRY.blob_info(entry["sha256"]) is None:
         return JSONResponse({"detail": f"unknown artifact {name!r}"}, status_code=404)
     _audit(
         "artifact_download", username=record["subject"], name=name,
-        sha256=entry["sha256"], bytes=entry["bytes"], version=entry["version"])
-    return FileResponse(
-        path, media_type=entry["media_type"], filename=name)
+        sha256=entry["sha256"], bytes=entry["bytes"],
+        version=str(entry["meta"].get("version") or ""))
+    return FileResponse(REGISTRY.blob_path(entry["sha256"]), media_type=entry["media_type"],
+                        filename=name)
 
 
 def _load_docs() -> list[dict[str, Any]]:
