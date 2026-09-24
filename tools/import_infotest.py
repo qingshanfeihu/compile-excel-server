@@ -338,6 +338,8 @@ class InfoTestResolver:
                        generation_id=active.generation_id,
                        manifest_sha256=active.manifest_sha256)
         self._add_file("spec", "index.json", active.index)
+        # 同步台账：代际清单登记了它的 sha256，客户端重建代际目录时要逐字节核对
+        self._add_file("spec", "state.tsv", active.state)
         docs_root = Path(active.docs)
         for path in sorted(docs_root.rglob("*")):
             if path.is_file() and not path.is_symlink():

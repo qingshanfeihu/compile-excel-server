@@ -119,3 +119,41 @@ def test_real_infotest_without_convergence_is_refused_cleanly(tmp_path):
                if p.is_file() and "__pycache__" not in p.parts
                and p.stat().st_mtime > marker.stat().st_mtime]
     assert written == [], f"导入器不应往 InfoTest 写文件：{written[:5]}"
+
+
+INFOTEST_ROOT = Path(os.environ.get("INFOTEST_ROOT") or REPO_ROOT.parent / "InfoTest_Engine")
+INFOTEST_PYTHON = Path(os.environ.get("INFOTEST_PYTHON")
+                       or Path.home() / ".venvs" / "infotest-engine" / "bin" / "python")
+
+
+@pytest.mark.skipif(not (INFOTEST_ROOT / "main" / "kms" / "spec_generation.py").is_file()
+                    or not INFOTEST_PYTHON.is_file(),
+                    reason="需要同级 InfoTest 检出和它的 venv（INFOTEST_ROOT / INFOTEST_PYTHON）")
+def test_spec_entries_carry_the_generation_sync_ledger(tmp_path):
+    """规格书代际清单登记了 state.tsv 的 sha256，客户端重建代际时逐字节核对：导入器必须发它。
+    代际由 InfoTest 自己的发布器生成，导入器按 InfoTest 自己的解析函数取数。"""
+    script = f'''
+import json, sys
+from pathlib import Path
+sys.path.insert(0, {str(INFOTEST_ROOT)!r})
+sys.path.insert(0, {str(REPO_ROOT / "tools")!r})
+from main.kms import spec_generation as g
+root = Path({str(tmp_path)!r})
+gid, staging = g._new_staging_generation(root / "knowledge" / "data" / "spec")
+(staging / "docs" / "12345_Listener_Spec.md").write_text("# spec\\n", encoding="utf-8")
+g.save_state(staging / "state.tsv", {{}})
+g._publish_generation(staging, gid)
+import import_infotest as imp
+resolver = imp.InfoTestResolver(root, "B")
+resolver._spec()
+print(json.dumps({{"gid": gid, "entries": {{e.path: e.data.hex() for e in resolver.entries}}}}))
+'''
+    proc = subprocess.run([str(INFOTEST_PYTHON), "-c", script], capture_output=True, text=True,
+                          timeout=300)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    generation = tmp_path / "knowledge" / "data" / "spec" / "generations" / out["gid"]
+    entries = {path: bytes.fromhex(data) for path, data in out["entries"].items()}
+    assert set(entries) == {"spec/manifest.json", "spec/index.json", "spec/state.tsv",
+                            "spec/docs/12345_Listener_Spec.md"}
+    assert entries["spec/state.tsv"] == (generation / "state.tsv").read_bytes()
