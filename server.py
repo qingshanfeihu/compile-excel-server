@@ -35,8 +35,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import hashlib
-import hmac
 import html
 import json
 import os
@@ -52,6 +50,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 import auth_backends
 import client_config
+from gateway.audit_chain import AuditChain
 from auth_store import SCOPES, AuthStore
 from registry import CHANNELS, Registry, RegistryError, valid_build, valid_sha
 
@@ -106,13 +105,14 @@ def _init_data(data_dir: Path) -> None:
     """按数据目录装载全部状态；模块导入时调用一次，`--data` 覆盖时再调用一次。"""
     global DATA_DIR, ARTIFACTS_DIR, DOCS_DIR, META_PATH, AUDIT_PATH, AUDIT_KEY_PATH
     global META, DEVICE_BUILD, ARTIFACT_META, DOCS
-    global AUTH_STORE, AUTH_BACKEND, REGISTRY
+    global AUTH_STORE, AUTH_BACKEND, REGISTRY, AUDIT
     DATA_DIR = Path(data_dir)
     ARTIFACTS_DIR = DATA_DIR / "artifacts"
     DOCS_DIR = DATA_DIR / "docs"
     META_PATH = DATA_DIR / "artifacts_meta.json"
     AUDIT_PATH = DATA_DIR / "audit.log"
     AUDIT_KEY_PATH = DATA_DIR / "audit_hmac_key"
+    AUDIT = AuditChain(AUDIT_PATH, key=_audit_key)
     META = _load_meta(META_PATH)
     DEVICE_BUILD = str(META["device_build"])
     ARTIFACT_META = dict(META.get("artifacts") or {})
@@ -138,19 +138,11 @@ _device_flows: dict[str, dict[str, Any]] = {}
 
 
 def _audit(event: str, **fields: Any) -> None:
-    """JSONL 审计；调用方保证不含任何 token、访问码、client secret。有实例密钥时附 hmac。"""
+    """JSONL 审计，哈希链（audit_chain.py）；有实例密钥时附 hmac。
+    调用方保证不含任何 token、访问码、client secret。"""
     record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": event}
     record.update(fields)
-    line = json.dumps(record, ensure_ascii=False)
-    key = _audit_key()
-    if key is not None:
-        line = line + "\thmac=" + hmac.new(key, line.encode("utf-8"),
-                                           hashlib.sha256).hexdigest()
-    try:
-        with open(AUDIT_PATH, "a", encoding="utf-8") as stream:
-            stream.write(line + "\n")
-    except OSError:
-        pass
+    AUDIT.append(record)
 
 
 async def _parse_payload(request: Request) -> dict[str, str]:
@@ -745,10 +737,19 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=int(os.environ.get("CES_PORT", "8900")))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--data", default="", help="数据目录（覆盖 $CES_DATA_DIR）")
+    parser.add_argument("--tls-cert", default="")
+    parser.add_argument("--tls-key", default="")
+    parser.add_argument("--insecure-lan", action="store_true")
     args = parser.parse_args()
+    from deploy.tls_policy import serve_tls_problem, uvicorn_tls_kwargs
+
+    problem = serve_tls_problem(args.host, args.tls_cert, args.tls_key, args.insecure_lan)
+    if problem:
+        raise SystemExit(problem)
     if args.data:
         _init_data(Path(args.data))
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning",
+                **uvicorn_tls_kwargs(args.tls_cert, args.tls_key))
 
 
 if __name__ == "__main__":

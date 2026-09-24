@@ -14,6 +14,7 @@
   tokens revoke|purge        按用户/客户端撤销令牌、清理过期令牌
   config show|set|unset|import-env   组织下发给客户端的地址常量
   registry list|show|import-dir|promote|verify|gc   数据包注册表
+  audit verify               复核审计日志（哈希链 + 实例密钥 hmac）
 
 管理命令默认作用于安装登记里的数据目录，可用 --data <目录> 指定。
 
@@ -29,7 +30,6 @@ import signal
 import subprocess
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 if getattr(sys, "frozen", False):  # PyInstaller onedir
@@ -107,30 +107,49 @@ def _host(install: dict) -> str:
     return str(install.get("host") or "127.0.0.1").strip()
 
 
-def _probe_host(host: str) -> str:
-    """探活地址：监听全部网卡时走回环，绑定具体地址时直连该地址。"""
-    if host in ("", "0.0.0.0", "::", "localhost"):
-        return "127.0.0.1"
-    return host
+def healthz(port: int, timeout: float = 2.0, host: str = "127.0.0.1",
+            tls_cert: str = "") -> dict | None:
+    from deploy.tls_policy import healthz as probe
+
+    return probe(port, host=host, tls_cert=tls_cert, timeout=timeout)
 
 
-def healthz(port: int, timeout: float = 2.0, host: str = "127.0.0.1") -> dict | None:
-    try:
-        with urllib.request.urlopen(
-                f"http://{_probe_host(host)}:{port}/healthz", timeout=timeout) as resp:
-            return json.loads(resp.read())
-    except (OSError, ValueError):
-        return None
+def _health(install: dict, timeout: float = 2.0) -> dict | None:
+    return healthz(install["port"], timeout=timeout, host=_host(install),
+                   tls_cert=str(install.get("tls_cert") or ""))
+
+
+def _legacy_plaintext(install: dict) -> bool:
+    """TLS 规则之前装的非回环明文实例：install.json 里没有任何 TLS 相关键。"""
+    from deploy.tls_policy import is_loopback_host
+
+    return (not install.get("tls_cert") and "insecure_lan" not in install
+            and not is_loopback_host(_host(install)))
+
+
+def _tls_argv(install: dict) -> list[str]:
+    argv: list[str] = []
+    if install.get("tls_cert") and install.get("tls_key"):
+        argv += ["--tls-cert", str(install["tls_cert"]), "--tls-key", str(install["tls_key"])]
+    if install.get("insecure_lan"):
+        argv.append("--insecure-lan")
+    elif _legacy_plaintext(install):
+        # 旧安装照旧起（升级不能把在用的服务停掉），但每次都提示
+        print(f"警告：监听 {_host(install)} 未配 TLS，令牌明文过网。用 ces setup 重配证书，"
+              "或在 install.json 写 tls_cert/tls_key（确认是可信实验网则写 insecure_lan: true 消除本提示）。",
+              file=sys.stderr)
+        argv.append("--insecure-lan")
+    return argv
 
 
 def _serve_argv(install: dict) -> list[str]:
     if getattr(sys, "frozen", False):
         return [sys.executable, "serve",
                 "--data", install["data"], "--port", str(install["port"]),
-                "--host", _host(install)]
+                "--host", _host(install), *_tls_argv(install)]
     return [sys.executable, str(ROOT / "ces_main.py"), "serve",
             "--data", install["data"], "--port", str(install["port"]),
-            "--host", _host(install)]
+            "--host", _host(install), *_tls_argv(install)]
 
 
 def _detached_popen(argv: list[str], log_path: Path) -> int:
@@ -151,7 +170,7 @@ def cmd_status() -> None:
     install = load_install()
     pid = _read_pid(install)
     alive = _pid_alive(pid)
-    health = healthz(install["port"], host=_host(install))
+    health = _health(install)
     print("compile-excel-server 状态")
     print(f"  进程    : {'运行中 pid=' + str(pid) if alive else '未运行'}")
     print(f"  健康    : {'OK ' + json.dumps(health, ensure_ascii=False) if health else '不可达'}")
@@ -168,15 +187,15 @@ def cmd_start() -> None:
     if _pid_alive(_read_pid(install)):
         print(f"已在运行（pid={_read_pid(install)}）")
         return
-    if healthz(install["port"], host=_host(install)):
+    if _health(install):
         print(f"端口 {install['port']} 已有实例（无 pidfile）")
         return
     pid = _detached_popen(_serve_argv(install), Path(install["data"]) / "server.log")
     _pid_file(install).write_text(str(pid))
     print(f"已启动 pid={pid}")
     for _ in range(40):
-        if healthz(install["port"], timeout=1, host=_host(install)):
-            print(f"healthz: {healthz(install['port'], host=_host(install))}")
+        if _health(install, timeout=1):
+            print(f"healthz: {_health(install)}")
             return
         time.sleep(0.5)
     print("探活失败，看 <数据目录>/server.log", file=sys.stderr)
@@ -332,13 +351,38 @@ def cmd_setup(args: list[str]) -> None:
     raise SystemExit(setup_mod.main())
 
 
-def cmd_serve(data: str, port: int, host: str) -> None:
+def cmd_serve(data: str, port: int, host: str, tls_cert: str = "", tls_key: str = "",
+              insecure_lan: bool = False) -> int:
+    from deploy.tls_policy import serve_tls_problem, uvicorn_tls_kwargs
+
+    problem = serve_tls_problem(host, tls_cert, tls_key, insecure_lan)
+    if problem:
+        print(problem, file=sys.stderr)
+        return 2
     os.environ["CES_DATA_DIR"] = str(Path(data).expanduser().resolve())
     import uvicorn
 
     import server
 
-    uvicorn.run(server.app, host=host, port=port, log_level="warning")
+    uvicorn.run(server.app, host=host, port=port, log_level="warning",
+                **uvicorn_tls_kwargs(tls_cert, tls_key))
+    return 0
+
+
+def cmd_audit(rest: list[str]) -> int:
+    from gateway.audit_chain import verify
+
+    data, args = _admin_args(rest)
+    if args[:1] != ["verify"]:
+        print("用法: ces audit verify [--data 目录]")
+        return 64
+    key = None
+    key_path = data / "audit_hmac_key"
+    if key_path.is_file():
+        key = bytes.fromhex(key_path.read_text(encoding="utf-8").strip())
+    result = verify(data / "audit.log", key)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result["ok"] else 1
 
 
 # ── 身份与客户端配置（直接读写数据目录里的 auth.db / client_config.json）──
@@ -655,8 +699,13 @@ def main() -> int:
         parser.add_argument("--data", required=True)
         parser.add_argument("--port", type=int, default=8900)
         parser.add_argument("--host", default="127.0.0.1")
+        parser.add_argument("--tls-cert", default="")
+        parser.add_argument("--tls-key", default="")
+        parser.add_argument("--insecure-lan", action="store_true",
+                            help="允许在非回环地址上不配 TLS（只用于可信实验网）")
         args = parser.parse_args(rest)
-        cmd_serve(args.data, args.port, args.host)
+        return cmd_serve(args.data, args.port, args.host, args.tls_cert, args.tls_key,
+                         args.insecure_lan)
     elif command == "service":
         if not rest or rest[0] not in ("install", "remove", "print"):
             print("用法: ces service install|remove|print")
@@ -676,6 +725,8 @@ def main() -> int:
         return cmd_config(rest)
     elif command == "registry":
         return cmd_registry(rest)
+    elif command == "audit":
+        return cmd_audit(rest)
     else:
         print(__doc__)
         return 64

@@ -59,8 +59,31 @@ jobs:
         run: |
           tar -czf "compile-excel-server-${{ matrix.tag }}.tar.gz" \
             -C dist compile-excel-server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.tag }}
+          path: |
+            compile-excel-server-*.tar.gz
+            cexg-*.tar.gz
+          if-no-files-found: error
+
+  # 所有平台的包到齐后统一算 SHA256SUMS 并发布：下载方用 sha256sum -c SHA256SUMS 核对
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: SHA256SUMS
+        run: |
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            compile-excel-server-*.tar.gz
-            cexg-*.tar.gz
+            dist/*.tar.gz
+            dist/SHA256SUMS

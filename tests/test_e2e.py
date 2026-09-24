@@ -409,7 +409,7 @@ def test_ces_setup_options_file_end_to_end(tmp_path):
     options = tmp_path / "opt.json"
     options.write_text(json.dumps({
         "data": str(data), "device_build": "CES_E2E", "kms": "127.0.0.1:8443",
-        "port": 8917, "host": "0.0.0.0", "start": False, "force": False,
+        "port": 8917, "host": "0.0.0.0", "insecure_lan": True, "start": False, "force": False,
         "artifacts": [f"{art}:0.1"], "docs": [str(docs)],
     }), encoding="utf-8")
     proc = subprocess.run(

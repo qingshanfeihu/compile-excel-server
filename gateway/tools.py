@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import console, framework, gates
+from .audit_chain import AuditChain
 from .config import GatewayConfig
 from .introspect import IntrospectError, ServerClient
 from .state import LeaseError, StateStore
@@ -122,6 +123,7 @@ class Gateway:
         self.server = server or ServerClient(cfg.server_url, cfg.client_id, cfg.client_secret_file)
         self._grammar_lock = threading.Lock()
         self.audit_path = cfg.state_dir / "audit.log"
+        self._audit = AuditChain(self.audit_path)
         self.handlers: dict[str, Callable[[Caller, dict[str, Any]], dict[str, Any]]] = {
             "lease_acquire": self.lease_acquire, "lease_heartbeat": self.lease_heartbeat,
             "lease_release": self.lease_release, "lease_status": self.lease_status,
@@ -132,13 +134,9 @@ class Gateway:
 
     # ── 公共 ──────────────────────────────────────────────
     def audit(self, event: str, **fields: Any) -> None:
-        record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": event,
-                  **fields}
-        try:
-            with open(self.audit_path, "a", encoding="utf-8") as stream:
-                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-        except OSError:
-            pass
+        """哈希链审计（gateway/audit_chain.py）；`cexg audit-verify` 复核。"""
+        self._audit.append({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "event": event, **fields})
 
     def call(self, caller: Caller, name: str, args: dict[str, Any]) -> dict[str, Any]:
         spec = next((s for s in TOOL_SPECS if s["name"] == name), None)
@@ -209,7 +207,12 @@ class Gateway:
         return {"released": True}
 
     def lease_status(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
-        return self.state.status()
+        status = self.state.status()
+        if status.get("holder") != caller.subject:
+            # 租约号与 fencing token 只给持有人本人；别人只看到谁占着、还剩多久
+            status.pop("lease_id", None)
+            status.pop("token", None)
+        return status
 
     # ── 环境自检 ──────────────────────────────────────────
     def env_prepare(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:

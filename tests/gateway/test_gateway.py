@@ -335,3 +335,29 @@ def test_batch_logs_marks_logs_older_than_delivery_as_stale(fake_env):
     assert "hunter2" not in logs["202609240000000061"]["log"], "日志经脱敏再返回"
     assert logs["202609240000000062"] == {"mtime": logs["202609240000000062"]["mtime"],
                                           "stale": True, "log": ""}
+
+
+def test_lease_status_shows_the_token_only_to_the_holder(fake_env):
+    gw = fake_env["gateway"]
+    _lease(gw, ALICE)
+    mine = gw.call(ALICE, "lease_status", {})
+    theirs = gw.call(BOB, "lease_status", {})
+    assert mine["holder"] == "alice" and "token" in mine and "lease_id" in mine
+    assert theirs["holder"] == "alice" and "token" not in theirs and "lease_id" not in theirs
+    assert theirs["expires_in_s"] > 0
+
+
+def test_gateway_audit_is_a_verifiable_hash_chain(fake_env):
+    from gateway.audit_chain import verify
+
+    gw = fake_env["gateway"]
+    lease = _lease(gw, ALICE)
+    gw.call(BOB, "lease_acquire", {})
+    gw.call(ALICE, "lease_release", lease)
+    result = verify(gw.audit_path)
+    assert result["ok"] and result["chained"] >= 3, result
+    lines = gw.audit_path.read_text(encoding="utf-8").splitlines()
+    lines[1] = lines[1].replace("alice", "mallory") if "alice" in lines[1] else lines[1] + " "
+    gw.audit_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert verify(gw.audit_path) == {"ok": False, "line": 3,
+                                     "reason": "prev does not match the previous line"}

@@ -32,6 +32,7 @@ bash <(gh api repos/qingshanfeihu/compile-excel-server/contents/install.sh --jq 
 ```bash
 ces setup     # 配置向导：数据目录/device_build/openkm·KMS 地址/工件(xml·xlsx·tar)/手册/端口与监听地址
               #   监听地址默认 127.0.0.1（只本机可用）；局域网内其他机器要登录，填 0.0.0.0（或 --host 0.0.0.0）
+              #   非本机监听必须给 TLS 证书（--tls-cert/--tls-key）；可信实验网暂无证书时显式 --insecure-lan
               #   逐项说明+示例；每答一题存草稿，中断重跑自动从断点继续
 ces           # 管理菜单（状态/启停/日志/服务注册/重配/卸载）
 ces service install   # 注册 systemd(Linux)/launchd(macOS)，开机自启
@@ -46,7 +47,7 @@ ces users add alice   # 建账号；访问码只显示一次（或 --out 文件 
 |---|---|
 | （无参数） | 管理菜单 |
 | `setup [...]` | 配置向导 / 非交互安装（同 deploy/setup.py 参数） |
-| `serve --data D --port P` | 前台运行（服务管理器/调试用） |
+| `serve --data D --port P [--host H] [--tls-cert C --tls-key K] [--insecure-lan]` | 前台运行（服务管理器/调试用）；非回环地址不配 TLS 就拒绝启动 |
 | `status` / `start` / `stop` / `restart` / `log` | 进程管理（pidfile + healthz） |
 | `service install\|remove\|print` | systemd/launchd 服务（print 只看 unit 内容） |
 | `uninstall [--purge]` | 卸载（--purge 连数据目录一起删） |
@@ -56,8 +57,23 @@ ces users add alice   # 建账号；访问码只显示一次（或 --out 文件 
 | `tokens revoke --user <名>\|--client <id>` / `purge` | 撤销令牌、清理过期记录 |
 | `config show\|set <键> <地址>\|unset <键>\|import-env <文件>` | 下发给客户端的门户/缺陷系统/网关地址 |
 | `registry list\|show <build>\|import-dir <build> <kind> <目录>\|promote <build> <bundle_id>\|verify\|gc` | 数据包注册表：查看、手工导入一类数据、切通道、全量复核 blob、回收无引用 blob |
+| `audit verify` | 复核审计日志：逐行哈希链 + 实例密钥 hmac，报出第一处被改或被删的行 |
 
 管理命令默认作用于安装登记里的数据目录，也可以加 `--data <目录>`。
+
+## 传输与审计
+
+- **TLS**：客户端带着 OAuth 令牌访问，监听非回环地址时 `ces serve` 要求 `--tls-cert/--tls-key`
+  （`ces setup` 会问，写进安装登记），确认是可信实验网才可 `--insecure-lan`。规则在 `deploy/tls_policy.py`，
+  网关用同一条。本机探活在开 TLS 时走 https，以部署自己的证书为信任锚校验证书链。
+  这条规则出现前装好、监听非回环地址又没配 TLS 的实例照旧启动，但每次启动都提示；
+  客户端对非回环地址默认也拒绝明文（工作区 `insecure_lan` 显式开启才放行）。
+  客户端信任自签证书：让 Python 认得这张证书，例如设 `SSL_CERT_FILE` 指向证书文件。
+- **审计**：服务端 `<data>/audit.log` 与网关 `<state>/audit.log` 都是哈希链（`gateway/audit_chain.py`）：
+  每行带上一行的 SHA-256，改动或删除中间任何一行都会断链；服务端另有实例密钥 hmac。
+  `ces audit verify` / `cexg audit-verify --config …` 复核。哈希链证明不了"末尾没被截掉"，
+  需要的话把最新一行的哈希定期记到别处。
+- **Release**：每个 tag 的 Release 附 `SHA256SUMS`，下载后 `sha256sum -c SHA256SUMS` 核对。
 
 ## 仓库边界
 

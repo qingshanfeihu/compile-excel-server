@@ -4,6 +4,7 @@
   cexg serve  --config gateway.toml     前台运行（systemd 用）
   cexg check  --config gateway.toml     配置与框架自检（不碰设备）
   cexg sample-config                    打印配置样例
+  cexg audit-verify --config gateway.toml   复核审计日志哈希链
 
 配置里的路径与口令文件都在跳板机本机；网关不读任何 environment 文件。
 """
@@ -75,10 +76,23 @@ def cmd_serve(config: Path) -> int:
     return 0
 
 
+def cmd_audit_verify(config: Path) -> int:
+    from gateway.audit_chain import verify
+
+    try:
+        cfg = load(config)
+    except ConfigError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        return 2
+    result = verify(cfg.state_dir / "audit.log")
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result["ok"] else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="cexg", description="compile-excel 跳板机网关")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("serve", "check"):
+    for name in ("serve", "check", "audit-verify"):
         p = sub.add_parser(name)
         p.add_argument("--config", required=True)
     sub.add_parser("sample-config")
@@ -87,6 +101,8 @@ def main(argv: list[str] | None = None) -> int:
         print(SAMPLE.read_text(encoding="utf-8"))
         return 0
     config = Path(args.config).expanduser()
+    if args.command == "audit-verify":
+        return cmd_audit_verify(config)
     return cmd_serve(config) if args.command == "serve" else cmd_check(config)
 
 

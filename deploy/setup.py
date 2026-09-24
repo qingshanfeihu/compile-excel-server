@@ -29,19 +29,19 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.request
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_DIR = Path(__file__).resolve().parent
 
 if __package__:  # 作为 deploy.setup 包导入（PyInstaller/ces 入口）
-    from . import gen_meta, provision, sample_data  # noqa: E402
+    from . import gen_meta, provision, sample_data, tls_policy  # noqa: E402
 else:  # 直接运行: python deploy/setup.py
     sys.path.insert(0, str(DEPLOY_DIR))
     import gen_meta  # noqa: E402
     import provision  # noqa: E402
     import sample_data  # noqa: E402
+    import tls_policy  # noqa: E402
 
 def _config_root() -> Path:
     override = os.environ.get("CES_CONFIG_ROOT")
@@ -347,6 +347,17 @@ def wizard() -> dict:
                 state["host"] = raw
                 break
             print("  地址非法，请重输。")
+        if not tls_policy.is_loopback_host(state["host"]):
+            print("  非本机监听：客户端带着登录令牌访问，需要 TLS 证书（PEM）。")
+            cert = ask("TLS 证书文件（回车 = 暂不配置）", state.get("tls_cert") or "").strip()
+            if cert:
+                state["tls_cert"] = cert
+                state["tls_key"] = ask("TLS 私钥文件", state.get("tls_key") or "").strip()
+                state["insecure_lan"] = ""
+            else:
+                state["tls_cert"] = state["tls_key"] = ""
+                state["insecure_lan"] = "y" if ask(
+                    "确认这是可信实验网、允许明文？(y/N)", "n").strip().lower() == "y" else ""
         done(6)
 
     # 7/7 覆盖与启动
@@ -440,32 +451,35 @@ def copy_docs(source: Path, docs_dir: Path, force: bool) -> list[Path]:
     return copied
 
 
-def probe_host(host: str) -> str:
-    """探活用的地址：监听全部网卡时走回环，绑定具体地址时直连该地址。"""
-    host = (host or "").strip()
-    if host in ("", "0.0.0.0", "::", "localhost"):
-        return "127.0.0.1"
-    return host
+probe_host = tls_policy.probe_host
 
 
-def client_url(host: str, port: int) -> str:
+def client_url(host: str, port: int, tls: bool = False) -> str:
     host = (host or "127.0.0.1").strip()
+    scheme = "https" if tls else "http"
     if host in ("0.0.0.0", "::"):
-        return f"http://{lan_ip()}:{port}"
-    return f"http://{host}:{port}"
+        return f"{scheme}://{lan_ip()}:{port}"
+    return f"{scheme}://{host}:{port}"
 
 
 def healthz_ok(port: int, timeout: float = 1.5,
-               host: str = "127.0.0.1") -> dict | None:
-    try:
-        with urllib.request.urlopen(
-                f"http://{probe_host(host)}:{port}/healthz", timeout=timeout) as resp:
-            return json.loads(resp.read())
-    except (OSError, ValueError):
-        return None
+               host: str = "127.0.0.1", tls_cert: str = "") -> dict | None:
+    return tls_policy.healthz(port, host=host, tls_cert=tls_cert, timeout=timeout)
 
 
-def start_server(data_dir: Path, port: int, host: str = "127.0.0.1") -> None:
+def _tls_serve_argv(tls: dict) -> list[str]:
+    argv: list[str] = []
+    if tls.get("tls_cert"):
+        argv += ["--tls-cert", str(tls["tls_cert"]), "--tls-key", str(tls["tls_key"])]
+    if tls.get("insecure_lan"):
+        argv.append("--insecure-lan")
+    return argv
+
+
+def start_server(data_dir: Path, port: int, host: str = "127.0.0.1",
+                 tls: dict | None = None) -> None:
+    tls = tls or {}
+    cert = str(tls.get("tls_cert") or "")
     pid_file = data_dir / "server.pid"
     if pid_file.is_file():
         try:
@@ -475,7 +489,7 @@ def start_server(data_dir: Path, port: int, host: str = "127.0.0.1") -> None:
             return
         except (ValueError, ProcessLookupError, PermissionError):
             pid_file.unlink(missing_ok=True)  # 残留 pidfile
-    if healthz_ok(port, host=host):
+    if healthz_ok(port, host=host, tls_cert=cert):
         print(f"      端口 {port} 已有实例在跑（无 pidfile，不再重复启动）")
         return
     log_path = data_dir / "server.log"
@@ -487,18 +501,19 @@ def start_server(data_dir: Path, port: int, host: str = "127.0.0.1") -> None:
             | getattr(subprocess, "DETACHED_PROCESS", 0))
     else:
         kwargs["start_new_session"] = True
+    # 两种形态都走 ces serve：TLS 规则与参数只有一处
     if getattr(sys, "frozen", False):  # PyInstaller 包：自引用 serve 子命令
-        serve_argv = [sys.executable, "serve",
-                      "--data", str(data_dir), "--port", str(port), "--host", host]
+        serve_argv = [sys.executable, "serve"]
     else:
-        serve_argv = [sys.executable, str(REPO_ROOT / "server.py"),
-                      "--data", str(data_dir), "--port", str(port), "--host", host]
+        serve_argv = [sys.executable, str(REPO_ROOT / "ces_main.py"), "serve"]
+    serve_argv += ["--data", str(data_dir), "--port", str(port), "--host", host,
+                   *_tls_serve_argv(tls)]
     proc = subprocess.Popen(serve_argv, stdout=log, stderr=log, **kwargs)
     pid_file.write_text(str(proc.pid))
     print(f"      pid={proc.pid} 日志={log_path}")
     for _ in range(40):
-        if healthz_ok(port, timeout=1, host=host):
-            print(f"      healthz: {healthz_ok(port, host=host)}")
+        if healthz_ok(port, timeout=1, host=host, tls_cert=cert):
+            print(f"      healthz: {healthz_ok(port, host=host, tls_cert=cert)}")
             return
         time.sleep(0.5)
     print(f"      探活失败，看 {log_path}", file=sys.stderr)
@@ -522,6 +537,14 @@ def run_install(options: dict, interactive: bool = False) -> None:
     force = bool(options.get("force"))
     port = int(options.get("port") or 8900)
     host = str(options.get("host") or "127.0.0.1").strip()
+    tls = {"tls_cert": str(options.get("tls_cert") or "").strip(),
+           "tls_key": str(options.get("tls_key") or "").strip(),
+           "insecure_lan": bool(options.get("insecure_lan"))}
+    problem = tls_policy.serve_tls_problem(host, tls["tls_cert"], tls["tls_key"],
+                                           tls["insecure_lan"])
+    if problem:
+        print(problem, file=sys.stderr)
+        raise SystemExit(64)
 
     print("════ compile-excel-server 安装部署 ════")
     print(f"仓库: {REPO_ROOT}")
@@ -602,26 +625,27 @@ def run_install(options: dict, interactive: bool = False) -> None:
 
     if options.get("start"):
         print(f"[6/6] 启动并探活（:{port}） ...")
-        start_server(data_dir, port, host)
+        start_server(data_dir, port, host, tls)
     else:
         launcher = ("ces serve" if getattr(sys, "frozen", False)
-                    else f"python {REPO_ROOT / 'server.py'}")
+                    else f"python {REPO_ROOT / 'ces_main.py'} serve")
         print(f"[6/6] （未传 --start）手动启动："
-              f"{launcher} --data {data_dir} --port {port} --host {host}")
+              f"{launcher} --data {data_dir} --port {port} --host {host} "
+              + " ".join(_tls_serve_argv(tls)))
 
     print("════ 部署完成 ════")
     CONFIG_ROOT.mkdir(parents=True, exist_ok=True)
     INSTALL_JSON.write_text(
         json.dumps({"repo": str(REPO_ROOT), "data": str(data_dir), "port": port,
-                    "host": host},
+                    "host": host, **{k: v for k, v in tls.items() if v}},
                    ensure_ascii=False, indent=1),
         encoding="utf-8")
     launcher = "ces" if getattr(sys, "frozen", False) else f"python {REPO_ROOT / 'ces_main.py'}"
     print(f"管理：{launcher}（无参数进菜单；status/start/stop/log/service 子命令）")
     print(f"建账号：{launcher} users add <用户名>（访问码只显示一次，交给本人；"
           "授权页填用户名 + 访问码）")
-    print(f"客户端接入：export COMPILE_EXCEL_SERVER={client_url(host, port)}"
-          "  → login.py → fetch.py")
+    print(f"客户端接入：在项目文件夹里 cex_init（server={client_url(host, port, bool(tls['tls_cert']))}）"
+          " → cex_login_start → cex_sync")
     if probe_host(host) == "127.0.0.1" and host not in ("0.0.0.0", "::"):
         print("注意：当前只监听本机；其他机器要接入，用 --host 0.0.0.0 重装或在向导里改监听地址。")
 
@@ -641,6 +665,10 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--host", default="",
                         help="监听地址（默认 127.0.0.1；局域网访问用 0.0.0.0）")
+    parser.add_argument("--tls-cert", default="", help="TLS 证书（PEM）；非本机监听时必需")
+    parser.add_argument("--tls-key", default="", help="TLS 私钥（PEM）")
+    parser.add_argument("--insecure-lan", action="store_true",
+                        help="非本机监听且不配 TLS（只用于可信实验网）")
     parser.add_argument("--start", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--sample", action="store_true")
@@ -660,6 +688,8 @@ def main() -> int:
                 "data": args.data, "device_build": args.device_build,
                 "kms": args.kms, "artifacts": args.artifact, "docs": args.docs,
                 "port": args.port or 8900, "host": args.host or "127.0.0.1",
+                "tls_cert": args.tls_cert, "tls_key": args.tls_key,
+                "insecure_lan": args.insecure_lan,
                 "start": args.start,
                 "force": args.force, "sample": args.sample,
             }, interactive=not args.yes)
@@ -672,6 +702,9 @@ def main() -> int:
             "kms": state["kms"],
             "port": state["port"] or "8900",
             "host": state.get("host") or "127.0.0.1",
+            "tls_cert": state.get("tls_cert") or "",
+            "tls_key": state.get("tls_key") or "",
+            "insecure_lan": state.get("insecure_lan") == "y",
             "force": state["force"] == "y",
             "start": state["start"] == "y",
             "artifacts": state["artifacts"],
