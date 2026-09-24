@@ -358,11 +358,24 @@ async def artifact_download(name: str, request: Request):
 
 
 def _load_docs() -> list[dict[str, Any]]:
+    """递归加载 docs/ 下全部 *.md（setup 按子目录拷贝手册）。
+
+    doc 标识用相对 docs/ 的 posix 路径；软链文件跳过，解析后不在 docs/ 之内的一律跳过。
+    """
     docs = []
-    for path in sorted(DOCS_DIR.glob("*.md")):
+    if not DOCS_DIR.is_dir():
+        return docs
+    root = DOCS_DIR.resolve()
+    for path in sorted(DOCS_DIR.rglob("*.md")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            rel = path.resolve().relative_to(root).as_posix()
+        except ValueError:
+            continue
         body = path.read_text(encoding="utf-8")
         docs.append({
-            "doc": path.name,
+            "doc": rel,
             "title": body.splitlines()[0].lstrip("# ").strip() if body else path.name,
             "body": body,
         })

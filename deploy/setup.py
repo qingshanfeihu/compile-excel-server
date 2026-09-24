@@ -159,7 +159,7 @@ def draft_message(state: dict) -> None:
 def wizard() -> dict:
     state: dict = {
         "progress": 0, "data": "", "device_build": "", "kms": "",
-        "port": "", "force": "n", "start": "y",
+        "port": "", "host": "", "force": "n", "start": "y",
         "artifacts": [], "docs": [],
     }
     resume = False
@@ -340,6 +340,13 @@ def wizard() -> dict:
                 state["port"] = raw
                 break
             print("  端口非法，请重输。")
+        print("  监听地址：只给本机用填 127.0.0.1；要让局域网里其他机器登录拉取，填 0.0.0.0。")
+        while True:
+            raw = ask("监听地址", state.get("host") or "127.0.0.1").strip()
+            if raw and " " not in raw:
+                state["host"] = raw
+                break
+            print("  地址非法，请重输。")
         done(6)
 
     # 7/7 覆盖与启动
@@ -375,6 +382,7 @@ def wizard() -> dict:
     if not state["docs"]:
         print("   （无）")
     print(f" 监听端口     : {state['port']}")
+    print(f" 监听地址     : {state.get('host') or '127.0.0.1'}")
     print(f" 覆盖策略     : {'同名即覆盖' if state['force'] == 'y' else '内容不同则跳过'}")
     print(f" 装完启动     : {'是' if state['start'] == 'y' else '否'}")
     print("══════════════════════════════════════════════════")
@@ -432,16 +440,32 @@ def copy_docs(source: Path, docs_dir: Path, force: bool) -> list[Path]:
     return copied
 
 
-def healthz_ok(port: int, timeout: float = 1.5) -> dict | None:
+def probe_host(host: str) -> str:
+    """探活用的地址：监听全部网卡时走回环，绑定具体地址时直连该地址。"""
+    host = (host or "").strip()
+    if host in ("", "0.0.0.0", "::", "localhost"):
+        return "127.0.0.1"
+    return host
+
+
+def client_url(host: str, port: int) -> str:
+    host = (host or "127.0.0.1").strip()
+    if host in ("0.0.0.0", "::"):
+        return f"http://{lan_ip()}:{port}"
+    return f"http://{host}:{port}"
+
+
+def healthz_ok(port: int, timeout: float = 1.5,
+               host: str = "127.0.0.1") -> dict | None:
     try:
         with urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/healthz", timeout=timeout) as resp:
+                f"http://{probe_host(host)}:{port}/healthz", timeout=timeout) as resp:
             return json.loads(resp.read())
     except (OSError, ValueError):
         return None
 
 
-def start_server(data_dir: Path, port: int) -> None:
+def start_server(data_dir: Path, port: int, host: str = "127.0.0.1") -> None:
     pid_file = data_dir / "server.pid"
     if pid_file.is_file():
         try:
@@ -451,7 +475,7 @@ def start_server(data_dir: Path, port: int) -> None:
             return
         except (ValueError, ProcessLookupError, PermissionError):
             pid_file.unlink(missing_ok=True)  # 残留 pidfile
-    if healthz_ok(port):
+    if healthz_ok(port, host=host):
         print(f"      端口 {port} 已有实例在跑（无 pidfile，不再重复启动）")
         return
     log_path = data_dir / "server.log"
@@ -465,16 +489,16 @@ def start_server(data_dir: Path, port: int) -> None:
         kwargs["start_new_session"] = True
     if getattr(sys, "frozen", False):  # PyInstaller 包：自引用 serve 子命令
         serve_argv = [sys.executable, "serve",
-                      "--data", str(data_dir), "--port", str(port)]
+                      "--data", str(data_dir), "--port", str(port), "--host", host]
     else:
         serve_argv = [sys.executable, str(REPO_ROOT / "server.py"),
-                      "--data", str(data_dir), "--port", str(port)]
+                      "--data", str(data_dir), "--port", str(port), "--host", host]
     proc = subprocess.Popen(serve_argv, stdout=log, stderr=log, **kwargs)
     pid_file.write_text(str(proc.pid))
     print(f"      pid={proc.pid} 日志={log_path}")
     for _ in range(40):
-        if healthz_ok(port, timeout=1):
-            print(f"      healthz: {healthz_ok(port)}")
+        if healthz_ok(port, timeout=1, host=host):
+            print(f"      healthz: {healthz_ok(port, host=host)}")
             return
         time.sleep(0.5)
     print(f"      探活失败，看 {log_path}", file=sys.stderr)
@@ -497,6 +521,7 @@ def run_install(options: dict, interactive: bool = False) -> None:
         raise SystemExit(64)
     force = bool(options.get("force"))
     port = int(options.get("port") or 8900)
+    host = str(options.get("host") or "127.0.0.1").strip()
 
     print("════ compile-excel-server 安装部署 ════")
     print(f"仓库: {REPO_ROOT}")
@@ -547,13 +572,20 @@ def run_install(options: dict, interactive: bool = False) -> None:
         print("      （未提供 --docs；--sample 将生成合成手册）")
 
     print("[4/6] 生成 artifacts_meta.json ...")
-    gen_meta.generate_meta(
-        data_dir,
-        device_build=str(options.get("device_build") or ""),
-        kms=str(options.get("kms") or ""),
-        version_map=version_map,
-        default_version=str(options.get("default_version") or ""),
-    )
+    artifacts_dir = data_dir / "artifacts"
+    has_artifacts = artifacts_dir.is_dir() and any(
+        entry.is_file() for entry in artifacts_dir.iterdir())
+    if options.get("sample") and not has_artifacts:
+        # 工件要等第 5 步 --sample 生成；此处先生成 meta 会因工件目录为空而中止安装。
+        print("      （工件由 --sample 在第 5 步生成，meta 随后生成）")
+    else:
+        gen_meta.generate_meta(
+            data_dir,
+            device_build=str(options.get("device_build") or ""),
+            kms=str(options.get("kms") or ""),
+            version_map=version_map,
+            default_version=str(options.get("default_version") or ""),
+        )
 
     if options.get("sample"):
         print("[5/6] 生成合成样例（自测，零内部资产） ...")
@@ -570,23 +602,26 @@ def run_install(options: dict, interactive: bool = False) -> None:
 
     if options.get("start"):
         print(f"[6/6] 启动并探活（:{port}） ...")
-        start_server(data_dir, port)
+        start_server(data_dir, port, host)
     else:
         launcher = ("ces serve" if getattr(sys, "frozen", False)
                     else f"python {REPO_ROOT / 'server.py'}")
         print(f"[6/6] （未传 --start）手动启动："
-              f"{launcher} --data {data_dir} --port {port}")
+              f"{launcher} --data {data_dir} --port {port} --host {host}")
 
     print("════ 部署完成 ════")
     CONFIG_ROOT.mkdir(parents=True, exist_ok=True)
     INSTALL_JSON.write_text(
-        json.dumps({"repo": str(REPO_ROOT), "data": str(data_dir), "port": port},
+        json.dumps({"repo": str(REPO_ROOT), "data": str(data_dir), "port": port,
+                    "host": host},
                    ensure_ascii=False, indent=1),
         encoding="utf-8")
     launcher = "ces" if getattr(sys, "frozen", False) else f"python {REPO_ROOT / 'ces_main.py'}"
     print(f"管理：{launcher}（无参数进菜单；status/start/stop/log/service 子命令）")
-    print(f"客户端接入：export COMPILE_EXCEL_SERVER=http://{lan_ip()}:{port}"
+    print(f"客户端接入：export COMPILE_EXCEL_SERVER={client_url(host, port)}"
           "  → login.py → fetch.py")
+    if probe_host(host) == "127.0.0.1" and host not in ("0.0.0.0", "::"):
+        print("注意：当前只监听本机；其他机器要接入，用 --host 0.0.0.0 重装或在向导里改监听地址。")
 
 
 def main() -> int:
@@ -602,6 +637,8 @@ def main() -> int:
     parser.add_argument("--docs", action="append", default=[],
                         help="cli-app 手册目录/文件（可重复）")
     parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--host", default="",
+                        help="监听地址（默认 127.0.0.1；局域网访问用 0.0.0.0）")
     parser.add_argument("--start", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--sample", action="store_true")
@@ -615,11 +652,13 @@ def main() -> int:
             run_install(options, interactive=False)
             return 0
         if any([args.data, args.device_build, args.kms, args.artifact,
-                args.docs, args.port, args.start, args.force, args.sample]):
+                args.docs, args.port, args.host, args.start, args.force,
+                args.sample]):
             run_install({
                 "data": args.data, "device_build": args.device_build,
                 "kms": args.kms, "artifacts": args.artifact, "docs": args.docs,
-                "port": args.port or 8900, "start": args.start,
+                "port": args.port or 8900, "host": args.host or "127.0.0.1",
+                "start": args.start,
                 "force": args.force, "sample": args.sample,
             }, interactive=not args.yes)
             return 0
@@ -630,6 +669,7 @@ def main() -> int:
             "device_build": state["device_build"],
             "kms": state["kms"],
             "port": state["port"] or "8900",
+            "host": state.get("host") or "127.0.0.1",
             "force": state["force"] == "y",
             "start": state["start"] == "y",
             "artifacts": state["artifacts"],

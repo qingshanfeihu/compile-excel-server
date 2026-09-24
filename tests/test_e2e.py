@@ -6,7 +6,8 @@ skill 仓）、fetch SHA 校验与不符即拒、断网明示回退、docs 检�
 （git 跟踪内容出现内部资产指纹即失败）。
 
 跑法（仓库根，带 fastapi 的解释器）：python -m pytest tests/ -v
-env：SKILL_SCRIPTS_DIR 缺省 ~/Public/circle/compile-excel-skills/compile-excel/scripts
+env：SKILL_SCRIPTS_DIR 缺省为同级目录 ../compile-excel-skills/compile-excel/scripts；
+找不到客户端脚本时，依赖它们的用例跳过（不算失败）。
 """
 
 from __future__ import annotations
@@ -31,13 +32,20 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_SCRIPTS = Path(
     os.environ.get("SKILL_SCRIPTS_DIR")
-    or (Path.home() / "Public" / "circle" / "compile-excel-skills" / "compile-excel" / "scripts")
+    or (REPO_ROOT.parent / "compile-excel-skills" / "compile-excel" / "scripts")
 )
 PY = sys.executable
 LOGIN = SKILL_SCRIPTS / "login.py"
 FETCH = SKILL_SCRIPTS / "fetch.py"
 DOCS = SKILL_SCRIPTS / "docs_query.py"
 SAMPLE_BUILD = "SAMPLE_BUILD_LOCAL"
+DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+
+needs_skill_scripts = pytest.mark.skipif(
+    not LOGIN.is_file(),
+    reason=f"找不到 skill 仓客户端脚本 {SKILL_SCRIPTS}（设 SKILL_SCRIPTS_DIR，"
+           "或把 compile-excel-skills 放在同级目录）",
+)
 
 
 def _free_port() -> int:
@@ -212,6 +220,7 @@ def test_provision_generates_instance_credentials(data_dir):
     assert meta["device_build"] == SAMPLE_BUILD  # --sample 覆盖了骨架占位
 
 
+@needs_skill_scripts
 def test_audit_log_hmac(data_dir, server, client_env):
     client_env.login(server)
     client_env.run(FETCH)
@@ -230,6 +239,7 @@ def test_audit_log_hmac(data_dir, server, client_env):
 
 # ── 分发闭环（客户端在 skill 仓）─────────────────────────────────────
 
+@needs_skill_scripts
 def test_full_loop_login_fetch_docs(client_env, server):
     result = client_env.login(server, username="e2e-user")
     assert result["ok"] is True
@@ -254,6 +264,7 @@ def test_full_loop_login_fetch_docs(client_env, server):
     assert json.loads(docs.stdout)["results"]
 
 
+@needs_skill_scripts
 def test_wrong_token_rejected(client_env):
     config_dir = Path(client_env.env["COMPILE_EXCEL_CONFIG_DIR"])
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -267,6 +278,7 @@ def test_wrong_token_rejected(client_env):
     assert client_env.run(DOCS, "--q", "x").returncode != 0
 
 
+@needs_skill_scripts
 def test_sha_mismatch_rejected(client_env, server, data_dir):
     client_env.login(server)
     first = client_env.run(FETCH)
@@ -288,6 +300,7 @@ def test_sha_mismatch_rejected(client_env, server, data_dir):
         artifact.write_bytes(original)
 
 
+@needs_skill_scripts
 def test_offline_fallback_explicit(client_env, server):
     client_env.login(server)
     assert client_env.run(FETCH).returncode == 0
@@ -300,6 +313,7 @@ def test_offline_fallback_explicit(client_env, server):
     assert client_env.run(DOCS, "--q", "x").returncode != 0
 
 
+@needs_skill_scripts
 def test_token_expiry_auto_refresh(short_ttl_server, tmp_path):
     env = ClientEnv(short_ttl_server.base, tmp_path)
     env.login(short_ttl_server)
@@ -346,7 +360,7 @@ def test_ces_setup_options_file_end_to_end(tmp_path):
     options = tmp_path / "opt.json"
     options.write_text(json.dumps({
         "data": str(data), "device_build": "CES_E2E", "kms": "127.0.0.1:8443",
-        "port": 8917, "start": False, "force": False,
+        "port": 8917, "host": "0.0.0.0", "start": False, "force": False,
         "artifacts": [f"{art}:0.1"], "docs": [str(docs)],
     }), encoding="utf-8")
     proc = subprocess.run(
@@ -364,3 +378,75 @@ def test_ces_setup_options_file_end_to_end(tmp_path):
         (tmp_path / "cfg" / "install.json").read_text(encoding="utf-8"))
     assert install_state["data"] == str(data)
     assert install_state["port"] == 8917
+    # 监听地址一路透传到安装登记与实际起服务的 argv（此前恒绑 127.0.0.1）
+    assert install_state["host"] == "0.0.0.0"
+    sys.path.insert(0, str(REPO_ROOT))
+    try:
+        import ces_main
+    finally:
+        sys.path.pop(0)
+    argv = ces_main._serve_argv(install_state)
+    assert argv[argv.index("--host") + 1] == "0.0.0.0"
+
+
+def _http_token(server: "Server") -> str:
+    """不依赖 skill 仓脚本，直接走设备授权流拿 access token。"""
+    status, flow = server.post_form(
+        "/device_authorize", {"client_id": "e2e", "scope": "artifacts:read docs:query"})
+    assert status == 200
+    status, _ = server.post_form(
+        "/activate", {"user_code": flow["user_code"], "username": "tester"})
+    assert status == 200
+    status, tokens = server.post_form(
+        "/token", {"grant_type": DEVICE_GRANT, "device_code": flow["device_code"]})
+    assert status == 200, tokens
+    return tokens["access_token"]
+
+
+def _docs_query(server: "Server", token: str, query: str) -> list[dict]:
+    body = urllib.parse.urlencode({"q": query, "limit": "10"}).encode()
+    req = urllib.request.Request(
+        server.base + "/v1/docs/query", data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded",
+                 "Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())["results"]
+
+
+def test_docs_are_indexed_recursively_and_symlinks_stay_inside(tmp_path):
+    """setup 按子目录拷贝手册；检索必须覆盖子目录，且不能经软链读到数据目录外。"""
+    data = tmp_path / "d"
+    proc = subprocess.run(
+        [PY, str(REPO_ROOT / "deploy" / "provision.py"), "--data", str(data), "--sample"],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    nested = data / "docs" / "cli" / "10.5"
+    nested.mkdir(parents=True)
+    (nested / "cli_cn.md").write_text("# 子目录手册\nzzsubdirtoken", encoding="utf-8")
+    outside = tmp_path / "outside.md"
+    outside.write_text("# 外部\nzzoutsidetoken", encoding="utf-8")
+    (data / "docs" / "escape.md").symlink_to(outside)
+    srv = Server(data)
+    try:
+        token = _http_token(srv)
+        hits = _docs_query(srv, token, "zzsubdirtoken")
+        assert [hit["doc"] for hit in hits] == ["cli/10.5/cli_cn.md"]
+        assert _docs_query(srv, token, "zzoutsidetoken") == []
+    finally:
+        srv.stop()
+
+
+def test_setup_sample_install_from_empty_data_dir(tmp_path):
+    """--sample 的空目录安装：meta 要等样例工件生成后再生成，不能在第 4 步因工件为空中止。"""
+    data = tmp_path / "d"
+    proc = subprocess.run(
+        [PY, str(REPO_ROOT / "deploy" / "setup.py"), "--data", str(data),
+         "--device-build", "SAMPLE_BUILD_LOCAL", "--sample", "--port", "8918", "--yes"],
+        capture_output=True, text=True, timeout=180,
+        env={**os.environ, "CES_CONFIG_ROOT": str(tmp_path / "cfg")},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    meta = json.loads((data / "artifacts_meta.json").read_text(encoding="utf-8"))
+    assert meta["device_build"] == "SAMPLE_BUILD_LOCAL"
+    assert meta["artifacts"], "样例工件应已登记进 meta"

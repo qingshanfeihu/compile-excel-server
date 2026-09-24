@@ -28,7 +28,8 @@ bash <(gh api repos/qingshanfeihu/compile-excel-server/contents/install.sh --jq 
 ## 装完三步
 
 ```bash
-ces setup     # 配置向导：数据目录/device_build/openkm·KMS 地址/工件(xml·xlsx·tar)/手册/端口
+ces setup     # 配置向导：数据目录/device_build/openkm·KMS 地址/工件(xml·xlsx·tar)/手册/端口与监听地址
+              #   监听地址默认 127.0.0.1（只本机可用）；局域网内其他机器要登录，填 0.0.0.0（或 --host 0.0.0.0）
               #   逐项说明+示例；每答一题存草稿，中断重跑自动从断点继续
 ces           # 管理菜单（状态/启停/日志/服务注册/重配/卸载）
 ces service install   # 注册 systemd(Linux)/launchd(macOS)，开机自启
@@ -90,5 +91,6 @@ ces service install   # 注册 systemd(Linux)/launchd(macOS)，开机自启
 ## 测试
 
 ```bash
-python -m pytest tests/ -v     # 需 fastapi/uvicorn/pytest；SKILL_SCRIPTS_DIR 指向 skill 仓
+python -m pytest tests/ -v     # 需 fastapi/uvicorn/pytest；客户端脚本默认取同级 ../compile-excel-skills，
+                               # 也可用 SKILL_SCRIPTS_DIR 指定；找不到时相关用例跳过
 ```

@@ -96,10 +96,21 @@ def _pid_alive(pid: int | None) -> bool:
         return False
 
 
-def healthz(port: int, timeout: float = 2.0) -> dict | None:
+def _host(install: dict) -> str:
+    return str(install.get("host") or "127.0.0.1").strip()
+
+
+def _probe_host(host: str) -> str:
+    """探活地址：监听全部网卡时走回环，绑定具体地址时直连该地址。"""
+    if host in ("", "0.0.0.0", "::", "localhost"):
+        return "127.0.0.1"
+    return host
+
+
+def healthz(port: int, timeout: float = 2.0, host: str = "127.0.0.1") -> dict | None:
     try:
         with urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/healthz", timeout=timeout) as resp:
+                f"http://{_probe_host(host)}:{port}/healthz", timeout=timeout) as resp:
             return json.loads(resp.read())
     except (OSError, ValueError):
         return None
@@ -108,9 +119,11 @@ def healthz(port: int, timeout: float = 2.0) -> dict | None:
 def _serve_argv(install: dict) -> list[str]:
     if getattr(sys, "frozen", False):
         return [sys.executable, "serve",
-                "--data", install["data"], "--port", str(install["port"])]
+                "--data", install["data"], "--port", str(install["port"]),
+                "--host", _host(install)]
     return [sys.executable, str(ROOT / "ces_main.py"), "serve",
-            "--data", install["data"], "--port", str(install["port"])]
+            "--data", install["data"], "--port", str(install["port"]),
+            "--host", _host(install)]
 
 
 def _detached_popen(argv: list[str], log_path: Path) -> int:
@@ -131,12 +144,13 @@ def cmd_status() -> None:
     install = load_install()
     pid = _read_pid(install)
     alive = _pid_alive(pid)
-    health = healthz(install["port"])
+    health = healthz(install["port"], host=_host(install))
     print("compile-excel-server 状态")
     print(f"  进程    : {'运行中 pid=' + str(pid) if alive else '未运行'}")
     print(f"  健康    : {'OK ' + json.dumps(health, ensure_ascii=False) if health else '不可达'}")
     print(f"  数据    : {install['data']}")
     print(f"  端口    : {install['port']}")
+    print(f"  监听    : {_host(install)}")
     print(f"  代码    : {install.get('repo', '-')}")
     unit = _service_unit_path(install)
     print(f"  服务    : {unit if unit and unit.exists() else '未注册（ces service install）'}")
@@ -147,15 +161,15 @@ def cmd_start() -> None:
     if _pid_alive(_read_pid(install)):
         print(f"已在运行（pid={_read_pid(install)}）")
         return
-    if healthz(install["port"]):
+    if healthz(install["port"], host=_host(install)):
         print(f"端口 {install['port']} 已有实例（无 pidfile）")
         return
     pid = _detached_popen(_serve_argv(install), Path(install["data"]) / "server.log")
     _pid_file(install).write_text(str(pid))
     print(f"已启动 pid={pid}")
     for _ in range(40):
-        if healthz(install["port"], timeout=1):
-            print(f"healthz: {healthz(install['port'])}")
+        if healthz(install["port"], timeout=1, host=_host(install)):
+            print(f"healthz: {healthz(install['port'], host=_host(install))}")
             return
         time.sleep(0.5)
     print("探活失败，看 <数据目录>/server.log", file=sys.stderr)
