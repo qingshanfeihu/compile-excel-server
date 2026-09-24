@@ -15,6 +15,7 @@
   config show|set|unset|import-env   组织下发给客户端的地址常量
   registry list|show|import-dir|promote|verify|gc   数据包注册表
   audit verify               复核审计日志（哈希链 + 实例密钥 hmac）
+  generate --inputs D --out D [...]   服务端生成链：按 InfoTest 批入口顺序重生投影（源码安装）
 
 管理命令默认作用于安装登记里的数据目录，可用 --data <目录> 指定。
 
@@ -643,6 +644,57 @@ def cmd_registry(rest: list[str]) -> int:
     return 64
 
 
+def cmd_generate(rest: list[str]) -> int:
+    import argparse
+
+    from generators.chain import DEFAULT_STEPS, STEPS
+    from generators.runner import GenerateError, run
+
+    parser = argparse.ArgumentParser(
+        prog="ces generate",
+        description="按 InfoTest 批入口的顺序重生编译投影；产物目录可直接交给 "
+                    "ces registry import-dir <build> projections <out>")
+    parser.add_argument("--inputs", help="InfoTest 仓根布局的输入目录（不改它，复制一份再跑）")
+    parser.add_argument("--out", help="本次新写或改动的投影放这里")
+    parser.add_argument("--steps", default=",".join(DEFAULT_STEPS),
+                        help=f"逗号分隔；缺省 {','.join(DEFAULT_STEPS)}")
+    parser.add_argument("--raw-build", default="", help="设备 OS 原始 build（命令树分区）")
+    parser.add_argument("--execution-build", default="")
+    parser.add_argument("--version", default="", help="产品版本轴（如 10.5）")
+    parser.add_argument("--vendor", default="", help="含 cex_core 的目录（缺省 gateway/vendor）")
+    parser.add_argument("--report", default="", help="报告另存到这里（JSON）")
+    parser.add_argument("--list", action="store_true", help="列出步骤、所需输入后退出")
+    args = parser.parse_args(rest)
+    if args.list:
+        for name, step in STEPS.items():
+            flag = "默认" if step.default else "点名"
+            print(f"{name:<26} {flag}  {step.note}")
+            for need in step.needs:
+                print(f"{'':<32}需要 {need}")
+        return 0
+    if getattr(sys, "frozen", False):
+        print("ces generate 只在源码安装里可用（每一步要起一个 Python 子进程）")
+        return 2
+    if not args.inputs or not args.out:
+        parser.print_usage()
+        return 64
+    params = {"raw_build": args.raw_build, "execution_build": args.execution_build,
+              "version": args.version}
+    try:
+        report = run(Path(args.inputs), Path(args.out),
+                     steps=[s for s in args.steps.split(",") if s.strip()],
+                     params={k: v for k, v in params.items() if v},
+                     vendor=Path(args.vendor) if args.vendor else None)
+    except GenerateError as exc:
+        print(str(exc))
+        return 2
+    text = json.dumps(report, ensure_ascii=False, indent=1)
+    if args.report:
+        Path(args.report).write_text(text + "\n", encoding="utf-8")
+    print(text)
+    return 0 if report["ok"] else 1
+
+
 # ── 菜单 ─────────────────────────────────────────────────
 def menu() -> None:
     while True:
@@ -725,6 +777,8 @@ def main() -> int:
         return cmd_config(rest)
     elif command == "registry":
         return cmd_registry(rest)
+    elif command == "generate":
+        return cmd_generate(rest)
     elif command == "audit":
         return cmd_audit(rest)
     else:

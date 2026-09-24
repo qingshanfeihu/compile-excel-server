@@ -1,0 +1,4 @@
+# ces generate（服务端生成链）子进程里跑的生成器依赖；服务端本身不需要
+openpyxl>=3.1
+PyYAML>=6.0
+pydantic>=2.6

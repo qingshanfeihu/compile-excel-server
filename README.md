@@ -58,6 +58,7 @@ ces users add alice   # 建账号；访问码只显示一次（或 --out 文件 
 | `config show\|set <键> <地址>\|unset <键>\|import-env <文件>` | 下发给客户端的门户/缺陷系统/网关地址 |
 | `registry list\|show <build>\|import-dir <build> <kind> <目录>\|promote <build> <bundle_id>\|verify\|gc` | 数据包注册表：查看、手工导入一类数据、切通道、全量复核 blob、回收无引用 blob |
 | `audit verify` | 复核审计日志：逐行哈希链 + 实例密钥 hmac，报出第一处被改或被删的行 |
+| `generate --inputs D --out D [--steps …] [--raw-build …] [--version …] [--report F]` / `generate --list` | 服务端生成链：按 InfoTest 批入口顺序重生投影（源码安装可用，见下文） |
 
 管理命令默认作用于安装登记里的数据目录，也可以加 `--data <目录>`。
 
@@ -160,6 +161,26 @@ ces clients add publisher --scopes "bundles:publish bundles:read" --out ~/.confi
 - spec：先跑 InfoTest 自己的 spec 同步，同步失败就拒绝；代龄只记录在包的 `source` 里。
 - 命令树只发投影 JSON，不发原始 XML（原始 XML 带参数默认值，含凭据默认值）。
 - `--dry-run` 只做解析与校验。内容没变时重跑是空操作，适合每天由 cron 跑一次。
+
+### 服务端生成链：`ces generate`（`generators/`）
+
+把 InfoTest 批入口里纯本地的那几段搬到服务端：输入目录（InfoTest 仓根布局：框架镜像、手册、
+命令树代际、`scripts/data` 策展源、入库的那几份 compile_ref）复制成工作副本，逐步起子进程调
+InfoTest 的同名函数，产物目录可直接 `ces registry import-dir <build> projections <out>` 发布。
+
+| 步骤 | 调的 InfoTest 函数 | 缺省 |
+|---|---|---|
+| `framework_projections` | `environment_prepare._converge_framework_projections`（按需结转重生 capability atlas、确认提示、能力用法索引、先例建议、设备行为样例、语言目录） | 跑 |
+| `compile_projections` | `environment_prepare.refresh_compile_projections`（命令树代际、清场 atlas、判据规则、节奏用法、语言目录；要 `--raw-build`、`--version`） | 跑 |
+| `rule_registry` / `device_behavior_examples` / `device_characteristics` | 三份入库投影的生成器 | 点名才跑 |
+
+- 生成逻辑一行不重写：函数来自 compile-excel-skills 的 `cex_core/engine`（从 InfoTest 抽取、逐条对拍），
+  经 `tools/sync_gateway_vendor.py --only cex_core` 同步进 `gateway/vendor/`；
+- 每一步先核对自己要的输入与参数，缺了记 `missing_inputs` / `missing_params`，依赖它的步骤记
+  `skipped`，退出码 1；不静默产出；
+- 生成器依赖（openpyxl、PyYAML、pydantic）见 `requirements-generators.txt`；每一步要起 Python 子进程，
+  所以只在源码安装里可用；
+- 上游同步（WebDAV 手册与规格书、跳板机框架镜像、设备命令树、构建站）不在这里，仍走上面的导入器。
 
 ## 跳板机网关（cexg，`gateway/`）
 
