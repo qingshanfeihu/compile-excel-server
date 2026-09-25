@@ -162,6 +162,24 @@ ces clients add publisher --scopes "bundles:publish bundles:read" --out ~/.confi
 - 命令树只发投影 JSON，不发原始 XML（原始 XML 带参数默认值，含凭据默认值）。
 - `--dry-run` 只做解析与校验。内容没变时重跑是空操作，适合每天由 cron 跑一次。
 
+### 数据目录发布通道：`tools/publish_data_dir.py`（不导入 InfoTest 代码）
+
+对已收敛的数据目录（InfoTest 仓根布局）只做数据文件自己的身份核对，再用同一个 Publisher 上传：
+
+```bash
+python3 tools/sync_gateway_vendor.py --skills-root ../compile-excel-skills --only cex_core
+python3 tools/publish_data_dir.py --data-root <数据目录> --raw-build "<show version 的完整版本>" \
+    --manual-version <手册版本> --server https://<服务端> \
+    --client-secret-file ~/.config/ces-publisher.secret --promote   # 或 --dry-run / --out-dir <目录>
+```
+
+- 命令树：从活动代际取 XML，按引擎的凭据参数规则把 `default_value` 置空（`tools/cmdtree_rederive.py`），
+  再用引擎自己的函数从这份 XML 重推导代际、投影、拆卸图谱与领域文法；重推导结果与原件只许
+  身份字段不同，否则拒绝发布。包里发脱敏 XML、代际清单与投影，`cmdtree/source.json` 记脱敏收据。
+- 另发编写阶段要的两份：判据台账种子（`projections/criterion_author_rules.jsonl`）与 SSL 生命周期
+  证据（`projections/ssl_lifecycle_contract.json`，图谱身份随重推导改绑）。
+- 模板与契约的固定身份取自同步来的 `gateway/vendor/cex_core`（客户端校验的同一份）。
+
 ### 服务端生成链：`ces generate`（`generators/`）
 
 把 InfoTest 批入口里纯本地的那几段搬到服务端：输入目录（InfoTest 仓根布局：框架镜像、手册、
