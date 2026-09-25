@@ -102,6 +102,14 @@ TOOL_SPECS: list[dict[str, Any]] = [
                               "command": {"type": "string"},
                               "device_index": {"type": "integer", "minimum": 0}},
                              ["lease_id", "token", "command"])},
+    {"name": "bed_topology", "scope": "jumphost:run", "read_only": True,
+     "description": "Network facts of this bed (network_topology.json, InfoTest layout): every "
+                    "bed host's interfaces from the jumphost, device interfaces from a read-only "
+                    "'show ip address', the L2 domains the jumphost sits in. Compile-time checks "
+                    "(reachability, VIP and trigger-host choice, real-server addresses) read it. "
+                    "Cached on the gateway; refresh=true re-probes. Needs your lease.",
+     "input_schema": _schema({**LEASE_PROPS, "refresh": {"type": "boolean"}},
+                             ["lease_id", "token"])},
     {"name": "init_device", "scope": "jumphost:admin", "read_only": False,
      "description": "Wipe and re-baseline devices over the serial console. Two steps: step=prepare "
                     "returns the exact plan and a one-time confirmation code; show the plan to the "
@@ -129,7 +137,8 @@ class Gateway:
             "lease_release": self.lease_release, "lease_status": self.lease_status,
             "env_prepare": self.env_prepare, "case_submit": self.case_submit,
             "case_status": self.case_status, "case_results": self.case_results,
-            "probe_show": self.probe_show, "init_device": self.init_device,
+            "probe_show": self.probe_show, "bed_topology": self.bed_topology,
+            "init_device": self.init_device,
         }
 
     # ── 公共 ──────────────────────────────────────────────
@@ -356,6 +365,35 @@ class Gateway:
             result = framework.probe(self.cfg, command.strip(), self.cfg.build, index)
         if "error" in result:
             raise ToolError(f"probe failed: {result['error']}")
+        return result
+
+    def bed_topology(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
+        from . import bed
+
+        self._lease(caller, args)
+        cache = self.cfg.state_dir / "bed_topology.json"
+        if not args.get("refresh"):
+            try:
+                return json.loads(cache.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pass
+        with self.state.bed_lock() as locked:
+            if not locked:
+                raise ToolError("bed busy: a run is in progress")
+            try:
+                result = bed.collect(
+                    self.cfg,
+                    hosts=lambda hosts: framework.bed_hosts(self.cfg, hosts),
+                    probe_show_ip=lambda index: framework.probe(
+                        self.cfg, "show ip address", self.cfg.build, index).get("output") or "",
+                    reachable=framework.device_reachable)
+            except framework.FrameworkError as exc:
+                raise ToolError(str(exc)) from None
+        tmp = cache.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, cache)
+        self.audit("bed_topology", subject=caller.subject, sha256=result["sha256"],
+                          devices=len(result["topology"].get("devices") or []))
         return result
 
     # ── 设备初始化（两步）──────────────────────────────────

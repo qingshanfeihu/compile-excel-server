@@ -267,6 +267,15 @@ def query_results(cfg: GatewayConfig, build: str, case_ids: list[str], *,
     return agent_call(cfg, request)
 
 
+def bed_hosts(cfg: GatewayConfig, hosts: dict[str, str]) -> dict[str, Any]:
+    """代理逐台登 conf [env] 主机取接口地址；主机密钥钉在网关状态目录里。"""
+    out = agent_call(cfg, {"op": "hosts", "hosts": dict(hosts), "apv_src": str(cfg.apv_src),
+                           "pins": str(cfg.state_dir / "bed_host_key_pins.json")}, timeout=240)
+    if "error" in out:
+        raise FrameworkError(f"host probe failed: {out['error']}")
+    return out.get("hosts") or {}
+
+
 def probe(cfg: GatewayConfig, command: str, build: str, device_index: int) -> dict[str, Any]:
     parser = read_conf(cfg)
     ips = device_ips(parser)

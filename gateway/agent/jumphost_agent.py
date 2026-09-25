@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """jumphost_agent：在测试框架自带的 py38 里执行的小代理（由网关子进程调用）。
 
-只做两件需要框架运行环境的事：
+只做需要框架运行环境的事：
 - probe：SSH 到设备执行一条只读命令（paramiko，框架环境自带）；
-- results：查结果库（给了口令就用 pymysql 直连，否则借框架自己的 lib.mysqldb.Result_DB）。
+- results：查结果库（给了口令就用 pymysql 直连，否则借框架自己的 lib.mysqldb.Result_DB）；
+- hosts：用框架自己的字面凭据登床内主机取接口地址（拓扑事实），主机密钥首见即钉。
 请求是 stdin 上的一个 JSON（含凭据，不进命令行参数）；结果是 stdout 最后一行 JSON。
 必须兼容 Python 3.8：不用 3.9+ 语法。
 合并自 InfoTest device_mcp_server/tools.py 的 probe_show 与 result_db.py。
@@ -142,7 +143,84 @@ def op_probe(req):
     return {"command": cmd, "output": "\n".join(lines)}
 
 
-OPS = {"results": op_results, "probe": op_probe}
+def framework_credentials(apv_src):
+    """框架 lib/ssh_server.py 里登测试床主机的那一处字面凭据（与 InfoTest 拓扑生成器同一取法）。
+
+    只认恰好一处 connect(username=<字面>, password=<字面>)：多处时不知道哪对该配哪对，宁可不取。
+    """
+    import ast
+
+    import io
+    with io.open(apv_src.rstrip("/") + "/lib/ssh_server.py", encoding="utf-8", errors="replace") as fh:
+        tree = ast.parse(fh.read())
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "connect":
+            kw = dict((k.arg, k.value) for k in node.keywords)
+            user, password = kw.get("username"), kw.get("password")
+            if isinstance(user, ast.Constant) and isinstance(password, ast.Constant) \
+                    and isinstance(user.value, str) and isinstance(password.value, str):
+                found.append((user.value, password.value))
+    if len(found) != 1:
+        raise RuntimeError("framework ssh_server.py has %d literal connect credentials; "
+                           "need exactly one" % len(found))
+    return found[0]
+
+
+def op_hosts(req):
+    """逐台登床内主机取接口地址（ip -o addr show）。主机密钥首见即钉，之后不一致就不递口令。"""
+    import hashlib
+    import socket
+
+    import paramiko
+
+    user, password = framework_credentials(req["apv_src"])
+    pins_path = req.get("pins") or ""
+    try:
+        with open(pins_path) as fh:
+            pins = json.load(fh)
+    except (IOError, OSError, ValueError):
+        pins = {}
+    out = {}
+    for name, ip in sorted((req.get("hosts") or {}).items()):
+        transport = None
+        try:
+            sock = socket.create_connection((ip, 22), timeout=8)
+            transport = paramiko.Transport(sock)
+            transport.start_client(timeout=8)
+            key = transport.get_remote_server_key()
+            fingerprint = key.get_name() + ":" + hashlib.sha256(key.asbytes()).hexdigest()
+            pinned = pins.get(ip)
+            if pinned and pinned != fingerprint:
+                out[name] = {"ip": ip, "error": "host_key_mismatch"}
+                continue
+            transport.auth_password(user, password)
+            chan = transport.open_session(timeout=8)
+            chan.settimeout(20)
+            chan.exec_command("ip -o addr show 2>/dev/null || ifconfig -a")
+            data = b""
+            while True:
+                chunk = chan.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+            pins.setdefault(ip, fingerprint)
+            out[name] = {"ip": ip, "output": data.decode("utf-8", "replace")}
+        except Exception as exc:  # noqa: BLE001 — 单台失败不连累别台，记下原因
+            out[name] = {"ip": ip, "error": "%s: %s" % (type(exc).__name__, exc)}
+        finally:
+            if transport is not None:
+                transport.close()
+    if pins_path:
+        tmp = pins_path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(pins, fh, sort_keys=True)
+        import os
+        os.replace(tmp, pins_path)
+    return {"hosts": out}
+
+
+OPS = {"results": op_results, "probe": op_probe, "hosts": op_hosts}
 
 
 def main():
