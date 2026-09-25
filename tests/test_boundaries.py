@@ -17,6 +17,12 @@ _PATTERNS = [
     re.compile(r"langchain" + r"_env"),
     re.compile(r"""["'/]\s*""" + "environ" + r"""ment["']"""),
 ]
+# 逐字放行的同名字面（文件 → 原文）：不是配置文件路径。只剥这一段原文再扫，同一文件里别处
+# 再出现照样报。publish_data_dir.py 读的是 Excel 晋升回执里的字段（晋升环境）。
+_ENV = "environ" + "ment"
+_KNOWN_LITERALS = {
+    "tools/publish_data_dir.py": (f'receipt.get("{_ENV}")',),
+}
 
 
 def test_server_code_does_not_touch_infotest_configuration():
@@ -27,6 +33,9 @@ def test_server_code_does_not_touch_infotest_configuration():
         if rel in ALLOWED or rel.startswith("tests/"):
             continue
         text = (REPO_ROOT / rel).read_text(encoding="utf-8", errors="ignore")
+        for literal in _KNOWN_LITERALS.get(rel, ()):
+            assert text.count(literal) == 1, f"{rel}: 放行的原文变了，重核这条放行：{literal}"
+            text = text.replace(literal, "")
         for pattern in _PATTERNS:
             if pattern.search(text):
                 offenders.append(f"{rel}: {pattern.pattern}")

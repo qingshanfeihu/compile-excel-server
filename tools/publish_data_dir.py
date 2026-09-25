@@ -233,12 +233,13 @@ class DataDirResolver:
                 or receipt.get("final_contract_sha256") != contract_pin:
             return self.fail("template", f"promotion receipt is for {receipt.get('device_build')}, "
                                          f"status {receipt.get('status')}")
-        meta = {"contract_sha256": contract_pin, "environment": receipt.get("environment")}
-        self.add("template", tpl.name, tpl, legacy_name=tpl.name, version=self.build, **meta)
+        released_in = receipt.get("environment")  # 晋升回执记的 Excel 晋升环境
+        self.add("template", tpl.name, tpl, legacy_name=tpl.name, version=self.build,
+                 contract_sha256=contract_pin, environment=released_in)
         for name in ("excel_contract.json", "excel_workbook_manifest.json"):
             self.add("template", name, ref / name)
         self.add("template", "promotion_receipt.json", receipt_path)
-        self.source["excel_environment"] = receipt.get("environment")
+        self.source["excel_environment"] = released_in
         self.ok("template", f"promoted for {self.build}")
 
     def manual(self) -> None:
