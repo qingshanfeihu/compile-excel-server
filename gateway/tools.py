@@ -314,7 +314,14 @@ class Gateway:
         if status.get("state") != "done":
             return {"task_id": task["task_id"], "channel": "not_completed",
                     "state": status.get("state", "unknown")}
-        queried = framework.query_results(self.cfg, task["build"], task["case_ids"])
+        finished = status.get("finished_at")
+        run_dir = framework.report_run_dir(
+            self.cfg, task["module"], task["autoid"], task["deliver_epoch"] - 3,
+            float(finished) + 60 if finished else None)
+        # 找不到本次运行的报告目录就没有本次的判定：宁可 not_run，也不借用别的运行留下的行
+        queried = (framework.query_results(self.cfg, task["build"], task["case_ids"],
+                                           run_dir=run_dir)
+                   if run_dir else {"results": {}})
         logs = framework.batch_logs(self.cfg, task["module"], task["autoid"],
                                     task["deliver_epoch"] - 3)
         cases = []
@@ -330,7 +337,8 @@ class Gateway:
         else:
             channel = "ready"
         return {"task_id": task["task_id"], "channel": channel, "rc": status.get("rc"),
-                "xlsx_sha256": task["xlsx_sha256"], "cases": cases,
+                "xlsx_sha256": task["xlsx_sha256"], "cases": cases, "run_dir": run_dir,
+                "ignored_rows": queried.get("ignored_rows", 0),
                 **({"query_error": queried["error"]} if "error" in queried else {})}
 
     # ── 只读探测 ──────────────────────────────────────────

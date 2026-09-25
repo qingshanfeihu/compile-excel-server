@@ -56,6 +56,8 @@ def test_case(request):
     slow = root / "slow_run"
     if slow.exists():
         time.sleep(float(slow.read_text() or "3"))
+    verdicts = json.loads((root / "fake_verdicts.json").read_text()) \\
+        if (root / "fake_verdicts.json").exists() else {}
     wb = load_workbook(here / "case.xlsx", read_only=True)
     ids = []
     for ws in wb.worksheets:
@@ -64,15 +66,22 @@ def test_case(request):
             if a.isdigit() and len(a) >= 12 and a != "999999999999999" and a not in ids:
                 ids.append(a)
     module = here.parent.name[len("ist_staging_"):]
-    results = json.loads((root / "fake_results.json").read_text()) \\
-        if (root / "fake_results.json").exists() else {}
+    # 与真框架一致：每次运行一个报告目录，结果库一行一案，url 指向本次运行的报告目录
+    run = "run-%d-%s" % (time.time_ns(), build)
+    rows = json.loads((root / "fake_results.json").read_text()) \\
+        if (root / "fake_results.json").exists() else []
     for cid in ids:
-        base = root / "report" / "r1" / "x" / ("ist_staging_" + module) / here.name / \\
-            "test_xlsx" / "case.xlsx" / cid
-        base.mkdir(parents=True, exist_ok=True)
-        (base / (cid + ".txt")).write_text("ran %s on %s\\n####### end case: %s\\n" % (cid, build, cid))
-        results[build + ":" + cid] = "PASS"
-    (root / "fake_results.json").write_text(json.dumps(results))
+        if cid in verdicts.get("skip", []):
+            continue
+        rel = "report/%s/%s/ist_staging_%s/%s/test_xlsx/case.xlsx/%s" % (run, module, module, here.name, cid)
+        (root / rel).mkdir(parents=True, exist_ok=True)
+        (root / rel / (cid + ".txt")).write_text("ran %s on %s\\n####### end case: %s\\n" % (cid, build, cid))
+        sub = "ist_staging_" + module
+        rows = [r for r in rows if not (r["table"] == build and r["case_id"] == cid and r["sub_module"] == sub)]
+        rows.append({"table": build, "case_id": cid, "sub_module": sub,
+                     "result": verdicts.get(cid, "PASS"),
+                     "url": "http://jumphost/test/fw/" + rel + "/" + cid + "/"})
+    (root / "fake_results.json").write_text(json.dumps(rows))
 '''
 
 FAKE_CONFTEST = '''
@@ -88,13 +97,10 @@ class Result_DB(object):
     def db_exec(self, queries):
         sql, params = queries[0]
         table = re.search(r"FROM `([^`]+)`", sql).group(1)
-        data = json.load(open(os.path.join(os.getcwd(), "fake_results.json")))
-        rows = []
-        for key, value in data.items():
-            build, _, cid = key.partition(":")
-            if build == table and cid in params:
-                rows.append((cid, value))
-        return rows
+        rows = json.load(open(os.path.join(os.getcwd(), "fake_results.json")))
+        wanted = [p for p in params if not p.endswith("%")]
+        return [(r["case_id"], r["result"], r["url"]) for r in rows
+                if r["table"] == table and r["case_id"] in wanted]
 '''
 
 FAKE_CU = r'''

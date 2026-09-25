@@ -195,12 +195,30 @@ def read_status(cfg: GatewayConfig, task_id: str) -> dict[str, Any]:
     return status
 
 
+def _report_bases(cfg: GatewayConfig, module: str, autoid: str) -> list[Path]:
+    """这个落位目录历次运行的报告目录，新的在前。"""
+    pattern = f"report/*/*/ist_staging_{safe(module, 'module')}/{safe(autoid, 'autoid')}" \
+              "/test_xlsx/case.xlsx"
+    return sorted(cfg.apv_src.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def report_run_dir(cfg: GatewayConfig, module: str, autoid: str, min_epoch: float,
+                   max_epoch: float | None = None) -> str | None:
+    """本次任务那一次框架运行的报告目录名（report/<名>/…），投递前或任务结束后的都不算。"""
+    for base in _report_bases(cfg, module, autoid):
+        mtime = base.stat().st_mtime
+        if max_epoch is not None and mtime > max_epoch:
+            continue
+        if mtime < min_epoch:
+            return None
+        return base.relative_to(cfg.apv_src / "report").parts[0]
+    return None
+
+
 def batch_logs(cfg: GatewayConfig, module: str, autoid: str, min_epoch: float,
                max_chars: int = 3500) -> dict[str, dict[str, Any]]:
     """最新一份报告目录里每个用例的日志；mtime 早于 min_epoch 的判为 stale（上一轮留下的）。"""
-    pattern = f"report/*/*/ist_staging_{safe(module, 'module')}/{safe(autoid, 'autoid')}" \
-              "/test_xlsx/case.xlsx"
-    bases = sorted(cfg.apv_src.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    bases = _report_bases(cfg, module, autoid)
     out: dict[str, dict[str, Any]] = {}
     if not bases:
         return out
@@ -236,10 +254,13 @@ def agent_call(cfg: GatewayConfig, request: dict[str, Any], timeout: float = 120
     return {"error": "agent returned no JSON", "stderr": scrub_text(proc.stderr[-800:])}
 
 
-def query_results(cfg: GatewayConfig, build: str, case_ids: list[str]) -> dict[str, Any]:
+def query_results(cfg: GatewayConfig, build: str, case_ids: list[str], *,
+                  run_dir: str) -> dict[str, Any]:
+    """结果库按"构建表 + case_id"存，一案可能有多行（别的床、上一轮）；只取本次运行报告目录下那行。"""
     parser = read_conf(cfg)
     request: dict[str, Any] = {"op": "results", "mysql_ip": mysql_ip(parser), "build": build,
-                               "case_ids": list(case_ids), "apv_src": str(cfg.apv_src)}
+                               "case_ids": list(case_ids), "apv_src": str(cfg.apv_src),
+                               "run_dir": run_dir}
     if cfg.mysql_password_file:
         request.update({"mysql_password": cfg.mysql_password_file.read_text(encoding="utf-8").strip(),
                         "mysql_user": cfg.mysql_user, "mysql_db": cfg.mysql_db})

@@ -251,13 +251,50 @@ def test_env_prepare_reports_each_check(fake_env, monkeypatch):
     assert next(c for c in out["checks"] if c["check"] == "device_build")["ok"] is False
 
 
-def test_agent_results_via_framework_result_db(fake_env):
+def _row(cid: str, result: str, run: str, *, bed: str = "jumphost", sub: str = "ist_staging_sdns") -> dict:
+    module = sub[len("ist_staging_"):]
+    return {"table": BUILD, "case_id": cid, "sub_module": sub, "result": result,
+            "url": f"http://{bed}/test/fw/report/{run}/{module}/{sub}/x/test_xlsx/case.xlsx/{cid}/{cid}/"}
+
+
+def test_agent_results_keep_only_rows_of_this_run(fake_env):
+    """结果库一案多行（别的床、上一轮）：只认 url 指向本次运行报告目录的那一行。"""
     apv = fake_env["apv"]
-    (apv / "fake_results.json").write_text(json.dumps({f"{BUILD}:202609240000000051": "FAIL"}),
-                                           encoding="utf-8")
+    rows = [_row("202609240000000051", "FAIL", "run-this"),
+            _row("202609240000000051", "PASS", "run-old", bed="other-bed", sub="ist_staging_slb")]
+    (apv / "fake_results.json").write_text(json.dumps(rows), encoding="utf-8")
     out = framework.query_results(fake_env["gateway"].cfg, BUILD,
-                                  ["202609240000000051", "202609240000000052"])
-    assert out == {"results": {"202609240000000051": "FAIL"}}
+                                  ["202609240000000051", "202609240000000052"], run_dir="run-this")
+    assert out == {"results": {"202609240000000051": "FAIL"}, "ignored_rows": 1}
+
+
+def test_results_come_from_this_run_not_other_beds_or_rounds(fake_env, tmp_path):
+    """别的床与上一轮在同一张构建表里留下的 PASS 不能顶替本次的判定。"""
+    gw, apv = fake_env["gateway"], fake_env["apv"]
+    a, b = "202609240000000071", "202609240000000072"
+    (apv / "fake_results.json").write_text(json.dumps(
+        [_row(a, "PASS", "run-old", bed="other-bed", sub="ist_staging_slb"),
+         _row(b, "PASS", "run-old", bed="other-bed", sub="ist_staging_slb")]), encoding="utf-8")
+    data = make_workbook(tmp_path / "c.xlsx", [(a, "APV_1", "cmd", "show slb real"),
+                                              (b, "APV_1", "cmd", "show slb real")])
+
+    def run_round(verdicts: dict) -> dict:
+        (apv / "fake_verdicts.json").write_text(json.dumps(verdicts), encoding="utf-8")
+        lease = _lease(gw)
+        submitted = gw.call(ALICE, "case_submit",
+                            {**lease, "xlsx_b64": base64.b64encode(data).decode()})
+        assert submitted["ok"], submitted
+        _wait_done(gw, ALICE, submitted["task_id"])
+        gw.call(ALICE, "lease_release", lease)
+        return gw.call(ALICE, "case_results", {"task_id": submitted["task_id"]})
+
+    first = run_round({a: "FAIL"})
+    assert {c["case_id"]: c["result"] for c in first["cases"]} == {a: "FAIL", b: "PASS"}
+    assert first["channel"] == "ready"
+    time.sleep(0.05)
+    second = run_round({"skip": [b]})     # 这一轮 b 没跑：上一轮与别的床的 PASS 都不算数
+    assert {c["case_id"]: c["result"] for c in second["cases"]} == {a: "PASS", b: None}
+    assert second["channel"] == "missing_after_done"
 
 
 def test_agent_is_python38_syntax():

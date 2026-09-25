@@ -52,7 +52,7 @@ def op_results(req):
     for b in bare:
         clauses.append("(case_id = %s OR case_id LIKE %s OR case_id LIKE %s)")
         params.extend([b, b + ".%", "test_" + b + "%"])
-    sql = "SELECT case_id, result FROM `%s` WHERE %s" % (table, " OR ".join(clauses))
+    sql = "SELECT case_id, result, url FROM `%s` WHERE %s" % (table, " OR ".join(clauses))
     if req.get("mysql_password"):
         import pymysql
 
@@ -81,11 +81,17 @@ def op_results(req):
         database = Result_DB.__new__(Result_DB)
         database.configer = config
         rows = database.db_exec([(sql, params)]) or []
-    results = {}
+    # 同一构建表里一案可能有多行（别的床、上一轮）；只认 url 落在本次运行报告目录下的那行
+    marker = "/report/%s/" % req["run_dir"] if req.get("run_dir") else None
+    results, ignored = {}, 0
     for row in rows:
         case_id, result = row[0], row[1]
+        url = str(row[2] or "") if len(row) > 2 else ""
+        if marker is None or marker not in url:
+            ignored += 1
+            continue
         results[bare_autoid(case_id)] = str(result)
-    return {"results": results}
+    return {"results": results, "ignored_rows": ignored}
 
 
 def op_probe(req):
