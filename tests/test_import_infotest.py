@@ -64,6 +64,44 @@ def test_publish_promote_and_noop(publish_env):
     assert again["created"] is False and again["uploaded_blobs"] == 0
 
 
+def test_large_blob_republish_and_cross_kind_duplicate(publish_env):
+    """大 blob（超过套接字缓冲）重发与同一次发布里跨 kind 重复：都不能断管。
+
+    服务端已有的 blob 也要读完请求体再回，否则客户端还在发送时连接被关（EPIPE）；
+    同一次发布里内容相同的条目只传一次。
+    """
+    server, secret_file = publish_env
+    big = os.urandom(4 * 1024 * 1024)
+    res = _resolution(b" big")
+    res.entries += [imp.Entry("template", "template/contract.bin", big),
+                    imp.Entry("projections", "projections/contract.bin", big)]
+    pub = imp.Publisher(server.base, "publisher", imp.read_secret_file(secret_file))
+    first = pub.publish(res, promote=False)
+    assert first["created"] is True
+    assert first["uploaded_blobs"] == len(imp.KINDS) + 1
+    again = pub.publish(res, promote=False)
+    assert again["bundle_id"] == first["bundle_id"] and again["uploaded_blobs"] == 0
+
+
+def test_put_existing_large_blob_reads_the_whole_body(publish_env):
+    """直接对服务端：同一个大 blob PUT 两次，第二次回 created=false 而不是断管。"""
+    import hashlib
+    import urllib.request
+
+    server, secret_file = publish_env
+    pub = imp.Publisher(server.base, "publisher", imp.read_secret_file(secret_file))
+    pub.login()
+    big = os.urandom(16 * 1024 * 1024)
+    digest = hashlib.sha256(big).hexdigest()
+    for expected in (True, False):
+        req = urllib.request.Request(
+            f"{server.base}/v1/blobs/{digest}", data=big, method="PUT",
+            headers={"Authorization": f"Bearer {pub._token}",
+                     "Content-Type": "application/octet-stream"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            assert json.loads(resp.read())["created"] is expected
+
+
 def test_promote_refused_when_required_kind_missing(publish_env):
     server, secret_file = publish_env
     pub = imp.Publisher(server.base, "publisher", imp.read_secret_file(secret_file))

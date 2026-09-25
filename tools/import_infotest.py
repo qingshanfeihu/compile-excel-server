@@ -462,7 +462,12 @@ class Publisher:
         if not self._token:
             self.login()
         uploaded = 0
+        sent: set[str] = set()
         for entry in resolution.entries:
+            # 同一次发布里内容相同的条目（例如同一份契约既是 projections 也是 template）只传一次
+            if entry.sha256 in sent:
+                continue
+            sent.add(entry.sha256)
             status, raw = self._request(
                 "PUT", f"/v1/blobs/{entry.sha256}", data=entry.data,
                 headers=self._auth({"Content-Type": entry.media_type}))

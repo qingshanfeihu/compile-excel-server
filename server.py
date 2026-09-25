@@ -531,6 +531,12 @@ async def put_blob(sha: str, request: Request) -> JSONResponse:
     if not valid_sha(sha):
         return JSONResponse({"detail": "invalid sha256"}, status_code=400)
     if REGISTRY.blob_info(sha) is not None:
+        # 已有同一内容也要读完请求体再回：客户端还在发送时就回并关连接，大 blob 会断管（EPIPE）
+        drained = 0
+        async for chunk in request.stream():
+            drained += len(chunk)
+            if drained > MAX_BLOB_BYTES:
+                break
         return JSONResponse({"sha256": sha, "created": False})
     writer = REGISTRY.begin_blob(request.headers.get("content-type") or "",
                                  MAX_BLOB_BYTES)
