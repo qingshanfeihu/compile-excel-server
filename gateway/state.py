@@ -221,6 +221,14 @@ class StateStore:
         data["case_ids"] = json.loads(data["case_ids"])
         return data
 
+    def next_delivery(self, module: str, autoid: str, after_epoch: float) -> float | None:
+        """同一落位目录（module + autoid）在 after_epoch 之后的下一次投递时刻；没有就是 None。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT MIN(deliver_epoch) FROM tasks WHERE module=? AND autoid=? AND deliver_epoch>?",
+                (module, autoid, after_epoch)).fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+
     # ── 初始化确认码 ─────────────────────────────────────
     def new_challenge(self, holder: str, lease_id: str, plan: dict[str, Any],
                       ttl_s: int = 300) -> str:

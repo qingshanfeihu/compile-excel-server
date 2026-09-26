@@ -324,15 +324,22 @@ class Gateway:
             return {"task_id": task["task_id"], "channel": "not_completed",
                     "state": status.get("state", "unknown")}
         finished = status.get("finished_at")
+        max_epoch = float(finished) + 60 if finished else None
+        # 同一落位目录的下一次投递之后才出现的报告目录属于那次任务：结束后 60 秒的宽限
+        # 挡不住紧接着的下一轮（返工重投常常一两分钟内就到）
+        following = self.state.next_delivery(task["module"], task["autoid"], task["deliver_epoch"])
+        if following is not None:
+            max_epoch = following if max_epoch is None else min(max_epoch, following)
         run_dir = framework.report_run_dir(
-            self.cfg, task["module"], task["autoid"], task["deliver_epoch"] - 3,
-            float(finished) + 60 if finished else None)
+            self.cfg, task["module"], task["autoid"], task["deliver_epoch"] - 3, max_epoch)
         # 找不到本次运行的报告目录就没有本次的判定：宁可 not_run，也不借用别的运行留下的行
         queried = (framework.query_results(self.cfg, task["build"], task["case_ids"],
                                            run_dir=run_dir)
                    if run_dir else {"results": {}})
-        logs = framework.batch_logs(self.cfg, task["module"], task["autoid"],
-                                    task["deliver_epoch"] - 3)
+        # 日志与判定同源：只取本次运行的报告目录；找不到就不给日志，也不借别的运行的
+        logs = (framework.batch_logs(self.cfg, task["module"], task["autoid"],
+                                     task["deliver_epoch"] - 3, run_dir=run_dir)
+                if run_dir else {})
         cases = []
         results = queried.get("results") or {}
         for case_id in task["case_ids"]:

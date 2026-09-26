@@ -75,7 +75,7 @@ def test_case(request):
             continue
         rel = "report/%s/%s/ist_staging_%s/%s/test_xlsx/case.xlsx/%s" % (run, module, module, here.name, cid)
         (root / rel).mkdir(parents=True, exist_ok=True)
-        (root / rel / (cid + ".txt")).write_text("ran %s on %s\\n####### end case: %s\\n" % (cid, build, cid))
+        (root / rel / (cid + ".txt")).write_text("ran %s on %s in %s\\n####### end case: %s\\n" % (cid, build, run, cid))
         sub = "ist_staging_" + module
         rows = [r for r in rows if not (r["table"] == build and r["case_id"] == cid and r["sub_module"] == sub)]
         rows.append({"table": build, "case_id": cid, "sub_module": sub,

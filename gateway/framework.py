@@ -216,9 +216,16 @@ def report_run_dir(cfg: GatewayConfig, module: str, autoid: str, min_epoch: floa
 
 
 def batch_logs(cfg: GatewayConfig, module: str, autoid: str, min_epoch: float,
-               max_chars: int = 3500) -> dict[str, dict[str, Any]]:
-    """最新一份报告目录里每个用例的日志；mtime 早于 min_epoch 的判为 stale（上一轮留下的）。"""
+               max_chars: int = 20000, run_dir: str | None = None) -> dict[str, dict[str, Any]]:
+    """每个用例的框架日志；mtime 早于 min_epoch 的判为 stale（上一轮留下的）。
+
+    给了 run_dir 就只读本次运行那一份报告目录——同一落位目录后来又跑过一轮时，最新目录是
+    别的任务的，拿它当本任务的证据就是张冠李戴。max_chars 按每案日志尾部截取，要装得下失败断言
+    连同它的回显（断言在中段，后面还有拆除）。"""
     bases = _report_bases(cfg, module, autoid)
+    if run_dir is not None:
+        root = cfg.apv_src / "report"
+        bases = [b for b in bases if b.relative_to(root).parts[0] == run_dir]
     out: dict[str, dict[str, Any]] = {}
     if not bases:
         return out

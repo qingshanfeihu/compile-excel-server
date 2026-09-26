@@ -296,6 +296,15 @@ def test_results_come_from_this_run_not_other_beds_or_rounds(fake_env, tmp_path)
     assert {c["case_id"]: c["result"] for c in second["cases"]} == {a: "PASS", b: None}
     assert second["channel"] == "missing_after_done"
 
+    # 紧接着又跑了一轮，再取第一轮的结果：报告目录与日志仍是第一轮自己的。结果库每案只留
+    # 最新一行——a 的行已被第二轮覆盖，第一轮的 a 就是缺失，不拿第二轮的 PASS 顶替
+    again = gw.call(ALICE, "case_results", {"task_id": first["task_id"]})
+    assert first["run_dir"] != second["run_dir"]
+    assert again["run_dir"] == first["run_dir"]
+    assert {c["case_id"]: c["result"] for c in again["cases"]} == {a: None, b: "PASS"}
+    logs = {c["case_id"]: c["log"] for c in again["cases"]}
+    assert first["run_dir"] in logs[a] and second["run_dir"] not in logs[a]
+
 
 def test_agent_is_python38_syntax():
     import ast
