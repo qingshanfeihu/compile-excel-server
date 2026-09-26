@@ -179,6 +179,9 @@ python3 tools/publish_data_dir.py --data-root <数据目录> --raw-build "<show 
 - 另发编写阶段要的两份：判据台账种子（`projections/criterion_author_rules.jsonl`）与 SSL 生命周期
   证据（`projections/ssl_lifecycle_contract.json`，图谱身份随重推导改绑）。
 - 模板与契约的固定身份取自同步来的 `gateway/vendor/cex_core`（客户端校验的同一份）。
+- 客户端（compile-excel-skills 的 `cex_client/engine_env.py`）按 `cmdtree/generation_manifest.json`
+  逐文件核哈希后摆成引擎的活动命令树代际，两份编写阶段数据摆到引擎读的位置；只带投影的旧包仍按
+  平面布局摆，引擎如实报命令树不可用。
 
 ### 服务端生成链：`ces generate`（`generators/`）
 
@@ -217,11 +220,14 @@ cexg serve --config ~/.config/cexg/gateway.toml      # systemd 样例见 gateway
 | `lease_acquire` / `lease_heartbeat` / `lease_release` / `lease_status` | `jumphost:run` | 单床租约，带 fencing token；碰设备的工具都要带当前租约 |
 | `env_prepare` | `jumphost:run` | 框架文件、conf、设备可达、设备自述构建与网关构建一致、规则与凭据字面量可用 |
 | `case_submit` | `jumphost:run` | 冻结工作簿 → 上机前闸（zip/体积、Excel 契约、自毁命令、框架凭据字面量）→ 只读落位、sha 对账 → 起跑 |
-| `case_status` / `case_results` | `jumphost:run` | 状态；结果来自框架结果库，早于投递时间的日志标 stale；输出经脱敏 |
+| `case_status` / `case_results` | `jumphost:run` | 状态；结果来自框架结果库，只认本次运行报告目录下的行（同一构建表里别的床、上一轮留下的行不算，条数记在 `ignored_rows`）；早于投递时间的日志标 stale；输出经脱敏 |
 | `probe_show` | `jumphost:run` | 单条 show/get，只读 |
+| `bed_topology` | `jumphost:run` | 本床拓扑事实（`network_topology.json`）：跳板机网卡与邻居、conf 里各台主机的接口地址（用框架自己的字面凭据登录，主机密钥首见即钉）、可达被测设备的 `show ip address`，按 InfoTest 拓扑生成器同一套纯函数合成；要租约，缓存到下次 `refresh`。客户端编写阶段的判据（VIP 选取、触发机配对、后端地址）读它 |
 | `init_device` | `jumphost:admin` | 串口重置，两步：`prepare` 给出计划与一次性确认码，`confirm` 带码执行；每步核对配置模式提示符 |
 
 - 互斥：`<state>/bed.lock` 用 `flock`，锁随 pytest 进程组继承，进程结束内核自动释放；不写 pid、不删锁文件。
+- 床拓扑缓存在 `<state>/bed_topology.json`，登录床内主机时见过的主机密钥钉在 `<state>/bed_host_key_pins.json`：
+  之后对不上的主机不再递口令，只在结果的观察项里报出来。
 - 设备初始化的命令全部来自 `gateway.toml` 的 `init_device.commands`，代码里不写设备命令。
 - 规则文件（`projections/domain_grammar.json`）从服务端该构建的 stable 包取并缓存；取不到且没有缓存就拒绝上机。
 - 判据代码 `gateway/vendor/` 由 `tools/sync_gateway_vendor.py` 从 compile-excel-skills 的 `cex_core`
