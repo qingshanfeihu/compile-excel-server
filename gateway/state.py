@@ -221,6 +221,16 @@ class StateStore:
         data["case_ids"] = json.loads(data["case_ids"])
         return data
 
+    def tasks_created_before(self, epoch: float) -> list[str]:
+        with self._conn() as conn:
+            rows = conn.execute("SELECT task_id FROM tasks WHERE created_at<?",
+                                (epoch,)).fetchall()
+        return [row[0] for row in rows]
+
+    def delete_tasks(self, task_ids: list[str]) -> None:
+        with self._conn() as conn:
+            conn.executemany("DELETE FROM tasks WHERE task_id=?", [(t,) for t in task_ids])
+
     def next_delivery(self, module: str, autoid: str, after_epoch: float) -> float | None:
         """同一落位目录（module + autoid）在 after_epoch 之后的下一次投递时刻；没有就是 None。"""
         with self._conn() as conn:

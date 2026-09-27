@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 _SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+SERVICE_PROTOS = ("http", "https", "tcp", "udp", "dns")
 
 
 class ConfigError(ValueError):
@@ -54,6 +55,8 @@ class GatewayConfig:
     init_long_commands: dict[str, int] = field(default_factory=dict)
     init_step_timeout_s: int = 5
     login_timeout_s: int = 10
+    # 本床常驻服务（运维维护的清单，bed_topology 原样带给客户端）：{host, ip, proto, port, note}
+    bed_services: tuple[dict[str, Any], ...] = ()
 
     @property
     def conf_path(self) -> Path:
@@ -87,6 +90,36 @@ def _safe(value: Any, what: str) -> str:
     return text
 
 
+def _services(raw: Any) -> tuple[dict[str, Any], ...]:
+    """[[bed.services]]：host 名、ip 地址、proto（http/https/tcp/udp/dns）、port、note（可省）。"""
+    if raw in (None, []):
+        return ()
+    if not isinstance(raw, list) or not all(isinstance(item, dict) for item in raw):
+        raise ConfigError("bed.services 必须是 [[bed.services]] 表数组")
+    out = []
+    for index, item in enumerate(raw):
+        where = f"bed.services[{index}]"
+        unknown = set(item) - {"host", "ip", "proto", "port", "note"}
+        if unknown:
+            raise ConfigError(f"{where} 有未知字段：{', '.join(sorted(unknown))}")
+        host = _safe(item.get("host"), f"{where}.host")
+        try:
+            ip = str(ipaddress.ip_address(str(item.get("ip") or "")))
+        except ValueError:
+            raise ConfigError(f"{where}.ip 不是 IP 地址：{item.get('ip')!r}") from None
+        proto = str(item.get("proto") or "").lower()
+        if proto not in SERVICE_PROTOS:
+            raise ConfigError(f"{where}.proto 只能是 {'/'.join(SERVICE_PROTOS)}：{proto!r}")
+        port = item.get("port")
+        if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
+            raise ConfigError(f"{where}.port 必须是 1–65535 的整数：{port!r}")
+        note = item.get("note", "")
+        if not isinstance(note, str):
+            raise ConfigError(f"{where}.note 必须是字符串")
+        out.append({"host": host, "ip": ip, "proto": proto, "port": port, "note": note})
+    return tuple(out)
+
+
 def load(path: Path) -> GatewayConfig:
     try:
         raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
@@ -99,6 +132,7 @@ def load(path: Path) -> GatewayConfig:
     results = raw.get("results") or {}
     device = raw.get("device") or {}
     init = raw.get("init_device") or {}
+    bed = raw.get("bed") or {}
 
     url = str(server.get("url") or "").rstrip("/")
     if not url.startswith(("https://", "http://")):
@@ -148,6 +182,7 @@ def load(path: Path) -> GatewayConfig:
         init_long_commands={str(k): int(v) for k, v in long_commands.items()},
         init_step_timeout_s=int(init.get("step_timeout_s") or 5),
         login_timeout_s=int(init.get("login_timeout_s") or 10),
+        bed_services=_services(bed.get("services")),
     )
     if not cfg.is_loopback and not cfg.tls_cert and not cfg.insecure_lan:
         raise ConfigError("监听非回环地址必须配 TLS（listen.tls_cert/tls_key），"

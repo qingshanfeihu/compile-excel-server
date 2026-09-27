@@ -17,6 +17,13 @@ import re
 import sys
 import time
 
+# 设备提示符：缓冲区最后一行以 # 或 > 结尾（锚在缓冲区末尾，回显中间的 '#' 不算）
+_PROMPT_END = re.compile(r"(?:^|[\r\n])([^\r\n]*?)(?:\([^)\r\n]*\))?[#>][ \t]*$")
+_PASSWORD_END = re.compile(r"(?:^|[\r\n])[^\r\n]*assword:?[ \t]*$", re.I)
+PROMPT_WAIT_S = 5.0      # 登录后与 enable/terminal length 各等多久提示符
+COMMAND_WAIT_S = 45.0    # 探测命令本身最多等多久（大输出分好几块到）
+QUIET_S = 0.3            # 看到提示符后再静候这么久没有新数据才算收完
+
 
 def normalize_build_name(build_name):
     b = build_name
@@ -95,6 +102,31 @@ def op_results(req):
     return {"results": results, "ignored_rows": ignored}
 
 
+def read_until_prompt(chan, prompt, timeout, quiet=None):
+    """读到缓冲区末尾是提示符、且 quiet 秒内没有新数据为止；返回 (文本, 是否等到了提示符)。
+
+    旧做法是缓冲区里出现第一个 '#' 就停：回显里有 '#'（注释、配置片段）或分块到达时，
+    输出被悄悄截断。这里只认锚在末尾的提示符，等不到就如实报超时。"""
+    quiet = QUIET_S if quiet is None else quiet
+    buf = ""
+    end = time.time() + timeout
+    seen_at = None
+    while time.time() < end:
+        if chan.recv_ready():
+            data = chan.recv(65535)
+            if not data:
+                break
+            buf += data.decode("utf-8", "replace")
+            seen_at = time.time() if prompt.search(buf) else None
+            continue
+        if seen_at is not None and time.time() - seen_at >= quiet:
+            return buf, True
+        if getattr(chan, "closed", False):
+            break
+        time.sleep(0.05)
+    return buf, bool(prompt.search(buf))
+
+
 def op_probe(req):
     import paramiko
 
@@ -106,29 +138,22 @@ def op_probe(req):
                 timeout=15, look_for_keys=False, allow_agent=False)
     try:
         chan = ssh.invoke_shell()
-
-        def read_until(token, timeout):
-            buf = ""
-            end = time.time() + timeout
-            while time.time() < end:
-                if chan.recv_ready():
-                    buf += chan.recv(65535).decode("utf-8", "replace")
-                    if token in buf:
-                        break
-                else:
-                    time.sleep(0.1)
-            return buf
-
-        read_until("#", 5)
+        banner, _ = read_until_prompt(chan, _PROMPT_END, PROMPT_WAIT_S)
+        # 登录后的那一行提示符定下主机名；命令输出要等到“主机名[(模式)]#”出现在末尾才算完
+        match = _PROMPT_END.search(banner)
+        host = match.group(1).strip() if match and match.group(1).strip() else ""
+        prompt = re.compile(r"(?:^|[\r\n])" + re.escape(host) + r"(?:\([^)\r\n]*\))?[#>][ \t]*$") \
+            if host else _PROMPT_END
+        either = re.compile("|".join((prompt.pattern, _PASSWORD_END.pattern)), re.I)
         chan.send("enable\n")
-        echo = read_until("#", 5)
-        if "assword" in echo.lower() or not re.search(r"#\s*$", echo.rstrip()):
+        echo, _ = read_until_prompt(chan, either, PROMPT_WAIT_S)
+        if _PASSWORD_END.search(echo) or not re.search(r"#[ \t]*$", echo.rstrip("\r\n")):
             chan.send("\n")
-            read_until("#", 5)
+            read_until_prompt(chan, prompt, PROMPT_WAIT_S)
         chan.send("terminal length 0\n")
-        read_until("#", 3)
+        read_until_prompt(chan, prompt, PROMPT_WAIT_S)
         chan.send(cmd + "\n")
-        out = read_until("#", 10)
+        out, complete = read_until_prompt(chan, prompt, COMMAND_WAIT_S)
     finally:
         ssh.close()
     raw = out.splitlines()
@@ -140,7 +165,12 @@ def op_probe(req):
     if core and re.match(r"^\^+$", core):
         return {"command": cmd, "syntax_error": True,
                 "output": "%% Invalid input: command %r is invalid on this device" % cmd}
-    return {"command": cmd, "output": "\n".join(lines)}
+    result = {"command": cmd, "output": "\n".join(lines)}
+    if not complete:
+        # 等不到设备提示符：输出可能不全，不能当完整回显用
+        result.update(truncated=True, note="no device prompt within %ds; output may be "
+                                           "incomplete" % int(COMMAND_WAIT_S))
+    return result
 
 
 def framework_credentials(apv_src):

@@ -9,6 +9,10 @@ User=test
 ExecStart=/home/test/.local/share/cexg/current/cexg serve --config /home/test/.config/cexg/gateway.toml
 Restart=on-failure
 RestartSec=3
+# 上机的 runner（bash → timeout → pytest）是网关起的子进程，与网关同在一个 cgroup；默认的
+# KillMode=control-group 会在网关重启/升级时连带杀掉正在跑的用例。只停网关本身，runner 跑完照常
+# 写完成状态、放床锁；真死掉的 runner 由 case_status 报 lost。
+KillMode=process
 # 网关要用串口与框架目录，不需要别的系统权限
 NoNewPrivileges=true
 

@@ -26,8 +26,15 @@ from .state import LeaseError, StateStore
 from .vendor.credential_literals import MirrorCredentialLiteralError, mirror_credential_literals
 
 GRAMMAR_PATH = "projections/domain_grammar.json"
+LITERALS_TTL_S = 600
+RUNNER_LOST = ("the runner exited without recording an end (killed by a gateway restart, OOM or "
+               "an operator); this run produced no verdicts to read - resubmit the workbook")
 _MYSQL_UNSAFE_RE = re.compile(r"[^0-9A-Za-z_]+")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+# probe_show：只许 show/get 开头的一行，参数只用这些字符——没有 | ; & ` $ < > \ 换行
+# 这类能接第二条命令、重定向写文件或在设备 shell 里展开的字符
+_PROBE_RE = re.compile(r"^(?:show|get)(?: +[A-Za-z0-9_.,:/@%+=*\"'-]+)* *$", re.IGNORECASE)
+_PROBE_MAX = 200
 
 
 class ToolError(RuntimeError):
@@ -76,8 +83,13 @@ TOOL_SPECS: list[dict[str, Any]] = [
      "description": "Check the bed before running cases: framework files present, framework conf "
                     "readable, devices reachable, the device's own build matches the gateway's "
                     "bundle build, destructive-command rules and credential literals available. "
+                    "Pass device_build (the build your cases were compiled for): a different build "
+                    "is refused; without it the result says build_checked=false. "
                     "Read-only; needs your lease.",
-     "input_schema": _schema(LEASE_PROPS, ["lease_id", "token"])},
+     "input_schema": _schema({**LEASE_PROPS,
+                              "device_build": {"type": "string", "description": "Build the "
+                                               "cases were compiled for; must equal this bed's."}},
+                             ["lease_id", "token"])},
     {"name": "case_submit", "scope": "jumphost:run", "read_only": False,
      "description": "Run a compiled case workbook on the bed. The workbook is frozen, checked "
                     "(zip/size limits, Excel contract, destructive commands, framework credential "
@@ -88,16 +100,23 @@ TOOL_SPECS: list[dict[str, Any]] = [
                               "module": {"type": "string", "description": "Staging module; defaults to the gateway's configured module."}},
                              ["lease_id", "token", "xlsx_b64"])},
     {"name": "case_status", "scope": "jumphost:run", "read_only": True,
-     "description": "State of a submitted run (running/done) with the last lines of its log.",
+     "description": "State of a submitted run (running/done/lost) with the last lines of its log. "
+                    "lost means the runner died without recording an end (gateway restart, OOM, "
+                    "operator kill); nothing more will come from that run.",
      "input_schema": _schema({"task_id": {"type": "string"}}, ["task_id"])},
     {"name": "case_results", "scope": "jumphost:run", "read_only": True,
      "description": "Per-case results of a finished run from the framework result database, with "
                     "each case's framework log. Logs older than the delivery time are marked stale "
-                    "and must not be read as this run's evidence.",
+                    "and must not be read as this run's evidence. channel=runner_lost means the "
+                    "run died before finishing and has no verdicts; resubmit it.",
      "input_schema": _schema({"task_id": {"type": "string"}}, ["task_id"])},
     {"name": "probe_show", "scope": "jumphost:run", "read_only": True,
      "description": "Run one read-only show/get command on a device and return its output. "
-                    "Single line only; no control characters or ';'. Needs your lease.",
+                    "One line of at most 200 characters starting with show or get; arguments use "
+                    "letters, digits, spaces and _ . , : / @ % + = * \" ' - only (no pipes, "
+                    "';', '&', '$', backticks, redirection or control characters). "
+                    "truncated=true means the device prompt did not come back in time and the "
+                    "output may be incomplete. Needs your lease.",
      "input_schema": _schema({**LEASE_PROPS,
                               "command": {"type": "string"},
                               "device_index": {"type": "integer", "minimum": 0}},
@@ -107,14 +126,21 @@ TOOL_SPECS: list[dict[str, Any]] = [
                     "bed host's interfaces from the jumphost, device interfaces from a read-only "
                     "'show ip address', the L2 domains the jumphost sits in. Compile-time checks "
                     "(reachability, VIP and trigger-host choice, real-server addresses) read it. "
-                    "Cached on the gateway; refresh=true re-probes. Needs your lease.",
+                    "services lists the bed's standing services from the gateway config "
+                    "({host, ip, proto, port, note}; proto is http/https/tcp/udp/dns; empty when "
+                    "none are configured). Cached on the gateway; refresh=true re-probes. Needs "
+                    "your lease.",
      "input_schema": _schema({**LEASE_PROPS, "refresh": {"type": "boolean"}},
                              ["lease_id", "token"])},
     {"name": "init_device", "scope": "jumphost:admin", "read_only": False,
      "description": "Wipe and re-baseline devices over the serial console. Two steps: step=prepare "
                     "returns the exact plan and a one-time confirmation code; show the plan to the "
-                    "user, and only after they approve call step=confirm with that code. Needs "
-                    "jumphost:admin and your lease.",
+                    "user, and only after they approve call step=confirm with that code. The code "
+                    "only binds confirm to that exact plan; the human approval itself is enforced "
+                    "by the client's permission prompt for this tool, not by the gateway. "
+                    "device_index picks one device; otherwise device_count (at least 1) takes the "
+                    "first N; with neither, every device in the conf. Needs jumphost:admin and "
+                    "your lease.",
      "input_schema": _schema({**LEASE_PROPS,
                               "step": {"type": "string", "enum": ["prepare", "confirm"]},
                               "device_index": {"type": "integer", "minimum": 0},
@@ -130,6 +156,7 @@ class Gateway:
         self.state = StateStore(cfg.state_dir, cfg.lease_ttl_s)
         self.server = server or ServerClient(cfg.server_url, cfg.client_id, cfg.client_secret_file)
         self._grammar_lock = threading.Lock()
+        self._literals: tuple[float, frozenset[str]] | None = None
         self.audit_path = cfg.state_dir / "audit.log"
         self._audit = AuditChain(self.audit_path)
         self.handlers: dict[str, Callable[[Caller, dict[str, Any]], dict[str, Any]]] = {
@@ -159,10 +186,14 @@ class Gateway:
             result = self.handlers[name](caller, args)
         except (LeaseError, ToolError, gates.GateError, framework.FrameworkError,
                 IntrospectError) as exc:
+            secrets = self.secrets()
             problems = getattr(exc, "problems", None)
-            self.audit("tool_refused", tool=name, subject=caller.subject, reason=str(exc)[:500])
-            return {"ok": False, "error": str(exc), **({"problems": problems} if problems else {})}
-        return {"ok": True, **result}
+            self.audit("tool_refused", tool=name, subject=caller.subject,
+                       reason=framework.redact(str(exc)[:500], secrets))
+            return framework.redact({"ok": False, "error": str(exc),
+                                     **({"problems": problems} if problems else {})}, secrets)
+        # 日志尾、每案日志、探测回显、结果库报错……回给客户端的一切都过一遍已知口令
+        return framework.redact({"ok": True, **result}, self.secrets())
 
     def _lease(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
         return self.state.check(caller.subject, str(args.get("lease_id") or ""), args.get("token"))
@@ -197,7 +228,23 @@ class Gateway:
             scanned += 1
         if not scanned:
             raise ToolError("framework lib/ and smoke_test/ contain no Python sources")
+        self._literals = (time.monotonic(), frozenset(values))
         return frozenset(values)
+
+    def secrets(self) -> tuple[str, ...]:
+        """网关知道的口令字面值（长的在前）：框架凭据字面量、conf 口令项、结果库口令。
+        凭据字面量要解析整个框架源码，缓存 LITERALS_TTL_S 秒
+        （case_submit/env_prepare 每次都会刷新）。"""
+        cached = self._literals
+        if cached is None or time.monotonic() - cached[0] > LITERALS_TTL_S:
+            try:
+                self.credential_literals()
+            except (ToolError, OSError):
+                self._literals = (time.monotonic(), frozenset())
+        values = set(self._literals[1] if self._literals else ()) | framework.conf_secrets(self.cfg)
+        values.add(framework.mysql_password(self.cfg))
+        return tuple(sorted((v for v in values if len(v) >= framework.MIN_SECRET_LEN),
+                            key=len, reverse=True))
 
     # ── 租约 ──────────────────────────────────────────────
     def lease_acquire(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
@@ -226,6 +273,13 @@ class Gateway:
     # ── 环境自检 ──────────────────────────────────────────
     def env_prepare(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
         self._lease(caller, args)
+        # 客户端按哪个构建编的用例：与本床不符就不用往下查了（老客户端不带，照查但注明没核对）
+        wanted = args.get("device_build")
+        build_checked = wanted not in (None, "")
+        if build_checked and mysql_safe_build(str(wanted)) != self.cfg.build:
+            raise ToolError(f"device_build {str(wanted)!r} is not this bed's build "
+                            f"{self.cfg.build!r}; compile against {self.cfg.build!r} or use the "
+                            "gateway of the bed that runs your build")
         checks: list[dict[str, Any]] = []
 
         def add(key: str, ok: bool, detail: str = "") -> None:
@@ -271,7 +325,8 @@ class Gateway:
                             f"device reports {device_build}, gateway bundle is {cfg.build}")
         else:
             add("device_build", False, "no bed_probes.build in the bundle grammar")
-        return {"ready": all(c["ok"] for c in checks), "checks": checks}
+        return {"ready": all(c["ok"] for c in checks), "checks": checks,
+                "build_checked": build_checked}
 
     # ── 上机 ──────────────────────────────────────────────
     def case_submit(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
@@ -288,6 +343,8 @@ class Gateway:
         if fd is None:
             raise ToolError("bed busy: another run or device operation is in progress")
         try:
+            # 冻结、取规则、抽凭据字面量可能要几十秒：租约在这期间过期或被接管，就不能再上机
+            lease = self._lease(caller, args)
             staged = framework.stage_case(self.cfg, module, submit, frozen.data, frozen.sha256)
             task_id = f"cex_{module}_{submit}_{int(time.time() * 1000)}"
             deliver_epoch = time.time()
@@ -315,11 +372,15 @@ class Gateway:
         task = self._own_task(caller, args)
         status = framework.read_status(self.cfg, task["task_id"])
         return {"task_id": task["task_id"], "state": status.get("state", "unknown"),
-                "rc": status.get("rc"), "log_tail": status.get("log_tail", "")}
+                "rc": status.get("rc"), "log_tail": status.get("log_tail", ""),
+                **({"note": RUNNER_LOST} if status.get("state") == "lost" else {})}
 
     def case_results(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
         task = self._own_task(caller, args)
         status = framework.read_status(self.cfg, task["task_id"])
+        if status.get("state") == "lost":
+            return {"task_id": task["task_id"], "channel": "runner_lost", "state": "lost",
+                    "rc": None, "explanation": RUNNER_LOST}
         if status.get("state") != "done":
             return {"task_id": task["task_id"], "channel": "not_completed",
                     "state": status.get("state", "unknown")}
@@ -360,10 +421,12 @@ class Gateway:
     # ── 只读探测 ──────────────────────────────────────────
     def probe_show(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
         command = str(args.get("command") or "")
-        if (not command.strip() or _CONTROL_RE.search(command) or ";" in command
-                or command.strip().split(None, 1)[0].lower() not in ("show", "get")):
-            raise ToolError("probe_show takes one line starting with show/get, "
-                            "with no control characters or ';'")
+        if (_CONTROL_RE.search(command) or len(command.strip()) > _PROBE_MAX
+                or not _PROBE_RE.match(command.strip())
+                or command.count('"') % 2 or command.count("'") % 2):
+            raise ToolError("probe_show takes one read-only line starting with show/get "
+                            f"(at most {_PROBE_MAX} characters; arguments limited to letters, "
+                            "digits, spaces and _ . , : / @ % + = * \" ' -)")
         self._lease(caller, args)
         index = int(args.get("device_index") or 0)
         with self.state.bed_lock() as locked:
@@ -379,9 +442,11 @@ class Gateway:
 
         self._lease(caller, args)
         cache = self.cfg.state_dir / "bed_topology.json"
+        # 常驻服务清单来自网关配置，不进探测缓存：改了配置下一次调用就看得到
+        services = {"services": [dict(item) for item in self.cfg.bed_services]}
         if not args.get("refresh"):
             try:
-                return json.loads(cache.read_text(encoding="utf-8"))
+                return {**json.loads(cache.read_text(encoding="utf-8")), **services}
             except (OSError, ValueError):
                 pass
         with self.state.bed_lock() as locked:
@@ -401,7 +466,7 @@ class Gateway:
         os.replace(tmp, cache)
         self.audit("bed_topology", subject=caller.subject, sha256=result["sha256"],
                           devices=len(result["topology"].get("devices") or []))
-        return result
+        return {**result, **services}
 
     # ── 设备初始化（两步）──────────────────────────────────
     def _init_plan(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -415,7 +480,13 @@ class Gateway:
                 raise ToolError(f"device_index {index} is not in the framework conf")
             indices = [index]
         else:
-            count = int(args.get("device_count") or len(ips))
+            count = len(ips)
+            if args.get("device_count") is not None:
+                # 显式给的 0 或负数是错，不能落成“全部设备”
+                count = int(args["device_count"])
+                if count < 1:
+                    raise ToolError(f"device_count must be at least 1, got {count} "
+                                    "(omit it to initialize every device in the conf)")
             if count > len(ips) or count > self.cfg.max_devices or count < 1:
                 raise ToolError(f"device_count {count} exceeds the {len(ips)} device(s) in conf "
                                 f"or the limit {self.cfg.max_devices}")

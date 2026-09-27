@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -16,18 +15,18 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# gateway/vendor/cex_core 不入库（带内部模板身份，本仓守零内部资产）：测前从同级 skills 仓现生成，
-# 保证网关测的是 skills 仓当前的 cex_core。没有同级仓时用已生成的副本；两样都没有就不收集网关测试。
+# gateway/vendor/cex_core 不入库（带内部模板身份，本仓守零内部资产），由人手跑
+# tools/sync_gateway_vendor.py --only cex_core 从 skills 仓生成。测试对仓库只读：
+# 从不改写 gateway/vendor（找到哪棵 skills 树就拿它覆盖一遍，会把半截改动或别的分支
+# 悄悄带进打包与别的工具）；
+# 与 skills 仓是否一致由 test_vendor_readonly.py 用 --check 报。没生成过就不收集网关测试。
 SKILLS_ROOT = Path(os.environ.get("CEX_SKILLS_ROOT") or REPO_ROOT.parent / "compile-excel-skills")
+SYNC_COMMAND = (f"python3 tools/sync_gateway_vendor.py --only cex_core "
+                f"--skills-root {SKILLS_ROOT}")
 VENDOR_NOTE = ""
-if (SKILLS_ROOT / "cex_core" / "__init__.py").is_file():
-    _sync = subprocess.run(
-        [sys.executable, str(REPO_ROOT / "tools" / "sync_gateway_vendor.py"), "--only", "cex_core",
-         "--skills-root", str(SKILLS_ROOT)], capture_output=True, text=True, timeout=120)
-    assert _sync.returncode == 0, _sync.stdout + _sync.stderr
-elif not (REPO_ROOT / "gateway" / "vendor" / "cex_core" / "__init__.py").is_file():
-    VENDOR_NOTE = (f"gateway tests not collected: no compile-excel-skills checkout at {SKILLS_ROOT} "
-                   "(set CEX_SKILLS_ROOT) and gateway/vendor/cex_core was never generated")
+if not (REPO_ROOT / "gateway" / "vendor" / "cex_core" / "__init__.py").is_file():
+    VENDOR_NOTE = ("gateway tests not collected: gateway/vendor/cex_core was never generated; "
+                   f"run {SYNC_COMMAND}")
     collect_ignore_glob = ["test_*.py"]
 
 

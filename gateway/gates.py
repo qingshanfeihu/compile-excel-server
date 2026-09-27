@@ -7,6 +7,11 @@
 另加两道 InfoTest 上机路径上没有的闸：
 - 自毁命令（规则来自服务端数据包的 domain_grammar.json，读不到就拒绝）；
 - 凭据字面量（从跳板机上真实框架源码 AST 提取，任何单元格命中就拒绝；报告只给单元格位置）。
+
+闸查的必须就是框架执行的（框架 lib/test_xlsx.py）：
+- 框架用 data_only=True 读公式的缓存值，闸读不到缓存值 → 执行页有公式（或以 = 开头的值）就拒收；
+- 框架一直跑到文件末尾，999999999999999 之后的行照样执行 → 每一行都查（它本身不算用例）；
+- 框架把 G 按逗号拆开、去引号、取关键字参数的值再交给设备 → 这些实参与原文一起查。
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ MAX_COLUMNS = 64
 SENTINEL_AUTOID = "999999999999999"
 _AUTOID_RE = re.compile(r"^\d{12,24}$")
 _MIN_LITERAL_LEN = 4
+_MAX_LISTED = 20
 
 
 class GateError(ValueError):
@@ -51,6 +57,111 @@ class FrozenCase:
     autoids: tuple[str, ...]
     command_lines: tuple[tuple[str, str], ...]
     cells: tuple[tuple[str, str], ...]
+
+
+# ── 框架怎样把 G 交给设备（lib/test_xlsx.py 的 _split_parameter_parts / _unquote_parameter /
+#    _keyword_split / _raw_call_arguments，逐行照抄语义，不 import 框架）────────────────
+def _split_parameter_parts(text: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for char in text:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            current.append(char)
+            escaped = True
+            continue
+        if quote is not None:
+            current.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char in ('"', "'"):
+            current.append(char)
+            quote = char
+            continue
+        if char == ",":
+            part = "".join(current).strip()
+            if part:
+                parts.append(part)
+            current = []
+            continue
+        current.append(char)
+    if quote is not None:
+        raise ValueError("unclosed quote in G")
+    tail = "".join(current).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _unquote_parameter(value: str) -> str:
+    text = value.strip()
+    if len(text) >= 2 and text[0] in ('"', "'") and text[-1] == text[0]:
+        return text[1:-1].strip()
+    return text
+
+
+def _keyword_split(part: str) -> tuple[str, str] | None:
+    quote: str | None = None
+    escaped = False
+    for index, char in enumerate(part):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in ('"', "'"):
+            quote = char
+            continue
+        if char == "=":
+            key = part[:index].strip()
+            if re.match(r"^[A-Za-z_]\w*$", key):
+                return key, part[index + 1:].strip()
+            return None
+    return None
+
+
+def framework_arguments(text: str, method: str) -> list[str]:
+    """框架把这一格 G 交给设备方法的每个字符串实参：execute/cmds_config 与多行格整格一个；
+    其余按不在引号里的逗号拆开，位置参数去引号，关键字参数（cmd=...）取值去引号。
+    拆不开（引号未闭合）框架整卷拒跑，这里只回原文。"""
+    if method in ("execute", "cmds_config") or "\n" in text or "\r" in text:
+        return [text]
+    try:
+        parts = _split_parameter_parts(text)
+    except ValueError:
+        return [text]
+    values = []
+    for part in parts:
+        keyword = _keyword_split(part)
+        values.append(_unquote_parameter(keyword[1] if keyword else part))
+    return values
+
+
+def _cached_values(data: bytes, where: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """执行页以外的公式格：取框架与读表人看到的缓存值，只交给凭据闸。"""
+    from openpyxl import load_workbook
+
+    wb = load_workbook(io.BytesIO(data), read_only=False, data_only=True)
+    try:
+        out = []
+        for title, coordinate in where:
+            value = wb[title][coordinate].value
+            if isinstance(value, str) and value.strip():
+                out.append((f"{title}!{coordinate}", value))
+        return out
+    finally:
+        wb.close()
 
 
 def freeze(data: bytes) -> FrozenCase:
@@ -91,28 +202,52 @@ def freeze(data: bytes) -> FrozenCase:
         except Exception as exc:  # noqa: BLE001
             raise GateError([f"execution sheet does not satisfy the Excel contract: {exc}"]) \
                 from None
-        autoids: list[str] = []
-        commands: list[tuple[str, str]] = []
-        for row_no, row in enumerate(ws.iter_rows(values_only=True), start=1):
-            first = str(row[0]).strip() if row and row[0] is not None else ""
-            if first == SENTINEL_AUTOID:
-                break
-            if _AUTOID_RE.match(first) and first not in autoids:
-                autoids.append(first)
-            device = str(row[4] or "").strip() if len(row) > 4 else ""
-            command = str(row[6] or "") if len(row) > 6 else ""
-            if device.startswith("APV") and command.strip():
-                for line in command.splitlines():
-                    if line.strip():
-                        commands.append((f"{ws.title}!G{row_no}", line))
-        cells = []
+        formulas: list[str] = []
+        elsewhere: list[tuple[str, str]] = []
+        cells: list[tuple[str, str]] = []
         for sheet in wb.worksheets:
             for row in sheet.iter_rows():
                 for cell in row:
-                    if isinstance(cell.value, str) and cell.value.strip():
-                        cells.append((f"{sheet.title}!{cell.coordinate}", cell.value))
+                    value = cell.value
+                    where = f"{sheet.title}!{cell.coordinate}"
+                    if sheet is ws and (cell.data_type == "f" or (
+                            isinstance(value, str) and value.startswith("="))):
+                        formulas.append(where)
+                    elif cell.data_type == "f":
+                        elsewhere.append((sheet.title, cell.coordinate))
+                    if isinstance(value, str) and value.strip():
+                        cells.append((where, value))
+        if formulas:
+            raise GateError([f"{where}: holds a formula; the framework runs its cached value, "
+                             "which this gate cannot check - write the literal value"
+                             for where in formulas[:_MAX_LISTED]]
+                            + ([f"... and {len(formulas) - _MAX_LISTED} more formula cells"]
+                               if len(formulas) > _MAX_LISTED else []))
+        autoids: list[str] = []
+        commands: list[tuple[str, str]] = []
+        # 不在 999999999999999 处停：框架一直跑到文件末尾，它后面的行照样执行
+        for row_no, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            first = str(row[0]).strip() if row and row[0] is not None else ""
+            if _AUTOID_RE.match(first) and first != SENTINEL_AUTOID and first not in autoids:
+                autoids.append(first)
+            device = str(row[4] or "").strip() if len(row) > 4 else ""
+            method = str(row[5] or "").strip() if len(row) > 5 else ""
+            raw = row[6] if len(row) > 6 else None
+            if not device.startswith("APV") or raw is None or not str(raw).strip():
+                continue
+            where, text = f"{ws.title}!G{row_no}", str(raw)
+            arguments = framework_arguments(text, method)
+            cells.extend((where, value) for value in arguments if value != text)
+            seen: set[str] = set()
+            for value in (text, *arguments):
+                for line in value.splitlines():
+                    if line.strip() and line not in seen:
+                        seen.add(line)
+                        commands.append((where, line))
     finally:
         wb.close()
+    if elsewhere:
+        cells.extend(_cached_values(data, elsewhere))
     if not autoids:
         raise GateError(["execution sheet has no case autoids"])
     return FrozenCase(data=data, sha256=hashlib.sha256(data).hexdigest(), size=len(data),
@@ -127,13 +262,21 @@ def check(frozen: FrozenCase, *, grammar: dict[str, Any] | Path | None,
     except DestructiveRulesUnavailable as exc:
         raise GateError([f"destructive-command rules unavailable, refusing to run: {exc}"]) \
             from None
+    reported: set[tuple[str, str]] = set()
     for finding in scan_lines(frozen.command_lines, patterns):
-        problems.append(f"{finding['where']}: {finding['command']!r} matches destructive rule "
-                        f"{finding['rule']!r}; clean up only what the case created")
+        # 同一格的原文与拆出的实参命中同一条规则只报一次
+        if (finding["where"], finding["rule"]) in reported:
+            continue
+        reported.add((finding["where"], finding["rule"]))
+        runs_as = f" (runs as {finding['executed']!r})" if finding.get("executed") else ""
+        problems.append(f"{finding['where']}: {finding['command']!r}{runs_as} matches destructive "
+                        f"rule {finding['rule']!r}; clean up only what the case created")
     literals = [value for value in credential_literals if len(value) >= _MIN_LITERAL_LEN]
+    flagged: set[str] = set()
     for where, text in frozen.cells:
         folded = text.casefold()
-        if any(value.casefold() in folded for value in literals):
+        if where not in flagged and any(value.casefold() in folded for value in literals):
+            flagged.add(where)
             problems.append(f"{where}: contains a framework credential literal; "
                             "remove it (credentials come from the framework conf at run time)")
     if problems:

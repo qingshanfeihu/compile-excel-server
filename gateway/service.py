@@ -1,7 +1,8 @@
 """网关 HTTP 服务：MCP streamable HTTP 的请求/应答子集（POST /mcp，JSON-RPC 2.0），只用标准库。
 
 - 每个请求都要 `Authorization: Bearer <用户令牌>`，经服务端 /v1/introspect 确认有效、取 scope；
-- 监听非回环地址时必须配 TLS（config 加载时已检查）；
+- 监听非回环地址时必须配 TLS（config 加载时已检查）；TLS 握手在每个连接自己的线程里做、带超时——
+  放在 accept() 里做，一个只连不说话的 TCP 连接就能卡住整个监听；
 - GET /healthz 不鉴权，只回 ok，不泄露任何床状态。
 """
 
@@ -18,6 +19,8 @@ from .tools import TOOL_SPECS, Caller, Gateway
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_INFO = {"name": "compile-excel-gateway", "version": "0.1.0"}
 MAX_BODY = 64 * 1024 * 1024
+HANDSHAKE_TIMEOUT_S = 10.0
+IDLE_TIMEOUT_S = 60.0
 
 
 def _rpc_result(msg_id: Any, result: Any) -> dict[str, Any]:
@@ -69,6 +72,7 @@ def make_handler(gateway: Gateway) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "cexg"
         sys_version = ""
+        timeout = IDLE_TIMEOUT_S   # 连上不发请求（或请求体发一半）的连接到点就断，不永远占一个线程
 
         def log_message(self, fmt: str, *args: Any) -> None:  # 不把请求行（可能含路径参数）打到 stderr
             return
@@ -119,7 +123,10 @@ def make_handler(gateway: Gateway) -> type[BaseHTTPRequestHandler]:
                 self._send(401, {"error": "missing, invalid or expired bearer token"},
                            {"WWW-Authenticate": 'Bearer error="invalid_token"'})
                 return
-            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
             if length <= 0 or length > MAX_BODY:
                 self._send(413 if length > MAX_BODY else 400, {"error": "bad request body size"})
                 return
@@ -138,12 +145,28 @@ def make_handler(gateway: Gateway) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
+class GatewayHTTPServer(ThreadingHTTPServer):
+    handshake_timeout = HANDSHAKE_TIMEOUT_S
+
+    def finish_request(self, request: Any, client_address: Any) -> None:
+        """每个连接的工作线程里：先在超时内完成 TLS 握手，失败就只丢这一个连接。"""
+        if isinstance(request, ssl.SSLSocket):
+            request.settimeout(self.handshake_timeout)
+            try:
+                request.do_handshake()
+            except OSError:   # 超时、对端乱发、半路断开（ssl.SSLError 也是 OSError）
+                return
+        super().finish_request(request, client_address)
+
+
 def build_server(gateway: Gateway) -> ThreadingHTTPServer:
     cfg = gateway.cfg
-    httpd = ThreadingHTTPServer((cfg.host, cfg.port), make_handler(gateway))
+    httpd = GatewayHTTPServer((cfg.host, cfg.port), make_handler(gateway))
     if cfg.tls_cert and cfg.tls_key:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(str(cfg.tls_cert), str(cfg.tls_key))
-        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+        # accept() 不握手：握手挪到 finish_request（工作线程）里
+        httpd.socket = context.wrap_socket(httpd.socket, server_side=True,
+                                           do_handshake_on_connect=False)
     return httpd

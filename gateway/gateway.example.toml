@@ -53,3 +53,19 @@ commands = [
 long_commands = { }        # 例：{ "clear config all" = 60 }，单条命令的超时（秒）
 step_timeout_s = 5
 login_timeout_s = 10
+
+# 本床常驻服务清单（运维维护）：bed_topology 原样带给客户端（services 字段），编写阶段拿它选真实服务器、
+# 触发机要连的端口。不配就是空清单。proto 只能是 http/https/tcp/udp/dns；地址按本实验室实际填写。
+# [[bed.services]]
+# host = "server231"
+# ip = "192.0.2.231"
+# proto = "http"
+# port = 80
+# note = "nginx，/ 回 200"
+#
+# [[bed.services]]
+# host = "server232"
+# ip = "192.0.2.232"
+# proto = "dns"
+# port = 53
+# note = "bind9，权威区 example.test"

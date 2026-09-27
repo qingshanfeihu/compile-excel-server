@@ -5,6 +5,9 @@
   cexg check  --config gateway.toml     配置与框架自检（不碰设备）
   cexg sample-config                    打印配置样例
   cexg audit-verify --config gateway.toml   复核审计日志哈希链
+  cexg gc --config gateway.toml [--days 30] [--apply]
+                                        列出（--apply 才删）N 天前已结束任务的记录、落位目录与
+                                        网关落位跑出来的框架报告（report/*/*/ist_staging_*）
 
 配置里的路径与口令文件都在跳板机本机；网关不读任何 environment 文件。
 """
@@ -89,12 +92,28 @@ def cmd_audit_verify(config: Path) -> int:
     return 0 if result["ok"] else 1
 
 
+def cmd_gc(config: Path, days: float, apply: bool) -> int:
+    from gateway import prune
+
+    try:
+        plan = prune.run(load(config), days, apply=apply)
+    except (ConfigError, prune.PruneError, OSError) as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        return 2
+    print(json.dumps(prune.report(plan, applied=apply), ensure_ascii=False, indent=1))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="cexg", description="compile-excel 跳板机网关")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("serve", "check", "audit-verify"):
+    for name in ("serve", "check", "audit-verify", "gc"):
         p = sub.add_parser(name)
         p.add_argument("--config", required=True)
+        if name == "gc":
+            p.add_argument("--days", type=float, default=30,
+                           help="只清最近一次写入早于这么多天前的（默认 30）")
+            p.add_argument("--apply", action="store_true", help="真删；不给只列出")
     sub.add_parser("sample-config")
     args = parser.parse_args(argv)
     if args.command == "sample-config":
@@ -103,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
     config = Path(args.config).expanduser()
     if args.command == "audit-verify":
         return cmd_audit_verify(config)
+    if args.command == "gc":
+        return cmd_gc(config, args.days, args.apply)
     return cmd_serve(config) if args.command == "serve" else cmd_check(config)
 
 

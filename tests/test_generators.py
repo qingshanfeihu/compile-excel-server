@@ -35,12 +35,13 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(scope="module")
-def vendor():
-    proc = subprocess.run(
-        [sys.executable, str(REPO_ROOT / "tools" / "sync_gateway_vendor.py"), "--only", "cex_core",
-         "--skills-root", str(SKILLS_ROOT)], capture_output=True, text=True, timeout=120)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    return REPO_ROOT / "gateway" / "vendor"
+def vendor(tmp_path_factory):
+    """skills 仓 cex_core 的临时副本：测的是它当前的生成器，又不改写仓库里的 gateway/vendor
+    （测试对仓库只读；gateway/vendor 由人手跑 tools/sync_gateway_vendor.py 更新）。"""
+    root = tmp_path_factory.mktemp("vendor")
+    shutil.copytree(SKILLS_ROOT / "cex_core", root / "cex_core",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    return root
 
 
 def _run(inputs: Path, out: Path, vendor: Path, steps=None, params=None) -> dict:

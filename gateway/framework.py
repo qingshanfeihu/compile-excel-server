@@ -5,13 +5,19 @@
 - conf 名只来自 gateway.toml；
 - runner 由网关直接起（bash，不再套 setsid），床锁 fd 继承给它，pytest 结束内核自动放锁；
 - 状态文件先写临时文件再改名；runner 不碰锁文件；
+- runner 进程组另继承一把本任务的 .alive 锁：状态还写着 running 而这把锁已经没人拿着，
+  就是 runner 没写完成状态就死了（网关重启连带杀掉、OOM、人工 kill），报 lost 而不是永远 running；
 - case.xlsx 落位后设为只读，远端 sha 必须等于冻结时的 sha；
-- 凭据经 stdin 交给 py38 代理，不进命令行参数。
+- 凭据经 stdin 交给 py38 代理，不进命令行参数；
+- 回给客户端的文字除了按模式脱敏（scrub_text 只认 password=... 这类形态），
+  还把网关知道的口令字面值（conf 口令项、结果库口令、框架源码凭据字面量）逐字换成 ***
+  （redact，由 tools.Gateway.call 统一做）。
 """
 
 from __future__ import annotations
 
 import configparser
+import fcntl
 import json
 import os
 import re
@@ -26,6 +32,8 @@ from .vendor.cex_core.security_scrub import scrub_text
 
 AGENT = Path(__file__).resolve().parent / "agent" / "jumphost_agent.py"
 _SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_SECRET_OPTION = re.compile(r"(?:^|_)(?:passwd|password|pass|pwd|secret)\d*(?:_|$)", re.I)
+MIN_SECRET_LEN = 4
 
 
 class FrameworkError(RuntimeError):
@@ -90,6 +98,49 @@ def device_credentials(parser: configparser.ConfigParser, build: str) -> dict[st
     return found
 
 
+def conf_secrets(cfg: GatewayConfig) -> set[str]:
+    """框架 conf 各段口令项（passwd/password/…）的值；conf 读不了就是空集。"""
+    try:
+        parser = read_conf(cfg)
+    except FrameworkError:
+        return set()
+    return {value.strip() for section in parser.sections()
+            for option, value in parser.items(section)
+            if _SECRET_OPTION.search(option) and value and value.strip()}
+
+
+def mysql_password(cfg: GatewayConfig) -> str:
+    if not cfg.mysql_password_file:
+        return ""
+    try:
+        return cfg.mysql_password_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def tail_lines(text: str, max_chars: int) -> str:
+    """尾部至多 max_chars 个字符，从整行起：截出来的半截首行丢掉，免得把口令切成认不出的半截。"""
+    if len(text) <= max_chars:
+        return text
+    cut = text[-max_chars:]
+    newline = cut.find("\n")
+    return cut[newline + 1:] if newline >= 0 else cut
+
+
+def redact(value: Any, secrets: tuple[str, ...]) -> Any:
+    """把 secrets 里每个字面值换成 ***（长的先换）；dict/list 逐层处理，键不动。"""
+    if isinstance(value, str):
+        for secret in secrets:
+            if secret in value:
+                value = value.replace(secret, "***")
+        return value
+    if isinstance(value, dict):
+        return {key: redact(item, secrets) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact(item, secrets) for item in value]
+    return value
+
+
 def mysql_ip(parser: configparser.ConfigParser) -> str:
     value = parser.get("other", "mysql_ip", fallback="").strip()
     if not value:
@@ -138,11 +189,15 @@ def stage_case(cfg: GatewayConfig, module: str, autoid: str, data: bytes,
             "sha256": remote}
 
 
+# 每个任务在 <state>/tasks/ 下的文件（cexg gc 按同一张表认领）
+TASK_FILES = (("runner", ".sh"), ("log", ".log"), ("status", ".status.json"), ("junit", ".xml"),
+              ("alive", ".alive"), ("process", ".runner.json"))
+
+
 def task_paths(cfg: GatewayConfig, task_id: str) -> dict[str, Path]:
     root = cfg.state_dir / "tasks"
     root.mkdir(parents=True, exist_ok=True)
-    return {name: root / f"{task_id}{suffix}" for name, suffix in (
-        ("runner", ".sh"), ("log", ".log"), ("status", ".status.json"), ("junit", ".xml"))}
+    return {name: root / f"{task_id}{suffix}" for name, suffix in TASK_FILES}
 
 
 def launch_run(cfg: GatewayConfig, task_id: str, module: str, autoid: str, build: str,
@@ -169,22 +224,72 @@ def launch_run(cfg: GatewayConfig, task_id: str, module: str, autoid: str, build
     ])
     paths["runner"].write_text(script, encoding="utf-8")
     os.chmod(paths["runner"], 0o700)
-    running = {"task_id": task_id, "state": "running", "started_at": int(time.time())}
-    tmp = paths["status"].with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(running), encoding="utf-8")
-    os.replace(tmp, paths["status"])
-    subprocess.Popen(
-        ["bash", str(paths["runner"])], cwd=str(cfg.apv_src), stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-        pass_fds=(bed_lock_fd,), close_fds=True)
+    # 本任务的存活锁：与床锁一样继承给 runner 进程组，它们全退出了内核才放
+    alive = os.open(paths["alive"], os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
+    try:
+        fcntl.flock(alive, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        running = {"task_id": task_id, "state": "running", "started_at": int(time.time())}
+        _write_json(paths["status"], running)
+        proc = subprocess.Popen(
+            ["bash", str(paths["runner"])], cwd=str(cfg.apv_src), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+            pass_fds=(bed_lock_fd, alive), close_fds=True)
+    finally:
+        os.close(alive)
+    # 新会话的首进程：pgid 就是 pid；运维要停这一轮就 kill -TERM -<pgid>。
+    # 只是给人看的记录，写不成也不能让已经起跑的这一轮变成没人认领的孤儿
+    try:
+        _write_json(paths["process"], {"pid": proc.pid, "pgid": proc.pid,
+                                        "started_at": running["started_at"]})
+    except OSError:
+        pass
+
+
+def _write_json(path: Path, data: dict[str, Any]) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _load_status(path: Path) -> dict[str, Any]:
+    try:
+        status = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"state": "unknown"}
+    return status if isinstance(status, dict) else {"state": "unknown"}
+
+
+def runner_gone(cfg: GatewayConfig, task_id: str) -> bool:
+    """runner 进程组是否都已退出：.alive 锁拿得到就是没人再拿着它。
+    升级前起的任务没有 .alive，判断不了，按还在跑算。"""
+    try:
+        fd = os.open(task_paths(cfg, task_id)["alive"], os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(fd)
+    return True
+
+
+def task_state(cfg: GatewayConfig, task_id: str) -> dict[str, Any]:
+    """状态文件；写着 running 而 runner 进程组已经全退出了，就是 lost（rc 为 None）。"""
+    paths = task_paths(cfg, task_id)
+    status = _load_status(paths["status"])
+    if status.get("state") == "running" and runner_gone(cfg, task_id):
+        # runner 先写 done 再退出：确认进程都没了之后再读一次，刚写完的 done 不会被判成 lost
+        status = _load_status(paths["status"])
+        if status.get("state") == "running":
+            status.update(state="lost", rc=None)
+    return status
 
 
 def read_status(cfg: GatewayConfig, task_id: str) -> dict[str, Any]:
     paths = task_paths(cfg, task_id)
-    try:
-        status = json.loads(paths["status"].read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        status = {"state": "unknown"}
+    status = task_state(cfg, task_id)
     tail = ""
     try:
         with open(paths["log"], "r", encoding="utf-8", errors="replace") as stream:
@@ -235,7 +340,8 @@ def batch_logs(cfg: GatewayConfig, module: str, autoid: str, min_epoch: float,
             continue
         mtime = log.stat().st_mtime
         stale = min_epoch > 0 and 0 < mtime < min_epoch
-        text = "" if stale else log.read_text(encoding="utf-8", errors="replace")[-max_chars:]
+        text = "" if stale else tail_lines(log.read_text(encoding="utf-8", errors="replace"),
+                                           max_chars)
         out[case_dir.name] = {"mtime": int(mtime), "stale": stale, "log": scrub_text(text)}
     return out
 
@@ -258,7 +364,7 @@ def agent_call(cfg: GatewayConfig, request: dict[str, Any], timeout: float = 120
                 return json.loads(line)
             except ValueError:
                 break
-    return {"error": "agent returned no JSON", "stderr": scrub_text(proc.stderr[-800:])}
+    return {"error": "agent returned no JSON", "stderr": scrub_text(tail_lines(proc.stderr, 800))}
 
 
 def query_results(cfg: GatewayConfig, build: str, case_ids: list[str], *,

@@ -70,26 +70,42 @@ class Console:
                     return False, seen
                 self.buffer += chunk.decode("utf-8", errors="ignore")
 
-    def close(self) -> None:
-        try:
-            os.kill(self.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            os.waitpid(self.pid, 0)
-        except ChildProcessError:
-            pass
+    def close(self, grace: float = 3.0) -> None:
+        """先 SIGTERM；grace 秒内不退（cu 卡在串口上常不理 TERM）就 SIGKILL，不让网关线程一直等。"""
+        for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, grace)):
+            try:
+                os.kill(self.pid, sig)
+            except ProcessLookupError:
+                pass
+            if _reaped(self.pid, wait):
+                break
         try:
             os.close(self.fd)
         except OSError:
             pass
 
 
-def _kill_console_holders(tty: str) -> list[int]:
-    """同一用户下占着这条串口线的控制台进程（cmdline 里有这个 tty 名的 cu）。"""
-    killed = []
+def _reaped(pid: int, timeout: float) -> bool:
+    """timeout 秒内等子进程退出并收尸；子进程已经不在也算。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return True
+        if done:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def console_holders(tty: str, proc_root: Path = Path("/proc")) -> list[int]:
+    """同一用户下占着这条串口线的 cu 进程：参数里恰好是这个设备（ttyS1 或 /dev/ttyS1），
+    不按子串认——ttyS1 不能连带 ttyS10–ttyS19。"""
+    found = []
     uid = os.getuid()
-    for proc in Path("/proc").iterdir():
+    for proc in proc_root.iterdir():
         if not proc.name.isdigit() or int(proc.name) == os.getpid():
             continue
         try:
@@ -99,12 +115,24 @@ def _kill_console_holders(tty: str) -> list[int]:
         except OSError:
             continue
         words = [a.decode("utf-8", "ignore") for a in argv if a]
-        if words and os.path.basename(words[0]) == "cu" and any(tty in w for w in words[1:]):
-            try:
-                os.kill(int(proc.name), signal.SIGTERM)
-                killed.append(int(proc.name))
-            except OSError:
-                pass
+        if not words or os.path.basename(words[0]) != "cu":
+            continue
+        # -l ttyS1、-lttyS1、--line=ttyS1 三种写法取出的设备名都要与目标完全相同
+        values = set(words[1:]) | {w[2:] for w in words[1:] if w.startswith("-l")} \
+            | {w.split("=", 1)[1] for w in words[1:] if "=" in w}
+        if values & {tty, f"/dev/{tty}"}:
+            found.append(int(proc.name))
+    return found
+
+
+def _kill_console_holders(tty: str) -> list[int]:
+    killed = []
+    for pid in console_holders(tty):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed.append(pid)
+        except OSError:
+            pass
     return killed
 
 
