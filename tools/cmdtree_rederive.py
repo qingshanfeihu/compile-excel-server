@@ -3,13 +3,23 @@
 
 数据包不发带凭据默认值的原始 XML（参数默认值里有凭据字面）。可客户端的引擎要核对来源：
 投影记着 XML 的哈希、命令树代际清单记着 XML 与投影、拆卸图谱与领域文法的框架清理规则记着
-XML 的哈希、SSL 生命周期证据记着拆卸图谱的身份。所以发布端先把凭据参数的 default_value 置空，
+XML 的哈希、SSL 生命周期证据记着拆卸图谱的身份。所以发布端先把 XML 里的凭据字面去掉，
 再**用引擎自己的函数**从这份 XML 把这些产物重新推导一遍（publish_local_command_tree、
 gen_command_teardown_atlas），而不是改写身份字段。
 
-判定：凭据参数按引擎同一条规则认（credential_literals.is_credential_argument）；脱敏后 XML
-里不得再出现任何原凭据默认字面；重推导的产物与 InfoTest 已收敛的那份相比，只许身份字段
-（XML 哈希、代际、清单、图谱身份）与省略默认值的计数不同——别处有一点不同就拒绝发布。
+凭据字面 = 引擎在**原始** XML 上算出的默认值闭包（command_tree_sync._xml_default_literal_closure：
+凭据参数——按 credential_literals.is_credential_argument 认——的非占位默认值）。同一个值在别处
+也会出现：非凭据参数的默认值、帮助文本、其他属性、元素文本，而且在 XML 里是转义后的写法
+（& 写成 &amp;）。所以按解析器看到的值（展开实体后）逐个属性、逐段文本比对，每一处都去掉：
+default_value 整个置空，别的属性与文本里把这个值换成 [redacted]（引擎投影里同一个标记，
+command_tree_sync.xml_sensitive_literal_replace），别的字节一个不动。注释、CDATA 里出现就拒绝。
+脱敏后重新解析：任何属性值、文本里还有凭据字面，或结构（元素、属性名）变了，就拒绝。
+
+重推导的产物与 InfoTest 已收敛的那份相比，只许身份字段（XML 哈希、代际、清单、图谱身份）与
+两个读入计数不同，且计数的差必须正好等于脱敏收据：投影的 default_values_omitted 少掉置空的
+default_value 个数；credential_fields_redacted 少掉脱敏时已换成 [redacted] 的、投影会读的字段数
+（非凭据参数的 name/length/limit/help_string——引擎本来会在投影里现场换成同一个标记，文本相同，
+只是计数不再算它）。别处有一点不同就拒绝发布。
 
 在临时数据根里跑（引擎在导入时按 CEX_ENGINE_DATA_ROOT 定路径，而且拆卸图谱脚本会就地收敛
 compile_ref 里的文件），引擎用网关 vendor 里从 compile-excel-skills 同步来的 cex_core。
@@ -30,13 +40,24 @@ import os
 import re
 import shutil
 import sys
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VENDOR = REPO_ROOT / "gateway" / "vendor"
-_ARG_TAG = re.compile(r"<arg\b[^>]*>")
-_DEFAULT_ATTR = re.compile(r'\bdefault_value="[^"]*"')
+REDACTED = "[redacted]"  # 与引擎投影里的标记同字（command_tree_sync.xml_sensitive_literal_replace）
+_XML_ENCODING = re.compile(rb"""^\s*<\?xml[^>]*?\bencoding\s*=\s*["']([A-Za-z0-9._-]+)["']""")
+# 注释、CDATA、处理指令、声明、结束标签；开始/空标签单独取标签名与属性串（属性值里可以有 >）
+_MARKUP = re.compile(
+    r"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>|<![^>]*>|</[^>]*>"
+    r"|<([^\s!?/>]+)((?:\s+[^\s=/>]+\s*=\s*(?:\"[^\"]*\"|'[^']*'))*)\s*/?>", re.S)
+_ATTR = re.compile(r"(\s+)([^\s=/>]+)(\s*=\s*)(?:\"([^\"]*)\"|'([^']*)')")
+_ENTITY = re.compile(r"&(#[0-9]+|#[xX][0-9A-Fa-f]+|amp|lt|gt|quot|apos);")
+_NAMED_ENTITIES = {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'"}
+_COMMAND_TAGS = frozenset({"scope", "menu", "item"})
+# 投影会读的非凭据参数属性（build_vendor_stdlib.parse_vendor_xml 经 _safe_xml_text 现场脱敏的那几个）
+_PROJECTED_ARG_ATTRS = frozenset({"name", "length", "limit", "help_string"})
 
 
 class RederiveError(RuntimeError):
@@ -47,36 +68,202 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def sanitize_xml(raw: bytes, is_credential_argument, default_literal_closure) -> tuple[bytes, dict[str, Any]]:
-    """把凭据参数的 default_value 置空（只动这些属性，别的字节不变）。"""
+def _literal_pattern(literal: str, *, ignore_case: bool) -> re.Pattern | None:
+    """与引擎 command_tree_sync._xml_sensitive_literal_pattern 同一条规则：纯字母数字按词边界。"""
+    text = str(literal or "").casefold()
+    if not text:
+        return None
+    flags = re.IGNORECASE if ignore_case else 0
+    if re.fullmatch("[a-z0-9]+", text):
+        return re.compile(f"(?<![a-z0-9]){re.escape(text)}(?![a-z0-9])", flags)
+    return re.compile(re.escape(text), flags)
+
+
+def literal_count(text: str, values) -> int:
+    """缺省实现，同 command_tree_sync.xml_sensitive_literal_count（run() 传引擎自己的那个）。"""
+    folded = str(text or "").casefold()
+    return sum(1 for value in values
+               if (pattern := _literal_pattern(value, ignore_case=False)) is not None
+               and pattern.search(folded) is not None)
+
+
+def literal_replace(text: str, values) -> str:
+    """缺省实现，同 command_tree_sync.xml_sensitive_literal_replace。"""
+    out = str(text or "")
+    for value in values:
+        pattern = _literal_pattern(value, ignore_case=True)
+        if pattern is not None:
+            out = pattern.sub(REDACTED, out)
+    return out
+
+
+def _unescape(text: str) -> str:
+    def one(match: re.Match) -> str:
+        ref = match.group(1)
+        if ref[:2] in ("#x", "#X"):
+            return chr(int(ref[2:], 16))
+        if ref[0] == "#":
+            return chr(int(ref[1:]))
+        return _NAMED_ENTITIES[ref]
+
+    return _ENTITY.sub(one, text)
+
+
+def _attribute_value(raw: str) -> str:
+    """解析器看到的属性值：行尾规范化、属性值空白规范化，再展开实体。"""
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    return _unescape(raw.replace("\t", " ").replace("\n", " "))
+
+
+def _text_value(raw: str) -> str:
+    return _unescape(raw.replace("\r\n", "\n").replace("\r", "\n"))
+
+
+def _escape_attribute(value: str, quote: str) -> str:
+    out = value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    out = out.replace("\t", "&#9;").replace("\n", "&#10;").replace("\r", "&#13;")
+    return out.replace('"', "&quot;") if quote == '"' else out.replace("'", "&apos;")
+
+
+def _escape_text(value: str) -> str:
+    return (value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace("\r", "&#13;"))
+
+
+def _written_forms(literal: str) -> frozenset[str]:
+    """一个值在 XML 原文里可能的写法（原文、各种实体转义、URL 编码）。"""
+    xml = literal.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    forms = {literal, xml, urllib.parse.quote(literal, safe="")}
+    for quot in ('"', "&quot;", "&#34;"):
+        for apos in ("'", "&apos;", "&#39;"):
+            forms.add(xml.replace('"', quot).replace("'", apos))
+    return frozenset(form for form in forms if form)
+
+
+def sanitize_xml(raw: bytes, is_credential_argument, default_literal_closure, *,
+                 literal_count=literal_count, literal_replace=literal_replace
+                 ) -> tuple[bytes, dict[str, Any]]:
+    """去掉原始 XML 里凭据默认值闭包的每一处出现（按解析后的值比对），别的字节不变。"""
     import xml.etree.ElementTree as ET
 
-    text = raw.decode("utf-8")
-    blanked = 0
+    literals = frozenset(default_literal_closure(raw))
+    declared = _XML_ENCODING.match(raw)
+    encoding = declared.group(1).decode("ascii") if declared else "utf-8"
+    try:
+        text = raw.decode(encoding)
+    except (LookupError, UnicodeDecodeError) as exc:
+        raise RederiveError(f"the command tree XML does not decode as its declared encoding "
+                            f"{encoding}") from exc
+    tally: dict[str, int] = {"blanked_default_values": 0, "blanked_credential_defaults": 0,
+                             "blanked_other_defaults": 0, "redacted_text_nodes": 0,
+                             "projected_fields_redacted": 0}
+    attributes: dict[str, int] = {}
+    changed: set[tuple[int, str]] = set()
 
-    def blank(match: re.Match) -> str:
-        nonlocal blanked
-        tag = match.group(0)
-        element = ET.fromstring(tag if tag.endswith("/>") else tag + "</arg>")
-        if (element.get("default_value") or "").strip() and is_credential_argument(
-                name=element.get("name"), arg_type=element.get("type"),
-                help_string=element.get("help_string")):
-            blanked += 1
-            return _DEFAULT_ATTR.sub('default_value=""', tag)
-        return tag
+    def carries(value: str) -> bool:
+        return bool(literals) and literal_count(value, literals) > 0
 
-    literals = default_literal_closure(raw)
-    sanitized = _ARG_TAG.sub(blank, text).encode("utf-8")
-    remaining = sorted(value for value in literals if value in sanitized.decode("utf-8"))
-    if remaining:
-        raise RederiveError(f"{len(remaining)} credential default literal(s) still occur in the "
-                            "sanitized XML outside default_value attributes")
+    def written(chunk: str) -> bool:
+        return any(literal_count(chunk, _written_forms(literal)) for literal in literals)
+
+    def text_node(raw_text: str) -> str:
+        if "<" in raw_text:
+            raise RederiveError("the command tree XML has markup the sanitizer does not recognize")
+        value = _text_value(raw_text)
+        if not carries(value):
+            return raw_text
+        tally["redacted_text_nodes"] += 1
+        return _escape_text(literal_replace(value, literals))
+
+    out: list[str] = []
+    position = 0
+    ordinal = -1
+    for match in _MARKUP.finditer(text):
+        out.append(text_node(text[position:match.start()]))
+        position = match.end()
+        token = match.group(0)
+        tag = match.group(1)
+        if tag is None:
+            if token.startswith(("<!", "<?")) and literals and written(token):
+                raise RederiveError("a credential default literal occurs inside an XML comment, "
+                                    "CDATA section or declaration")
+            out.append(token)
+            continue
+        ordinal += 1
+        raw_attrs = match.group(2)
+        values = {item.group(2): _attribute_value(item.group(4) if item.group(4) is not None
+                                                  else item.group(5))
+                  for item in _ATTR.finditer(raw_attrs)}
+        credential = tag == "arg" and bool(is_credential_argument(
+            name=values.get("name"), arg_type=values.get("type"),
+            help_string=values.get("help_string")))
+
+        def attribute(item: re.Match, tag=tag, credential=credential, ordinal=ordinal,
+                      values=values) -> str:
+            name = item.group(2)
+            # 凭据参数的默认值不论是不是闭包里的值（占位字面也算）都置空；别处只动带闭包值的
+            blank = name == "default_value" and (carries(values[name])
+                                                 or (credential and values[name].strip() != ""))
+            if not blank and not carries(values[name]):
+                return item.group(0)
+            if blank:
+                new = ""
+                tally["blanked_default_values"] += 1
+                tally["blanked_credential_defaults" if credential else "blanked_other_defaults"] += 1
+            elif tag in _COMMAND_TAGS and name == "name":
+                raise RederiveError(f"a credential default literal is part of a command token "
+                                    f"(<{tag} name>); sanitizing it would change the command tree")
+            else:
+                new = literal_replace(values[name], literals)
+                attributes[name] = attributes.get(name, 0) + 1
+                if tag == "arg" and not credential and name in _PROJECTED_ARG_ATTRS:
+                    tally["projected_fields_redacted"] += 1
+            changed.add((ordinal, name))
+            quote = '"' if item.group(4) is not None else "'"
+            return f"{item.group(1)}{name}{item.group(3)}{quote}{_escape_attribute(new, quote)}{quote}"
+
+        sanitized_attrs = _ATTR.sub(attribute, raw_attrs)
+        if sanitized_attrs != raw_attrs:
+            head = 1 + len(tag)
+            token = token[:head] + sanitized_attrs + token[head + len(raw_attrs):]
+        out.append(token)
+    out.append(text_node(text[position:]))
+    sanitized_text = "".join(out)
+    sanitized = sanitized_text.encode(encoding)
+
+    try:
+        before = list(ET.fromstring(raw).iter())
+        after = list(ET.fromstring(sanitized).iter())
+    except ET.ParseError as exc:
+        raise RederiveError("the sanitized command tree XML does not parse") from exc
+    if len(before) != len(after):
+        raise RederiveError("sanitization changed the XML element structure")
+    left = 0
+    for index, (old, new) in enumerate(zip(before, after, strict=True)):
+        if old.tag != new.tag or set(old.attrib) != set(new.attrib):
+            raise RederiveError("sanitization changed the XML element structure")
+        for key, value in new.attrib.items():
+            if value != old.attrib[key] and (index, key) not in changed:
+                raise RederiveError("sanitization changed an attribute it did not mean to change")
+            left += carries(value)
+        for old_text, new_text in ((old.text or "", new.text or ""), (old.tail or "", new.tail or "")):
+            if old_text != new_text and not carries(old_text):
+                raise RederiveError("sanitization changed text that carries no credential default "
+                                    "literal")
+            left += carries(new_text)
+    if left:
+        raise RederiveError(f"{left} parsed attribute or text value(s) of the sanitized XML still "
+                            "carry credential default literals")
     if default_literal_closure(sanitized):
         raise RederiveError("the sanitized XML still carries credential default values")
-    ET.fromstring(sanitized)
-    return sanitized, {"blanked_default_values": blanked,
+    if literals and written(sanitized_text):
+        raise RederiveError("the sanitized XML still carries a credential default literal in "
+                            "escaped or encoded form")
+    return sanitized, {**tally, "redacted_attributes": dict(sorted(attributes.items())),
                        "distinct_literals_removed": len(literals),
-                       "rule": "credential_literals.is_credential_argument"}
+                       "rule": "command_tree_sync._xml_default_literal_closure(original XML); "
+                               "every occurrence in any attribute or text",
+                       "replacement": {"default_value": "", "other": REDACTED}}
 
 
 def _without(value: Any, paths: list[tuple[str, ...]]) -> Any:
@@ -91,8 +278,10 @@ def _without(value: Any, paths: list[tuple[str, ...]]) -> Any:
 
 
 # 重推导产物与原产物之间允许不同的字段：“绑定到哪份 XML”的身份，加上生成时读了多少输入的
-# 计数（省略的默认值少了被置空的那几个；足迹语料随 InfoTest 收敛增长）。命令头一条都不许变
+# 计数（足迹语料随 InfoTest 收敛增长；省略的默认值、现场脱敏的字段各少了脱敏收据里那几个——
+# 这两个差在 run() 里按收据逐一核对，不是放过）。命令头一条都不许变
 _PROJECTION_IDENTITY = [("source", "sha256"), ("stats", "default_values_omitted"),
+                        ("stats", "credential_fields_redacted"),
                         ("stats", "value_domain", "footprint_nodes_read"),
                         ("stats", "value_domain", "footprint_commands_read")]
 _ATLAS_IDENTITY = [("identity",), ("auxiliary_sources",)]
@@ -101,6 +290,18 @@ _GRAMMAR_IDENTITY = [("framework_cleanup_rules", "source_identity")]
 
 def same_but_identity(original: Any, derived: Any, paths: list[tuple[str, ...]]) -> bool:
     return _without(original, paths) == _without(derived, paths)
+
+
+def counter_deltas(before: dict[str, Any], after: dict[str, Any],
+                   receipt: dict[str, Any]) -> dict[str, bool]:
+    """投影里放过的两个计数，差必须正好等于脱敏收据（原投影 stats − 重推导投影 stats）。"""
+    return {
+        "omitted_defaults_delta": (before["default_values_omitted"] - after["default_values_omitted"]
+                                   == receipt["blanked_default_values"]),
+        "redacted_fields_delta": (
+            before["credential_fields_redacted"] - after["credential_fields_redacted"]
+            == receipt["projected_fields_redacted"]),
+    }
 
 
 def _copytree(src: Path, dst: Path) -> None:
@@ -139,6 +340,8 @@ def run(data_root: Path, raw_build: str, root: Path) -> dict[str, Any]:
         parse_build_identity,
         publish_local_command_tree,
         resolve_active_command_tree,
+        xml_sensitive_literal_count,
+        xml_sensitive_literal_replace,
     )
 
     identity = parse_build_identity(raw_build)
@@ -154,7 +357,9 @@ def run(data_root: Path, raw_build: str, root: Path) -> dict[str, Any]:
     raw_xml = original.xml_path.read_bytes()
     if sha256(raw_xml) != original.source_sha256:
         raise RederiveError("the active command tree XML drifted from its generation")
-    sanitized, receipt = sanitize_xml(raw_xml, is_credential_argument, _xml_default_literal_closure)
+    sanitized, receipt = sanitize_xml(raw_xml, is_credential_argument, _xml_default_literal_closure,
+                                      literal_count=xml_sensitive_literal_count,
+                                      literal_replace=xml_sensitive_literal_replace)
     from cex_core.engine.scripts.maintenance.build_vendor_stdlib import (
         generate_vendor_stdlib_projection,
     )
@@ -185,9 +390,9 @@ def run(data_root: Path, raw_build: str, root: Path) -> dict[str, Any]:
             json.loads((ref_new / "domain_grammar.json").read_text("utf-8")),
             _GRAMMAR_IDENTITY),
     }
-    omitted = (json.loads(original.projection_path.read_text("utf-8"))["stats"]["default_values_omitted"]
-               - json.loads(derived.projection_path.read_text("utf-8"))["stats"]["default_values_omitted"])
-    checks["omitted_defaults_delta"] = omitted == receipt["blanked_default_values"]
+    checks.update(counter_deltas(json.loads(original.projection_path.read_text("utf-8"))["stats"],
+                                 json.loads(derived.projection_path.read_text("utf-8"))["stats"],
+                                 receipt))
     if not all(checks.values()):
         raise RederiveError("re-derived artifacts differ beyond their XML identity: "
                             + ", ".join(name for name, ok in checks.items() if not ok))
@@ -197,6 +402,8 @@ def run(data_root: Path, raw_build: str, root: Path) -> dict[str, Any]:
         "sanitization": {**receipt, "original_xml_sha256": original.source_sha256,
                          "sanitized_xml_sha256": derived.source_sha256,
                          "original_generation_id": original.generation_id},
+        # 发布端要在原始 XML 上现算默认值闭包（出包前扫描用）；只给路径，值不经过 stdout
+        "original_xml": {"path": str(original.xml_path), "sha256": original.source_sha256},
         "generation": {"generation_id": derived.generation_id,
                        "manifest_sha256": derived.manifest_sha256,
                        "projection_sha256": derived.projection_sha256,

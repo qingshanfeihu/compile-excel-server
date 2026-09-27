@@ -14,12 +14,18 @@
 - InfoTest 没有“收敛链已跑完”的回执，所以闸是：InfoTest 编译预检里与数据有关的各项 +
   逐类的校验。任何一项不过就拒绝导入，并指出 InfoTest 里修复它的入口。
 - spec：先调 InfoTest 自己的 spec 同步（有时限），同步失败就拒绝；generation 的代龄只记录。
-- 命令树只发投影（vendor_stdlib JSON），不发原始 XML：原始 XML 带参数默认值（含凭据默认值）。
+- 命令树只发投影（vendor_stdlib JSON），不发原始 XML：原始 XML 带参数默认值（含凭据默认值）；
+  compile_ref 里的 cmdtree_*.xml 也不进 projections。
+- 出包前扫描：每个条目、每个 tar/zip 成员里都不许出现凭据值（框架镜像源码的凭据字面 +
+  命令树 XML 凭据参数的默认值，取 InfoTest 自己的闭包函数，查原文、XML 转义、URL 编码等写法）。
+  本通道不脱敏：框架树、规格书里带凭据就拒绝，改用 tools/publish_data_dir.py（它脱敏并重推导）。
 - 发布：client_credentials 取令牌 → 逐个 PUT blob → POST 清单进 candidate →
   服务端自检通过且给了 --promote 才切 stable。内容没变时 bundle_id 相同，是空操作。
+  服务端地址必须是 https（回环地址除外；可信实验网显式 --insecure-lan），客户端密钥不明文过网。
 
 分两层：InfoTestResolver 只负责从 InfoTest 取条目和检查结果；Publisher 只负责打包上传，
-与 InfoTest 无关（测试用假 resolver 驱动它）。
+与 InfoTest 无关（测试用假 resolver 驱动它）。出包前扫描（CredentialScanner）也在与 InfoTest
+无关的这一层，两个发布通道共用；Publisher 只上传扫描过且干净的解析结果。
 """
 
 from __future__ import annotations
@@ -29,14 +35,18 @@ import base64
 import gzip
 import hashlib
 import io
+import ipaddress
 import json
 import os
+import re
 import stat
 import sys
 import tarfile
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -53,8 +63,9 @@ DATA_CHECKS = (
 )
 
 # compile_ref 下不进包的：扁平 vendor_stdlib 的有效副本在命令树 generation 里；
-# source_reconciliation 没有消费方；Excel 候选文件归 template 类
-_PROJECTION_EXCLUDE_PREFIXES = ("vendor_stdlib_", "source_reconciliation_")
+# source_reconciliation 没有消费方；Excel 候选文件归 template 类；cmdtree_*.xml 是带凭据默认值的
+# 原始命令树（脱敏重推导的那份由 publish_data_dir 发）
+_PROJECTION_EXCLUDE_PREFIXES = ("vendor_stdlib_", "source_reconciliation_", "cmdtree_")
 _PROJECTION_EXCLUDE_NAMES = {
     "excel_contract.json", "excel_runtime_template.xlsx", "excel_workbook_manifest.json",
 }
@@ -108,11 +119,17 @@ def deterministic_tar_gz(root: Path, *, include: Callable[[Path], bool] | None =
             continue
         if include is not None and not include(rel):
             continue
-        files.append((rel.as_posix(), path))
+        files.append((rel.as_posix(), path.read_bytes()))
+    return tar_gz_bytes(files)
+
+
+def tar_gz_bytes(files: Iterable[tuple[str, bytes]]) -> bytes:
+    """内存里的 (相对路径, 内容) 打成确定性 tar.gz（与 deterministic_tar_gz 同一套规则）。
+
+    按路径分段排序（与 Path 排序一致），同样的内容打出与按目录打包同样的字节。"""
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as tar:
-        for rel, path in files:
-            data = path.read_bytes()
+        for rel, data in sorted(files, key=lambda item: item[0].split("/")):
             info = tarfile.TarInfo(rel)
             info.size = len(data)
             info.mtime = 0
@@ -126,7 +143,169 @@ def deterministic_tar_gz(root: Path, *, include: Callable[[Path], bool] | None =
     return out.getvalue()
 
 
+# ── 出包前的凭据扫描（与 InfoTest 无关；两个发布通道共用）────────────────────
+# 值由调用方用引擎在**原始**数据上的闭包算出（框架镜像源码里的凭据字面、命令树 XML 凭据参数的
+# 默认值），这里只认值。匹配与引擎同一套规则：
+#   SUBSTRING：忽略大小写的子串（credential_literals.matching_credential_literal_count，框架闭包）
+#   TOKEN：纯字母数字的值按词边界、其余按子串，忽略大小写
+#          （command_tree_sync.xml_sensitive_literal_count，命令树默认值闭包）
+# 每个值还查它在包里可能的别的写法：XML 转义、URL 编码、JSON 转义。gzip/tar/zip（含 xlsx）逐层
+# 解开查；xlsx 的共享串按富文本分段存时，把同一个串的各段拼起来再查一遍。
+# 报告只有位置与次数，从不带值。
+SUBSTRING = "substring"
+TOKEN = "token"
+_ZIP_MAGIC = b"PK\x03\x04"
+_GZIP_MAGIC = b"\x1f\x8b"
+_SCAN_MAX_DEPTH = 4
+_SCAN_MAX_EXPANDED = 4 * 1024 ** 3
+_XML_RUN_GROUP = re.compile(r"<(si|is)\b[^>]*>(.*?)</\1>", re.S)
+_XML_RUN_TEXT = re.compile(r"<t\b[^>]*>(.*?)</t>", re.S)
+
+
+class CredentialScanError(RuntimeError):
+    """包没法扫完（嵌套过深、解开后过大）：当成没扫过，拒绝发布。"""
+
+
+def credential_forms(value: str) -> frozenset[str]:
+    """一个凭据值在包里可能的写法：原文、XML 转义（&amp; &lt; &gt; &quot; &#39; …）、URL 编码、JSON 转义。"""
+    xml = value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    forms = {value, xml, value.replace("&", "&#38;"),
+             urllib.parse.quote(value, safe=""), urllib.parse.quote_plus(value, safe=""),
+             urllib.parse.quote(value), json.dumps(value)[1:-1],
+             json.dumps(value, ensure_ascii=False)[1:-1]}
+    for quot in ('"', "&quot;", "&#34;"):
+        for apos in ("'", "&#39;", "&apos;"):
+            forms.add(xml.replace('"', quot).replace("'", apos))
+    return frozenset(form for form in forms if form)
+
+
+def _joined_runs(text: str) -> str:
+    return "\n".join("".join(_XML_RUN_TEXT.findall(group.group(2)))
+                     for group in _XML_RUN_GROUP.finditer(text))
+
+
+class CredentialScanner:
+    def __init__(self, values: Mapping[str, str]):
+        plain: set[str] = set()
+        token: set[str] = set()
+        for value, rule in values.items():
+            if rule not in (SUBSTRING, TOKEN):
+                raise ValueError(f"unknown credential match rule {rule!r}")
+            for form in credential_forms(str(value)):
+                folded = form.casefold()
+                if rule == TOKEN and re.fullmatch("[a-z0-9]+", folded):
+                    token.add(folded)
+                elif folded:
+                    plain.add(folded)
+        parts = [re.escape(form) for form in sorted(plain, key=lambda f: (-len(f), f))]
+        parts += [rf"(?<![a-z0-9]){re.escape(form)}(?![a-z0-9])"
+                  for form in sorted(token, key=lambda f: (-len(f), f))]
+        self.value_count = len(values)
+        self._folded = re.compile("|".join(parts)) if parts else None
+        # 原文上定位（脱敏替换用）：同一组写法，忽略大小写
+        self._original = re.compile("|".join(parts), re.IGNORECASE) if parts else None
+
+    def count(self, text: str) -> int:
+        if self._folded is None or not text:
+            return 0
+        return sum(1 for _ in self._folded.finditer(text.casefold()))
+
+    def replace(self, text: str, placeholder: str) -> tuple[str, int]:
+        if self._original is None or not text:
+            return text, 0
+        return self._original.subn(placeholder, text)
+
+    def count_blob(self, data: bytes) -> int:
+        """一段不再往下解的内容：按 UTF-8 读（读不了的字节换掉），XML 里再拼富文本分段查。"""
+        text = data.decode("utf-8", "replace")
+        found = self.count(text)
+        if "<t" in text:
+            found = max(found, self.count(_joined_runs(text)))
+        return found
+
+    def scan(self, name: str, data: bytes) -> list[tuple[str, int]]:
+        """name 下（含层层解开的成员）还带凭据值的位置与次数。"""
+        hits: list[tuple[str, int]] = []
+        self._scan(name, data, hits, 0, [_SCAN_MAX_EXPANDED])
+        return hits
+
+    def scan_entries(self, entries: Iterable[Entry]) -> list[tuple[str, int]]:
+        hits: list[tuple[str, int]] = []
+        for entry in entries:
+            hits.extend(self.scan(entry.path, entry.data))
+        return hits
+
+    def _scan(self, name: str, data: bytes, hits: list, depth: int, budget: list[int]) -> None:
+        if depth > _SCAN_MAX_DEPTH:
+            raise CredentialScanError(f"{name}: containers nested too deep to scan")
+        if data[:4] == _ZIP_MAGIC:
+            try:
+                archive = zipfile.ZipFile(io.BytesIO(data))
+                members = [info for info in archive.infolist() if not info.is_dir()]
+                for info in members:
+                    budget[0] -= info.file_size
+                    if budget[0] < 0:
+                        raise CredentialScanError(f"{name}: expands beyond the scan budget")
+                    self._scan(f"{name}!{info.filename}", archive.read(info), hits, depth + 1,
+                               budget)
+                return
+            except (zipfile.BadZipFile, zipfile.LargeZipFile, NotImplementedError, EOFError,
+                    RuntimeError) as exc:
+                if isinstance(exc, CredentialScanError):
+                    raise
+                # 不是能解开的 zip：当普通字节查
+        elif data[:2] == _GZIP_MAGIC:
+            try:
+                with gzip.GzipFile(fileobj=io.BytesIO(data)) as stream:
+                    inner = stream.read(budget[0] + 1)
+            except (OSError, EOFError):
+                inner = None
+            if inner is not None:
+                if len(inner) > budget[0]:
+                    raise CredentialScanError(f"{name}: expands beyond the scan budget")
+                budget[0] -= len(inner)
+                try:
+                    with tarfile.open(fileobj=io.BytesIO(inner), mode="r:") as tar:
+                        for member in tar.getmembers():
+                            if member.isfile():
+                                blob = tar.extractfile(member)
+                                self._scan(f"{name}!{member.name}",
+                                           blob.read() if blob is not None else b"", hits,
+                                           depth + 1, budget)
+                    return
+                except tarfile.TarError:
+                    self._scan(f"{name}!gunzip", inner, hits, depth + 1, budget)
+                    return
+        found = self.count_blob(data)
+        if found:
+            hits.append((name, found))
+
+
+def describe_credential_hits(hits: list[tuple[str, int]],
+                             notes: Mapping[str, str] | None = None,
+                             limit: int = 60) -> list[str]:
+    rows = [f"{name}: {count}" + (f" ({notes[name]})" if notes and name in notes else "")
+            for name, count in hits[:limit]]
+    if len(hits) > limit:
+        rows.append(f"... and {len(hits) - limit} more")
+    return rows
+
+
 # ── InfoTest 一侧 ──────────────────────────────────────────────────────
+def compile_ref_files(compile_ref: Path) -> list[tuple[str, Path]]:
+    """compile_ref 下进 projections 的文件（排除规则见 _PROJECTION_EXCLUDE_*）。"""
+    picked = []
+    for path in sorted(compile_ref.rglob("*")):
+        rel = path.relative_to(compile_ref)
+        if (not path.is_file() or path.is_symlink()
+                or any(part.startswith(".") for part in rel.parts)
+                or rel.name in _PROJECTION_EXCLUDE_NAMES
+                or rel.name.startswith(_PROJECTION_EXCLUDE_PREFIXES)):
+            continue
+        picked.append((rel.as_posix(), path))
+    return picked
+
+
 class InfoTestResolver:
     def __init__(self, root: Path, raw_build: str, *, spec_sync_timeout_s: int = 180):
         self.root = Path(root).resolve()
@@ -136,9 +315,10 @@ class InfoTestResolver:
         self.checks: list[dict[str, str]] = []
         self.entries: list[Entry] = []
         self.source: dict[str, Any] = {"importer": "import_infotest", "raw_build": self.raw_build}
+        self._raw_xml: bytes | None = None  # 活动代际的原始命令树 XML（只用来算默认值闭包，不进包）
 
-    def _fail(self, key: str, evidence: str, repair: str = "") -> None:
-        item = {"key": key, "status": "fail", "evidence": evidence[:500], "repair": repair}
+    def _fail(self, key: str, evidence: str, repair: str = "", **extra: Any) -> None:
+        item = {"key": key, "status": "fail", "evidence": evidence[:500], "repair": repair, **extra}
         self.failures.append(item)
         self.checks.append(item)
 
@@ -174,6 +354,7 @@ class InfoTestResolver:
         self._step("projections", self._projections)
         self._step("framework", self._framework)
         self._step("footprints", self._footprints)
+        self._step("credential_scan", self._credential_scan)
         if self.failures:
             raise ImportRefused(self.failures)
         return Resolution(self.execution_build, self.entries, self.source, self.checks)
@@ -277,6 +458,12 @@ class InfoTestResolver:
             self._fail("cmdtree", f"命令树投影需要重铸（{verdict.get('reason')}）",
                        "environment_prepare._converge_device_command_tree")
             return
+        raw_xml = active.xml_path.read_bytes()
+        if hashlib.sha256(raw_xml).hexdigest() != active.source_sha256:
+            self._fail("cmdtree", "命令树活动代际的 XML 与代际清单不一致",
+                       "environment_prepare._converge_device_command_tree")
+            return
+        self._raw_xml = raw_xml
         self._add_file("cmdtree", active.projection_path.name, active.projection_path,
                        legacy_name=active.projection_path.name, version=active.generation_id,
                        projection_sha256=active.projection_sha256)
@@ -363,16 +550,40 @@ class InfoTestResolver:
         gen_command_teardown_atlas.verify_atlas_source_identity(
             json.loads(atlas.read_text(encoding="utf-8")))
         count = 0
-        for path in sorted(compile_ref.rglob("*")):
-            rel = path.relative_to(compile_ref)
-            if (not path.is_file() or path.is_symlink()
-                    or any(part.startswith(".") for part in rel.parts)
-                    or rel.name in _PROJECTION_EXCLUDE_NAMES
-                    or rel.name.startswith(_PROJECTION_EXCLUDE_PREFIXES)):
-                continue
-            self._add_file("projections", rel.as_posix(), path)
+        for rel, path in compile_ref_files(compile_ref):
+            self._add_file("projections", rel, path)
             count += 1
         self._ok("projections", f"{count} files")
+
+    def _credential_values(self) -> dict[str, str]:
+        """InfoTest 自己的闭包：框架镜像源码的凭据字面 + 原始命令树 XML 凭据参数的默认值。"""
+        from main.case_compiler.credential_literals import mirror_credential_literals
+        from main.knowledge_paths import KNOWLEDGE_FRAMEWORK_MIRROR
+        from main.sync.command_tree_sync import _xml_default_literal_closure
+
+        if self._raw_xml is None:
+            raise RuntimeError("命令树活动代际没解析出来，取不到 XML 默认值闭包，没法做出包前扫描")
+        values = {value: SUBSTRING
+                  for value in mirror_credential_literals(Path(KNOWLEDGE_FRAMEWORK_MIRROR))}
+        for value in _xml_default_literal_closure(self._raw_xml):
+            values.setdefault(value, TOKEN)
+        return values
+
+    def _credential_scan(self) -> None:
+        scanner = CredentialScanner(self._credential_values())
+        hits = scanner.scan_entries(self.entries)
+        if hits:
+            self._fail("credential_scan",
+                       f"{len(hits)} 个条目/成员仍带凭据值（共 {sum(n for _, n in hits)} 处；"
+                       "只列位置与次数）",
+                       "过渡通道不脱敏：改用 tools/publish_data_dir.py 发布（命令树脱敏后重推导、"
+                       "框架树与规格书脱敏、出包前同样扫描）",
+                       locations=describe_credential_hits(hits))
+            return
+        self.source["credential_scan"] = {"status": "clean", "values": scanner.value_count,
+                                          "entries": len(self.entries)}
+        self._ok("credential_scan", f"{len(self.entries)} entries clean "
+                                    f"({scanner.value_count} credential values)")
 
     def _framework(self) -> None:
         from main.case_compiler.framework_projection_identity import (
@@ -423,10 +634,57 @@ class PublishError(RuntimeError):
     pass
 
 
+# 进 stable 的服务端下限（registry.STABLE_REQUIRED_KINDS；服务端可用 CES_STABLE_REQUIRED_KINDS 改）。
+# 发布方在上传之前按同一个变量核一遍：缺这些 kind 的包进不了 stable，早早拒绝，而不是传完才在
+# 切 stable 时被服务端拒
+STABLE_FLOOR_ENV = "CES_STABLE_REQUIRED_KINDS"
+_STABLE_FLOOR = ("cmdtree", "projections")
+
+
+def stable_floor(value: str | None = None) -> tuple[str, ...]:
+    raw = os.environ.get(STABLE_FLOOR_ENV, "") if value is None else value
+    items = [item for item in re.split(r"[\s,]+", raw.strip()) if item]
+    if not items:
+        return _STABLE_FLOOR
+    if items == ["none"]:
+        return ()
+    unknown = [item for item in items if item not in KINDS]
+    if unknown:
+        raise PublishError(f"{STABLE_FLOOR_ENV} 含未知 kind：{', '.join(unknown)}")
+    return tuple(dict.fromkeys(items))
+
+
+def _is_loopback_host(host: str) -> bool:
+    """与 deploy/tls_policy.is_loopback_host、客户端 check_server_url 同一条规则。"""
+    host = (host or "").strip().strip("[]")
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def check_publish_server(url: str, *, insecure_lan: bool = False) -> str:
+    """服务端地址：https 放行；http 只放行回环地址，或显式 --insecure-lan（可信实验网）。
+
+    发布方的 client secret 走 Basic 认证、令牌走 Bearer：明文 http 会让同网段的人直接拿到。"""
+    url = (url or "").strip().rstrip("/")
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise PublishError(f"--server 必须是 http(s) 地址：{url!r}")
+    if parts.username or parts.password:
+        raise PublishError("--server 里不许带凭据（用 --client-secret-file）")
+    if parts.scheme == "http" and not insecure_lan and not _is_loopback_host(parts.hostname):
+        raise PublishError("明文 http 发往非回环地址会把 client secret 与令牌明文过网；用 https，"
+                           "或确认是可信实验网后加 --insecure-lan")
+    return url
+
+
 class Publisher:
     def __init__(self, server: str, client_id: str, client_secret: str, *,
-                 timeout: float = 120.0):
-        self.server = server.rstrip("/")
+                 timeout: float = 120.0, insecure_lan: bool = False):
+        self.server = check_publish_server(server, insecure_lan=insecure_lan)
         self.client_id = client_id
         self._secret = client_secret
         self.timeout = timeout
@@ -457,8 +715,26 @@ class Publisher:
     def _auth(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._token}", **(extra or {})}
 
+    @staticmethod
+    def preflight(resolution: Resolution, *, promote: bool,
+                  required_kinds: tuple[str, ...] = KINDS) -> None:
+        """上传之前就能判的拒绝：没做出包前扫描（或没过）；要切 stable 却缺 stable 下限的 kind。"""
+        scan = resolution.source.get("credential_scan")
+        if not isinstance(scan, dict) or scan.get("status") != "clean":
+            raise PublishError("这份解析结果没有通过出包前的凭据扫描，拒绝上传"
+                               "（由 InfoTestResolver / DataDirResolver 的 resolve() 产出）")
+        if not promote:
+            return  # 只进 candidate：缺哪类由服务端自检如实记下
+        present = {entry.kind for entry in resolution.entries}
+        missing = [kind for kind in dict.fromkeys((*required_kinds, *stable_floor()))
+                   if kind not in present]
+        if missing:
+            raise PublishError(f"包里缺少 {', '.join(missing)}，进不了 stable（服务端自检与 stable "
+                               f"下限，见 {STABLE_FLOOR_ENV}）；先补齐再发布")
+
     def publish(self, resolution: Resolution, *, promote: bool,
                 required_kinds: tuple[str, ...] = KINDS) -> dict[str, Any]:
+        self.preflight(resolution, promote=promote, required_kinds=required_kinds)
         if not self._token:
             self.login()
         uploaded = 0
@@ -492,19 +768,61 @@ class Publisher:
         result["uploaded_blobs"] = uploaded
         result["promoted"] = False
         if promote:
-            if not result["checks"]["ok"]:
-                raise PublishError("服务端自检未通过，不切 stable：" +
-                                   "; ".join(result["checks"]["problems"]))
-            form = urllib.parse.urlencode({"bundle_id": result["bundle_id"]}).encode()
-            status, raw = self._request(
-                "POST", f"/v1/builds/{urllib.parse.quote(resolution.build)}/channels/stable",
-                data=form, headers=self._auth(
-                    {"Content-Type": "application/x-www-form-urlencoded"}))
-            if status != 200:
-                raise PublishError(f"切 stable 失败（HTTP {status}）："
-                                   f"{raw[:300].decode('utf-8', 'replace')}")
-            result["promoted"] = True
+            result["promotion"] = self._promote(resolution.build, result)
+            result["promoted"] = result["promotion"]["status"] == "promoted"
         return result
+
+    def _promote(self, build: str, result: dict[str, Any]) -> dict[str, Any]:
+        """切 stable，但不覆盖别人的决定：
+
+        - 服务端自检没过 → PublishError（退出码非零）；
+        - stable 已经指着这个包 → already_stable；
+        - 内容没变（created 为 False）而 stable 指着别的包 → 不动（left_alone_unchanged）：
+          多半是运维回滚过，同内容重发不该把它拨回来；
+        - 新包 → 带 expect=<登记时看到的 stable 指针|none> 切；服务端回 409 说明这期间有人动过
+          stable（并发发布或回滚）→ 不动（left_alone_conflict），如实报当前指针。
+        这三种“不动”都按成功退出（每天由 cron 重跑也不报错）；其余被拒（自检、缺 kind、权限…）
+        抛 PublishError。旧版服务端的回应里没有 channels：只在新包时切，不带 expect。"""
+        bundle_id = result["bundle_id"]
+        if not result["checks"]["ok"]:
+            raise PublishError("服务端自检未通过，不切 stable：" +
+                               "; ".join(result["checks"]["problems"]))
+        channels = result.get("channels")
+        stable = channels.get("stable") if isinstance(channels, dict) else None
+        if stable == bundle_id:
+            return {"status": "already_stable", "stable": stable,
+                    "message": "stable 已经指向这个包"}
+        if not result.get("created"):
+            return {"status": "left_alone_unchanged", "stable": stable,
+                    "message": f"内容与已登记的包相同，stable 指针没动（现在指向 {stable or '（空）'}，"
+                               "可能是运维回滚过）；确要切过去：ces registry promote "
+                               f"{build} {bundle_id} --expect {stable or 'none'}"}
+        fields = {"bundle_id": bundle_id}
+        if isinstance(channels, dict):
+            fields["expect"] = stable or "none"
+        status, raw = self._request(
+            "POST", f"/v1/builds/{urllib.parse.quote(build)}/channels/stable",
+            data=urllib.parse.urlencode(fields).encode(),
+            headers=self._auth({"Content-Type": "application/x-www-form-urlencoded"}))
+        if status == 409:
+            try:
+                current = json.loads(raw).get("current")
+            except ValueError:
+                current = None
+            return {"status": "left_alone_conflict", "stable": current,
+                    "message": f"登记后 stable 被别人动过（现在指向 {current or '（空）'}），没有覆盖；"
+                               f"核对后确要切过去：ces registry promote {build} {bundle_id} "
+                               f"--expect {current or 'none'}"}
+        if status != 200:
+            raise PublishError(f"切 stable 失败（HTTP {status}）："
+                               f"{raw[:300].decode('utf-8', 'replace')}")
+        try:
+            changed = json.loads(raw).get("changed", True)
+        except ValueError:
+            changed = True
+        return {"status": "promoted" if changed is not False else "already_stable",
+                "stable": bundle_id, "message": "已切到 stable" if changed is not False
+                else "stable 已经指向这个包"}
 
 
 def read_secret_file(path: Path) -> str:
@@ -528,7 +846,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--spec-sync-timeout", type=int, default=180)
     parser.add_argument("--promote", action="store_true", help="自检通过后切到 stable")
     parser.add_argument("--dry-run", action="store_true", help="只解析与校验，不上传")
+    parser.add_argument("--insecure-lan", action="store_true",
+                        help="允许明文 http 发往非回环地址（仅限可信实验网）")
     args = parser.parse_args(argv)
+    if not args.dry_run and args.server:
+        try:  # 先核地址再解析：明文 http 发往非回环地址直接拒绝
+            check_publish_server(args.server, insecure_lan=args.insecure_lan)
+        except PublishError as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+            return 1
 
     resolver = InfoTestResolver(Path(args.infotest_root), args.device_build,
                                 spec_sync_timeout_s=args.spec_sync_timeout)
@@ -552,7 +878,8 @@ def main(argv: list[str] | None = None) -> int:
         return 64
     try:
         publisher = Publisher(args.server, args.client_id,
-                              read_secret_file(Path(args.client_secret_file).expanduser()))
+                              read_secret_file(Path(args.client_secret_file).expanduser()),
+                              insecure_lan=args.insecure_lan)
         result = publisher.publish(resolution, promote=args.promote)
     except (PublishError, OSError) as exc:
         print(json.dumps({**summary, "ok": False, "error": str(exc)}, ensure_ascii=False))

@@ -2,6 +2,8 @@
 
 - Publisher：用假的解析结果对真服务端（uvicorn 子进程）走完整发布：取令牌 → 上传 blob →
   登记进 candidate → 切 stable；同内容重发是空操作；自检不过不切 stable。
+- 切 stable 不覆盖别人的决定：同内容重发时 stable 已被回滚到别的包就不动；新包切 stable 时带
+  expect=<登记时看到的 stable>，这期间有人动过 stable（服务端回 409）就不动，如实报当前指针。
 - 确定性打包：同样的文件内容，mtime 不同也打出同样的字节。
 - 凭据文件必须是 0600。
 - 对真实 InfoTest 的负向验证（可选）：设 IMPORT_INFOTEST_ROOT 指向一份**没有跑过批入口**
@@ -11,11 +13,15 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -42,14 +48,16 @@ def publish_env(tmp_path_factory):
     server.stop()
 
 
-def _resolution(extra: bytes = b"") -> imp.Resolution:
+def _resolution(extra: bytes = b"", build: str = "IMPORT_TEST_BUILD") -> imp.Resolution:
     entries = [
         imp.Entry(kind, f"{kind}/sample_{kind}.json",
                   json.dumps({"kind": kind}).encode() + extra, "application/json",
                   {"legacy_name": f"sample_{kind}.json"} if kind == "cmdtree" else {})
         for kind in imp.KINDS
     ]
-    return imp.Resolution("IMPORT_TEST_BUILD", entries, {"importer": "test"},
+    # 真解析器在 resolve() 末尾做出包前扫描并记下结论；Publisher 只收扫描过且干净的
+    return imp.Resolution(build, entries, {"importer": "test",
+                                           "credential_scan": {"status": "clean"}},
                           [{"key": "identity", "status": "ok", "evidence": ""}])
 
 
@@ -109,6 +117,90 @@ def test_promote_refused_when_required_kind_missing(publish_env):
     partial.entries = [e for e in partial.entries if e.kind != "footprints"]
     with pytest.raises(imp.PublishError, match="footprints"):
         pub.publish(partial, promote=True)
+
+
+def _stable(server, secret_file, build: str) -> str | None:
+    """当前 stable 指针（用只读令牌读，不经 Publisher）。"""
+    basic = base64.b64encode(f"publisher:{imp.read_secret_file(secret_file)}".encode()).decode()
+    req = urllib.request.Request(
+        f"{server.base}/token", data=b"grant_type=client_credentials&scope=bundles%3Aread",
+        headers={"Authorization": f"Basic {basic}",
+                 "Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        token = json.loads(resp.read())["access_token"]
+    req = urllib.request.Request(f"{server.base}/v1/builds/{build}/bundle?channel=stable",
+                                 headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())["bundle_id"]
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 404
+        return None
+
+
+def _set_stable(pub: imp.Publisher, build: str, bundle_id: str) -> None:
+    """运维手工切 stable（例如回滚）。"""
+    if not pub._token:
+        pub.login()
+    status, raw = pub._request(
+        "POST", f"/v1/builds/{build}/channels/stable",
+        data=urllib.parse.urlencode({"bundle_id": bundle_id}).encode(),
+        headers=pub._auth({"Content-Type": "application/x-www-form-urlencoded"}))
+    assert status == 200, raw
+
+
+def test_republishing_the_stable_content_is_a_no_op(publish_env):
+    server, secret_file = publish_env
+    pub = imp.Publisher(server.base, "publisher", imp.read_secret_file(secret_file))
+    build = "PROMOTE_NOOP"
+    first = pub.publish(_resolution(b" a", build), promote=True)
+    assert first["promotion"]["status"] == "promoted" and first["promoted"] is True
+    again = pub.publish(_resolution(b" a", build), promote=True)
+    assert again["created"] is False and again["promoted"] is False
+    assert again["promotion"]["status"] == "already_stable"
+    assert _stable(server, secret_file, build) == first["bundle_id"]
+
+
+def test_unchanged_content_does_not_undo_an_operator_rollback(publish_env):
+    server, secret_file = publish_env
+    pub = imp.Publisher(server.base, "publisher", imp.read_secret_file(secret_file))
+    build = "PROMOTE_ROLLBACK"
+    old = pub.publish(_resolution(b" old", build), promote=True)
+    new = pub.publish(_resolution(b" new", build), promote=True)
+    assert new["promoted"] and _stable(server, secret_file, build) == new["bundle_id"]
+    _set_stable(pub, build, old["bundle_id"])  # 运维回滚
+    again = pub.publish(_resolution(b" new", build), promote=True)
+    assert again["created"] is False and again["promoted"] is False
+    assert again["promotion"]["status"] == "left_alone_unchanged"
+    assert again["promotion"]["stable"] == old["bundle_id"]
+    assert _stable(server, secret_file, build) == old["bundle_id"], "the rollback stands"
+
+
+def test_promotion_does_not_overwrite_a_concurrent_stable_change(publish_env):
+    server, secret_file = publish_env
+    build = "PROMOTE_RACE"
+    secret = imp.read_secret_file(secret_file)
+    first = imp.Publisher(server.base, "publisher", secret).publish(
+        _resolution(b" first", build), promote=True)
+    other = imp.Publisher(server.base, "publisher", secret).publish(
+        _resolution(b" other", build), promote=False)
+    sent: list[dict] = []
+
+    class Racing(imp.Publisher):
+        def _request(self, method, path, *, data=None, headers=None):
+            if path.endswith("/channels/stable") and not sent:
+                sent.append(dict(urllib.parse.parse_qsl(data.decode())))
+                _set_stable(imp.Publisher(server.base, "publisher", secret), build,
+                            other["bundle_id"])  # 登记与切 stable 之间，别人动了 stable
+            return super()._request(method, path, data=data, headers=headers)
+
+    result = Racing(server.base, "publisher", secret).publish(_resolution(b" third", build),
+                                                              promote=True)
+    assert sent == [{"bundle_id": result["bundle_id"], "expect": first["bundle_id"]}]
+    assert result["promoted"] is False
+    assert result["promotion"]["status"] == "left_alone_conflict"
+    assert result["promotion"]["stable"] == other["bundle_id"]
+    assert _stable(server, secret_file, build) == other["bundle_id"]
 
 
 def test_bad_secret_is_refused(publish_env):
