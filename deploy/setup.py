@@ -157,9 +157,11 @@ def draft_message(state: dict) -> None:
 
 # ── 向导 ──────────────────────────────────────────────────
 def wizard() -> dict:
+    # 草稿恢复只认这里列出的键：TLS 三项也要在，不然断点续填会把证书答案丢掉
     state: dict = {
         "progress": 0, "data": "", "device_build": "", "kms": "",
-        "port": "", "host": "", "force": "n", "start": "y",
+        "port": "", "host": "", "tls_cert": "", "tls_key": "", "insecure_lan": "",
+        "force": "n", "start": "y",
         "artifacts": [], "docs": [],
     }
     resume = False
@@ -241,8 +243,8 @@ def wizard() -> dict:
         print(f" ✓ 第3步·openkm/KMS（沿用草稿）: {state['kms'] or '（未配置）'}")
     else:
         step_head("3/7", "openkm / KMS 地址（可选）",
-                  "知识管理/密钥服务的 host:port。配置后会透出到 /healthz 与 manifest，"
-                  "客户端与 preflight 可据此探活；暂无该服务直接回车跳过，"
+                  "知识管理/密钥服务的 host:port。配置后会透出到（需登录的）工件清单 manifest，"
+                  "客户端可据此探活；暂无该服务直接回车跳过，"
                   "之后可改 meta 补配。",
                   "10.0.0.90:8443 或 km.internal:8443")
         state["kms"] = ask("openkm/KMS 地址 host:port（无则回车跳过）", default_kms)
@@ -394,6 +396,10 @@ def wizard() -> dict:
         print("   （无）")
     print(f" 监听端口     : {state['port']}")
     print(f" 监听地址     : {state.get('host') or '127.0.0.1'}")
+    if state.get("tls_cert"):
+        print(f" TLS          : {state['tls_cert']}（私钥 {state.get('tls_key') or '未填'}）")
+    elif state.get("insecure_lan") == "y":
+        print(" TLS          : 不配（已确认可信实验网，明文）")
     print(f" 覆盖策略     : {'同名即覆盖' if state['force'] == 'y' else '内容不同则跳过'}")
     print(f" 装完启动     : {'是' if state['start'] == 'y' else '否'}")
     print("══════════════════════════════════════════════════")

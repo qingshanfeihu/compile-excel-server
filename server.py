@@ -6,7 +6,11 @@
   （$CES_DATA_DIR，缺省 ./data；由部署侧灌入，见 deploy/provision.py）；
 - 账号与密钥不预置：审计签名密钥在部署时由 provision 生成；用户与服务客户端由
   `ces users add` / `ces clients add` 创建，库里只存哈希；
-- 认证后端可插拔（auth_backends.py）。现有 private-mock：用户名 + 管理员发放的访问码。
+- 认证后端可插拔（auth_backends.py）。内置 private-mock：用户名 + 管理员发放的访问码。
+
+未认证可达的入口都有上限：请求体（表单 8 KiB、清单 16 MiB、blob $CES_MAX_BLOB_BYTES，超了 413）、
+待处理设备码（全局 1000、单个来源地址 $CES_MAX_PENDING_FLOWS_PER_IP）、访问码/secret 校验
+在有上限的线程池里做，不占事件循环。
 
 接口：
   POST /device_authorize           设备授权发起（RFC 8628）
@@ -21,11 +25,12 @@
   GET  /v1/blobs/{sha}             按内容寻址下载（bundles:read）
   PUT  /v1/blobs/{sha}             上传 blob，服务端重算哈希（bundles:publish）
   POST /v1/bundles                 登记数据包并进 candidate（bundles:publish）
-  POST /v1/builds/{b}/channels/{c} 切通道；自检没过的包进不了 stable（bundles:publish）
+  POST /v1/builds/{b}/channels/{c} 切通道（可带 expect，指针不符回 409）；自检没过、缺 stable
+                                   下限 kind 的包进不了 stable（bundles:publish）
   GET  /v1/artifacts/manifest      旧版工件清单：由该构建 stable 包派生（artifacts:read）
   GET  /v1/artifacts/{name}        旧版工件下载：发不可变 blob（artifacts:read）
   POST /v1/docs/query              知识库关键词检索（docs:query）
-  GET  /healthz                    探活
+  GET  /healthz                    探活（只答 ok，不透出构建与后端）
 
 跑法：python3 server.py [--port 8900] [--data <数据目录>]
 依赖：fastapi + uvicorn。
@@ -35,24 +40,39 @@ from __future__ import annotations
 
 import argparse
 import base64
+import functools
 import html
 import json
+import math
 import os
 import re
 import secrets
+import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import parse_qs, unquote
 
+import anyio
+import anyio.to_thread
+from anyio.lowlevel import RunVar
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 import auth_backends
 import client_config
-from gateway.audit_chain import AuditChain
-from auth_store import SCOPES, AuthStore
-from registry import CHANNELS, Registry, RegistryError, valid_build, valid_sha
+from auth_store import RESERVED_NAMES, SCOPES, AuthStore
+from deploy.audit_log import AuditLog
+from registry import (
+    CHANNELS,
+    BlobTooLarge,
+    ChannelConflict,
+    Registry,
+    RegistryError,
+    valid_build,
+    valid_sha,
+)
 
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -78,9 +98,16 @@ REFRESH_TTL = int(os.environ.get("CES_REFRESH_TTL", str(7 * 24 * 3600)))
 DEVICE_TTL = int(os.environ.get("CES_DEVICE_TTL", "600"))
 POLL_INTERVAL = int(os.environ.get("CES_POLL_INTERVAL", "1"))
 MAX_PENDING_FLOWS = 1000
+# 同一来源地址同时挂着的设备码上限：一个来源刷不满全局名额，挤不掉别人的登录
+MAX_PENDING_FLOWS_PER_IP = int(os.environ.get("CES_MAX_PENDING_FLOWS_PER_IP", "20"))
 DEFAULT_REQUEST_SCOPE = "artifacts:read docs:query"
 MAX_BLOB_BYTES = int(os.environ.get("CES_MAX_BLOB_BYTES", str(2 << 30)))
 MAX_MANIFEST_BYTES = 16 << 20
+MAX_FORM_BYTES = 8 << 10
+# 访问码 / client secret 校验（旧格式哈希要算 20 万轮）同时最多占几个线程
+HASH_WORKERS = 4
+MAX_QUERY_CHARS = 512
+MAX_QUERY_TERMS = 32
 
 MANIFEST_SCHEMA = "ist.excel.artifact-manifest"
 RECEIPT_SCHEMA = "ist.excel.promotion-receipt"
@@ -112,7 +139,8 @@ def _init_data(data_dir: Path) -> None:
     META_PATH = DATA_DIR / "artifacts_meta.json"
     AUDIT_PATH = DATA_DIR / "audit.log"
     AUDIT_KEY_PATH = DATA_DIR / "audit_hmac_key"
-    AUDIT = AuditChain(AUDIT_PATH, key=_audit_key)
+    # 与 ces 管理命令共写一条链：每次追加都在文件锁里重读末行（deploy/audit_log.py）
+    AUDIT = AuditLog(DATA_DIR)
     META = _load_meta(META_PATH)
     DEVICE_BUILD = str(META["device_build"])
     ARTIFACT_META = dict(META.get("artifacts") or {})
@@ -125,29 +153,68 @@ def _init_data(data_dir: Path) -> None:
         os.environ.get("CES_AUTH_BACKEND", ""), AUTH_STORE)
 
 
-def _audit_key() -> bytes | None:
-    """部署时生成的审计签名密钥（provision 产出，600）；缺省则审计不带 hmac。"""
-    try:
-        return bytes.fromhex(AUDIT_KEY_PATH.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
-        return None
-
-
 # ── 设备流状态（短命，进程内存；令牌本身在 auth.db）──────────────────────
 _device_flows: dict[str, dict[str, Any]] = {}
 
 
 def _audit(event: str, **fields: Any) -> None:
-    """JSONL 审计，哈希链（audit_chain.py）；有实例密钥时附 hmac。
+    """JSONL 审计，哈希链（audit_chain.py）；有实例密钥（provision 生成，600）时附 hmac。
     调用方保证不含任何 token、访问码、client secret。"""
     record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": event}
     record.update(fields)
     AUDIT.append(record)
 
 
-async def _parse_payload(request: Request) -> dict[str, str]:
-    """兼容 form-encoded 与 JSON 的手动解析（不引入 python-multipart）。"""
-    raw = await request.body()
+class BodyTooLarge(Exception):
+    def __init__(self, limit: int):
+        super().__init__(f"request body exceeds {limit} bytes")
+        self.limit = limit
+
+
+@app.exception_handler(BodyTooLarge)
+async def _body_too_large(request: Request, exc: BodyTooLarge) -> JSONResponse:
+    return JSONResponse({"detail": str(exc)}, status_code=413, headers={"Connection": "close"})
+
+
+def _declared_too_large(request: Request, limit: int) -> bool:
+    try:
+        return int(request.headers.get("content-length") or 0) > limit
+    except ValueError:
+        return False
+
+
+async def _read_body(request: Request, limit: int) -> bytes:
+    """读请求体，最多 limit 字节：声明的长度超限就不读直接 413，没声明的边读边数。"""
+    if _declared_too_large(request, limit):
+        raise BodyTooLarge(limit)
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            raise BodyTooLarge(limit)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+_T = TypeVar("_T")
+_HASH_LIMITER: RunVar[anyio.CapacityLimiter] = RunVar("ces_hash_limiter")
+
+
+async def _off_loop(func: Callable[..., _T], *args: Any) -> _T:
+    """访问码 / secret 校验放进线程池，并发上限 HASH_WORKERS（按事件循环各一份），
+    慢哈希不占事件循环，也不挤占下载等其他线程池用途。"""
+    try:
+        limiter = _HASH_LIMITER.get()
+    except LookupError:
+        limiter = anyio.CapacityLimiter(HASH_WORKERS)
+        _HASH_LIMITER.set(limiter)
+    return await anyio.to_thread.run_sync(functools.partial(func, *args), limiter=limiter)
+
+
+async def _parse_payload(request: Request, limit: int = MAX_FORM_BYTES) -> dict[str, str]:
+    """兼容 form-encoded 与 JSON 的手动解析（不引入 python-multipart）；请求体超过 limit 回 413。"""
+    raw = await _read_body(request, limit)
     if not raw:
         return {}
     text = raw.decode("utf-8", "replace")
@@ -216,17 +283,18 @@ def _requested_scopes(raw: str) -> list[str] | None:
 
 @app.get("/healthz")
 async def healthz() -> dict[str, Any]:
-    payload = {"ok": True, "service": "compile-excel-server",
-               "device_build": DEVICE_BUILD, "auth_backend": AUTH_BACKEND.name}
-    if META.get("kms_addr"):
-        payload["kms_addr"] = str(META["kms_addr"])
-    return payload
+    # 不鉴权：只答活着没有。构建、认证后端、KMS 地址不在这里透出（清单与 whoami 需登录）
+    return {"ok": True, "service": "compile-excel-server"}
 
 
 def _prune_flows() -> None:
     now = time.time()
     for code in [c for c, f in _device_flows.items() if f["exp"] < now]:
         _device_flows.pop(code, None)
+
+
+def _client_address(request: Request) -> str:
+    return request.client.host if request.client else ""
 
 
 @app.post("/device_authorize")
@@ -239,7 +307,10 @@ async def device_authorize(request: Request) -> JSONResponse:
                              "error_description": f"known scopes: {' '.join(SCOPES)}"},
                             status_code=400)
     _prune_flows()
-    if len(_device_flows) >= MAX_PENDING_FLOWS:
+    source = _client_address(request)
+    if (len(_device_flows) >= MAX_PENDING_FLOWS
+            or sum(1 for f in _device_flows.values() if f["source"] == source)
+            >= MAX_PENDING_FLOWS_PER_IP):
         return JSONResponse({"error": "slow_down"}, status_code=429)
     device_code = secrets.token_urlsafe(32)
     user_code = "".join(secrets.choice("BCDFGHJKLMNPQRSTVWXZ") for _ in range(8))
@@ -252,6 +323,8 @@ async def device_authorize(request: Request) -> JSONResponse:
         "status": "pending",
         "username": "",
         "granted": [],
+        "credential": "",
+        "source": source,
         "exp": time.time() + DEVICE_TTL,
     }
     return JSONResponse({
@@ -313,7 +386,9 @@ async def activate_submit(request: Request) -> HTMLResponse:
         return _page("授权失败", "<h2>设备码无效或已过期</h2>", 400)
     if flow["status"] != "pending":
         return _page("授权失败", "<h2>这个设备码已经处理过</h2>", 400)
-    principal = AUTH_BACKEND.authenticate(payload)
+    principal = await _off_loop(AUTH_BACKEND.authenticate, payload)
+    if flow["status"] != "pending":  # 校验期间同一设备码已被另一次提交处理
+        return _page("授权失败", "<h2>这个设备码已经处理过</h2>", 400)
     attempted = (payload.get("username") or "").strip()[:64]
     if principal is None:
         _audit("activate_rejected", username=attempted, client_id=flow["client_id"])
@@ -327,6 +402,7 @@ async def activate_submit(request: Request) -> HTMLResponse:
     flow["status"] = "approved"
     flow["username"] = principal.username
     flow["granted"] = granted
+    flow["credential"] = principal.credential
     _audit("device_authorized", username=principal.username, client_id=flow["client_id"],
            scope=granted)
     return _page("已授权", f"<h2>已授权（{html.escape(principal.username)}）</h2>"
@@ -360,14 +436,25 @@ async def token(request: Request) -> JSONResponse:
         _device_flows.pop(device_code, None)
         if flow["status"] == "denied":
             return _token_error("access_denied")
+        # 授权到兑换之间账号可能被停用/删除、访问码被重置、scope 被收回：按账号现状再核一次
+        subject = AUTH_STORE.subject_state("user", flow["username"])
+        granted = sorted(set(flow["granted"]) & set(subject["scopes"])) if subject else []
+        if subject is None or not granted or (
+                flow["credential"] and subject["credential"] != flow["credential"]):
+            reason = ("account disabled or removed" if subject is None
+                      else "no granted scope remains" if not granted else "credentials reset")
+            _audit("token_denied", username=flow["username"], client_id=flow["client_id"],
+                   grant="device_code", reason=reason)
+            return _token_error("access_denied", f"{reason} after approval; sign in again")
         issued = AUTH_STORE.issue(
             subject=flow["username"], subject_kind="user", client_id=flow["client_id"],
-            scope=flow["granted"], access_ttl=ACCESS_TTL, refresh_ttl=REFRESH_TTL)
+            scope=granted, access_ttl=ACCESS_TTL, refresh_ttl=REFRESH_TTL)
         _audit("token_issued", username=flow["username"], client_id=flow["client_id"],
-               scope=flow["granted"], grant="device_code", access_ttl=ACCESS_TTL)
+               scope=granted, grant="device_code", access_ttl=ACCESS_TTL)
         return _token_ok(issued)
 
     if grant_type == "refresh_token":
+        # scope 已与主体当前 scope 取交集；主体停用/删除或交集为空都是 invalid
         state, record = AUTH_STORE.rotate_refresh(payload.get("refresh_token") or "")
         if state == "reused":
             _audit("refresh_reuse_family_revoked", subject=record["subject"],
@@ -375,7 +462,8 @@ async def token(request: Request) -> JSONResponse:
             return _token_error("invalid_grant", "refresh token already used")
         if state != "ok":
             _audit("token_refresh_rejected")
-            return _token_error("invalid_grant", "refresh token unknown, revoked or expired")
+            return _token_error("invalid_grant", "refresh token unknown, revoked or expired, "
+                                                 "or its account lost the granted scopes")
         issued = AUTH_STORE.issue(
             subject=record["subject"], subject_kind=record["subject_kind"],
             client_id=record["client_id"], scope=record["scope"].split(),
@@ -386,7 +474,7 @@ async def token(request: Request) -> JSONResponse:
 
     if grant_type == "client_credentials":
         client_id, secret = _client_credentials(request, payload)
-        client = AUTH_STORE.verify_client(client_id, secret)
+        client = await _off_loop(AUTH_STORE.verify_client, client_id, secret)
         if client is None:
             _audit("client_auth_failed", client_id=client_id[:64])
             return _token_error("invalid_client", status=401)
@@ -420,7 +508,7 @@ async def introspect(request: Request) -> JSONResponse:
     """RFC 7662：只给带 introspect 权限的服务客户端（网关）用。"""
     payload = await _parse_payload(request)
     client_id, secret = _client_credentials(request, payload)
-    client = AUTH_STORE.verify_client(client_id, secret)
+    client = await _off_loop(AUTH_STORE.verify_client, client_id, secret)
     if client is None:
         _audit("client_auth_failed", client_id=client_id[:64], endpoint="introspect")
         return JSONResponse({"error": "invalid_client"}, status_code=401,
@@ -530,6 +618,8 @@ async def put_blob(sha: str, request: Request) -> JSONResponse:
         return record
     if not valid_sha(sha):
         return JSONResponse({"detail": "invalid sha256"}, status_code=400)
+    if _declared_too_large(request, MAX_BLOB_BYTES):
+        raise BodyTooLarge(MAX_BLOB_BYTES)
     if REGISTRY.blob_info(sha) is not None:
         # 已有同一内容也要读完请求体再回：客户端还在发送时就回并关连接，大 blob 会断管（EPIPE）
         drained = 0
@@ -537,6 +627,7 @@ async def put_blob(sha: str, request: Request) -> JSONResponse:
             drained += len(chunk)
             if drained > MAX_BLOB_BYTES:
                 break
+        REGISTRY.touch_blob(sha)  # 发布进行中：宽限期内 gc 不回收它
         return JSONResponse({"sha256": sha, "created": False})
     writer = REGISTRY.begin_blob(request.headers.get("content-type") or "",
                                  MAX_BLOB_BYTES)
@@ -547,7 +638,8 @@ async def put_blob(sha: str, request: Request) -> JSONResponse:
     except RegistryError as exc:
         writer.abort()
         _audit("blob_rejected", subject=record["subject"], sha256=sha, reason=str(exc))
-        return JSONResponse({"detail": str(exc)}, status_code=422)
+        return JSONResponse({"detail": str(exc)},
+                            status_code=413 if isinstance(exc, BlobTooLarge) else 422)
     except BaseException:
         writer.abort()
         raise
@@ -560,13 +652,16 @@ async def post_bundle(request: Request) -> JSONResponse:
     record = _require(request, "bundles:publish")
     if isinstance(record, JSONResponse):
         return record
-    raw = await request.body()
-    if len(raw) > MAX_MANIFEST_BYTES:
-        return JSONResponse({"detail": "manifest too large"}, status_code=413)
+    if record["subject"] in RESERVED_NAMES:  # 早期库里若有同名主体：不许冒充服务端自己登记的包
+        return JSONResponse({"detail": f"{record['subject']} is a reserved publisher name"},
+                            status_code=403)
+    raw = await _read_body(request, MAX_MANIFEST_BYTES)
     try:
-        body = json.loads(raw.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError):
-        return JSONResponse({"detail": "body must be JSON"}, status_code=400)
+        body = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant,
+                          parse_float=_finite_float)
+    except (UnicodeError, ValueError):
+        return JSONResponse({"detail": "body must be JSON with finite numbers only"},
+                            status_code=400)
     if not isinstance(body, dict):
         return JSONResponse({"detail": "body must be a JSON object"}, status_code=400)
     source = body.get("source") or {}
@@ -587,22 +682,41 @@ async def post_bundle(request: Request) -> JSONResponse:
     return JSONResponse(result, status_code=201 if result["created"] else 200)
 
 
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"non-finite number {name}")
+
+
+def _finite_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):  # 1e999 这类溢出成 inf 的字面量
+        raise ValueError(f"non-finite number {text}")
+    return value
+
+
 @app.post("/v1/builds/{build}/channels/{channel}")
 async def set_channel(build: str, channel: str, request: Request) -> JSONResponse:
+    """切通道。表单 bundle_id；可选 expect=<当前应指向的 bundle_id>|none，对不上回 409。"""
     record = _require(request, "bundles:publish")
     if isinstance(record, JSONResponse):
         return record
     payload = await _parse_payload(request)
     bundle_id = payload.get("bundle_id") or ""
+    expect = payload.get("expect")
     try:
-        REGISTRY.set_channel(build, channel, bundle_id, record["subject"])
+        changed = REGISTRY.set_channel(build, channel, bundle_id, record["subject"],
+                                       expect=expect)
+    except ChannelConflict as exc:
+        _audit("channel_conflict", subject=record["subject"], build=build, channel=channel,
+               bundle_id=bundle_id, expect=expect, current=exc.current)
+        return JSONResponse({"detail": str(exc), "current": exc.current}, status_code=409)
     except RegistryError as exc:
         _audit("channel_rejected", subject=record["subject"], build=build, channel=channel,
                bundle_id=bundle_id, reason=str(exc))
         return JSONResponse({"detail": str(exc)}, status_code=422)
     _audit("channel_set", subject=record["subject"], build=build, channel=channel,
-           bundle_id=bundle_id)
-    return JSONResponse({"build": build, "channel": channel, "bundle_id": bundle_id})
+           bundle_id=bundle_id, changed=changed)
+    return JSONResponse({"build": build, "channel": channel, "bundle_id": bundle_id,
+                         "changed": changed})
 
 
 # ── 旧版工件接口（由 stable 包派生）───────────────────────────────────────
@@ -648,17 +762,19 @@ async def artifacts_manifest(request: Request, device_build: str = "") -> JSONRe
 
 
 @app.get("/v1/artifacts/{name}")
-async def artifact_download(name: str, request: Request):
+async def artifact_download(name: str, request: Request, device_build: str = ""):
     record = _require(request, "artifacts:read")
     if isinstance(record, JSONResponse):
         _audit("artifact_rejected", name=name, status=record.status_code)
         return record
-    _, entries = _legacy_entries(DEVICE_BUILD) if valid_build(DEVICE_BUILD) else (None, [])
+    build = device_build or DEVICE_BUILD
+    _, entries = _legacy_entries(build) if valid_build(build) else (None, [])
     entry = next((e for e in entries if e["meta"]["legacy_name"] == name), None)
     if entry is None or REGISTRY.blob_info(entry["sha256"]) is None:
-        return JSONResponse({"detail": f"unknown artifact {name!r}"}, status_code=404)
+        return JSONResponse({"detail": f"unknown artifact {name!r} for device_build {build!r}"},
+                            status_code=404)
     _audit(
-        "artifact_download", username=record["subject"], name=name,
+        "artifact_download", username=record["subject"], name=name, device_build=build,
         sha256=entry["sha256"], bytes=entry["bytes"],
         version=str(entry["meta"].get("version") or ""))
     return FileResponse(REGISTRY.blob_path(entry["sha256"]), media_type=entry["media_type"],
@@ -681,11 +797,18 @@ def _load_docs() -> list[dict[str, Any]]:
             rel = path.resolve().relative_to(root).as_posix()
         except ValueError:
             continue
-        body = path.read_text(encoding="utf-8")
+        try:
+            body = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            # 一篇坏手册不该让服务起不来：跳过并在日志里说清楚是哪一篇
+            print(f"警告：跳过手册 docs/{rel}（读不了或不是 UTF-8：{type(exc).__name__}）",
+                  file=sys.stderr)
+            continue
         docs.append({
             "doc": rel,
             "title": body.splitlines()[0].lstrip("# ").strip() if body else path.name,
             "body": body,
+            "body_l": body.lower(),  # 检索用，加载时算一次
         })
     return docs
 
@@ -693,11 +816,17 @@ def _load_docs() -> list[dict[str, Any]]:
 _TERM_RE = re.compile(r"[A-Za-z0-9_]+|[一-鿿]")
 
 
+def _query_terms(query: str) -> list[str]:
+    """检索词：只看前 MAX_QUERY_CHARS 个字符，去重后最多 MAX_QUERY_TERMS 个。"""
+    return list(dict.fromkeys(_TERM_RE.findall(query[:MAX_QUERY_CHARS].lower())))[
+        :MAX_QUERY_TERMS]
+
+
 def _query_docs(query: str, limit: int) -> list[dict[str, Any]]:
-    terms = _TERM_RE.findall(query.lower())
+    terms = _query_terms(query)
     scored = []
     for doc in DOCS:
-        body_l = doc["body"].lower()
+        body_l = doc["body_l"]
         score = sum(body_l.count(term) for term in terms)
         if score <= 0:
             continue
@@ -726,8 +855,8 @@ async def docs_query(request: Request) -> JSONResponse:
     except ValueError:
         limit = 3
     results = _query_docs(query, limit)
-    _audit("docs_query", username=record["subject"],
-           terms=_TERM_RE.findall(query.lower())[:8], hits=len(results))
+    _audit("docs_query", username=record["subject"], terms=_query_terms(query)[:8],
+           hits=len(results))
     return JSONResponse({"schema": "ist.excel.docs-query", "query": query, "results": results})
 
 

@@ -5,7 +5,7 @@
 - 只收录 data/artifacts 下实际存在的文件；SHA 由服务启动时对字节快照，meta 不存 SHA；
 - media_type 按扩展名推断（xlsx/xml/tar.gz/json/md…），未知扩展按 octet-stream；
 - version 取值顺序：version_map 指定 > 既有 meta > default_version > installed-YYYYMMDD；
-- kms_addr 写入顶层（透出到 /healthz 与 manifest）；
+- kms_addr 写入顶层（透出到需登录的工件清单 manifest；/healthz 不透出）；
 - 已有 artifacts 条目的 receipt 等手写字段原样保留（按名合并）。
 """
 

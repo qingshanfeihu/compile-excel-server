@@ -283,3 +283,137 @@ def test_activate_page_escapes_user_supplied_code(env):
     assert "<script>alert(1)</script>" not in page.text
     assert "&lt;script&gt;" in page.text
     assert page.headers["x-frame-options"] == "DENY"
+
+
+# ── 授权与兑换之间账号有变：兑换时按账号现状再核一次；refresh 同理 ──────────────────
+def _approve(client: TestClient, username: str, code: str, scope: str) -> dict:
+    flow = client.post("/device_authorize", data={"client_id": "test", "scope": scope}).json()
+    page = client.post("/activate", data={"user_code": flow["user_code"],
+                                          "username": username, "access_code": code})
+    assert page.status_code == 200, page.text
+    return flow
+
+
+def _redeem(client: TestClient, flow: dict):
+    return client.post("/token", data={"grant_type": DEVICE_GRANT,
+                                       "device_code": flow["device_code"]})
+
+
+def test_redemption_rechecks_the_account(env):
+    server, client, _ = env
+    store = server.AUTH_STORE
+    code = store.add_user("ivy", ["artifacts:read", "jumphost:run", "jumphost:admin"])
+    flow = _approve(client, "ivy", code, "jumphost:run jumphost:admin")
+    store.set_user_scopes("ivy", ["artifacts:read", "jumphost:run"])  # 收回 admin
+    issued = _redeem(client, flow)
+    assert issued.status_code == 200 and issued.json()["scope"] == "jumphost:run"
+
+    flow = _approve(client, "ivy", code, "jumphost:run")
+    store.set_user_disabled("ivy", True)
+    denied = _redeem(client, flow)
+    assert denied.status_code == 400 and denied.json()["error"] == "access_denied"
+    store.set_user_disabled("ivy", False)
+
+    flow = _approve(client, "ivy", code, "jumphost:run")
+    store.reset_code("ivy")  # 访问码泄漏后重置：已批准、未兑换的设备码也作废
+    denied = _redeem(client, flow)
+    assert denied.status_code == 400 and denied.json()["error"] == "access_denied"
+
+    code = store.reset_code("ivy")
+    flow = _approve(client, "ivy", code, "jumphost:run")
+    store.set_user_scopes("ivy", ["artifacts:read"])
+    assert _redeem(client, flow).json()["error"] == "access_denied"
+
+
+def test_refresh_and_lookup_use_the_current_scopes(env):
+    server, client, data = env
+    code = server.AUTH_STORE.add_user("jack", ["artifacts:read", "docs:query"])
+    tokens = _login(client, "jack", code, scope="artifacts:read docs:query")
+    # 权限收回但令牌没被撤销（例如直接改库、以后的上游身份后端）：旧令牌与 refresh 都不再带它
+    import sqlite3
+
+    with sqlite3.connect(data / "auth.db") as conn:
+        conn.execute("UPDATE users SET scopes='docs:query' WHERE username='jack'")
+    who = client.get("/v1/whoami", headers=_bearer(tokens["access_token"])).json()
+    assert who["scope"] == "docs:query"
+    assert client.get("/v1/artifacts/manifest",
+                      headers=_bearer(tokens["access_token"])).status_code == 403
+    refreshed = client.post("/token", data={"grant_type": "refresh_token",
+                                            "refresh_token": tokens["refresh_token"]})
+    assert refreshed.status_code == 200 and refreshed.json()["scope"] == "docs:query"
+    with sqlite3.connect(data / "auth.db") as conn:
+        conn.execute("UPDATE users SET scopes='config:read' WHERE username='jack'")
+    gone = client.post("/token", data={"grant_type": "refresh_token",
+                                       "refresh_token": refreshed.json()["refresh_token"]})
+    assert gone.status_code == 400 and gone.json()["error"] == "invalid_grant"
+
+
+# ── 登录失败计数：只数真实账号，表有上界 ──────────────────────────────────────────
+def test_failure_table_tracks_only_real_accounts_and_is_bounded(env, monkeypatch):
+    server, client, _ = env
+    backend = server.AUTH_BACKEND
+    flow = client.post("/device_authorize", data={}).json()
+    for name in [f"ghost{i}" for i in range(40)] + ["bad name", "x" * 300, "../etc"]:
+        res = client.post("/activate", data={"user_code": flow["user_code"],
+                                             "username": name, "access_code": "nope"})
+        assert res.status_code == 403
+    assert backend._failures == {}
+    names = [f"real{i}" for i in range(6)]
+    for name in names:
+        server.AUTH_STORE.add_user(name)
+    monkeypatch.setattr(backend, "MAX_TRACKED", 4)
+    for name in names:
+        client.post("/activate", data={"user_code": flow["user_code"], "username": name,
+                                       "access_code": "nope"})
+    assert 0 < len(backend._failures) <= 4
+
+
+# ── secret 哈希：新格式是加盐 HMAC；旧 PBKDF2 哈希照认并在校验通过时换格式 ────────────
+def test_secret_hashes_are_fast_and_legacy_rows_migrate(env):
+    server, client, data = env
+    import sqlite3
+
+    import auth_store
+
+    secret = server.AUTH_STORE.add_client("legacy-gw", ["introspect"])
+    with sqlite3.connect(data / "auth.db") as conn:
+        salt, stored = conn.execute("SELECT secret_salt, secret_hash FROM clients"
+                                    " WHERE client_id='legacy-gw'").fetchone()
+        assert bytes(stored).startswith(b"hs256$")
+        conn.execute("UPDATE clients SET secret_hash=? WHERE client_id='legacy-gw'",
+                     (auth_store._legacy_hash(secret, salt),))
+    assert server.AUTH_STORE.verify_client("legacy-gw", "wrong") is None
+    with sqlite3.connect(data / "auth.db") as conn:
+        still = conn.execute("SELECT secret_hash FROM clients WHERE client_id='legacy-gw'"
+                             ).fetchone()[0]
+    assert not bytes(still).startswith(b"hs256$")
+    assert server.AUTH_STORE.verify_client("legacy-gw", secret)["client_id"] == "legacy-gw"
+    with sqlite3.connect(data / "auth.db") as conn:
+        migrated = conn.execute("SELECT secret_hash FROM clients WHERE client_id='legacy-gw'"
+                                ).fetchone()[0]
+    assert bytes(migrated).startswith(b"hs256$")
+    assert server.AUTH_STORE.verify_client("legacy-gw", secret) is not None
+    # 用户访问码同理
+    code = server.AUTH_STORE.add_user("kate")
+    with sqlite3.connect(data / "auth.db") as conn:
+        salt = conn.execute("SELECT code_salt FROM users WHERE username='kate'").fetchone()[0]
+        conn.execute("UPDATE users SET code_hash=? WHERE username='kate'",
+                     (auth_store._legacy_hash(code, salt),))
+    assert _login(client, "kate", code)["access_token"]
+    with sqlite3.connect(data / "auth.db") as conn:
+        assert bytes(conn.execute("SELECT code_hash FROM users WHERE username='kate'"
+                                  ).fetchone()[0]).startswith(b"hs256$")
+
+
+def test_rotate_client_secret_keeps_issued_tokens(env):
+    server, client, _ = env
+    old = server.AUTH_STORE.add_client("pub2", ["bundles:read"])
+    token = client.post("/token", data={"grant_type": "client_credentials"},
+                        headers=_basic("pub2", old)).json()["access_token"]
+    new = server.AUTH_STORE.rotate_client_secret("pub2")
+    assert new != old
+    assert client.post("/token", data={"grant_type": "client_credentials"},
+                       headers=_basic("pub2", old)).status_code == 401
+    assert client.post("/token", data={"grant_type": "client_credentials"},
+                       headers=_basic("pub2", new)).status_code == 200
+    assert client.get("/v1/whoami", headers=_bearer(token)).status_code == 200

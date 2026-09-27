@@ -7,17 +7,18 @@
   serve            前台运行服务（服务管理器/调试用）
   status           实例状态（进程/健康/配置摘要）
   start|stop|restart|log   进程管理（pidfile + healthz）
-  service install|remove|print   注册 systemd/launchd 服务
+  service install|remove|print [--user 账号]   注册 systemd/launchd 服务
   uninstall [--purge]        停止并移除安装（--purge 连数据一起删）
   users add|list|disable|enable|reset-code|scopes   用户与访问码（只存哈希）
-  clients add|list|remove    服务客户端（网关 introspect、发布导入器）
+  clients add|list|remove|rotate-secret   服务客户端（网关 introspect、发布导入器）
   tokens revoke|purge        按用户/客户端撤销令牌、清理过期令牌
   config show|set|unset|import-env   组织下发给客户端的地址常量
   registry list|show|import-dir|promote|verify|gc   数据包注册表
-  audit verify               复核审计日志（哈希链 + 实例密钥 hmac）
+  audit verify|rotate        复核审计日志（哈希链 + 实例密钥 hmac）/ 封存当前段并起新链（可换钥）
   generate --inputs D --out D [...]   服务端生成链：按 InfoTest 批入口顺序重生投影（源码安装）
 
 管理命令默认作用于安装登记里的数据目录，可用 --data <目录> 指定。
+改动身份、配置、注册表的管理命令都写进服务端审计链（<数据目录>/audit.log，与服务进程共用文件锁）。
 
 打包形态（PyInstaller onedir）与源码形态行为一致：serve/start 用
 sys.executable 自引用，不依赖用户 Python 环境。
@@ -27,11 +28,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 if getattr(sys, "frozen", False):  # PyInstaller onedir
     ROOT = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
@@ -172,9 +176,15 @@ def cmd_status() -> None:
     pid = _read_pid(install)
     alive = _pid_alive(pid)
     health = _health(install)
+    try:
+        meta = json.loads((Path(install["data"]) / "artifacts_meta.json").read_text(encoding="utf-8"))
+        build = str(meta.get("device_build") or "-")
+    except (OSError, ValueError, AttributeError):
+        build = "-"
     print("compile-excel-server 状态")
     print(f"  进程    : {'运行中 pid=' + str(pid) if alive else '未运行'}")
     print(f"  健康    : {'OK ' + json.dumps(health, ensure_ascii=False) if health else '不可达'}")
+    print(f"  构建    : {build}")
     print(f"  数据    : {install['data']}")
     print(f"  端口    : {install['port']}")
     print(f"  监听    : {_host(install)}")
@@ -248,16 +258,39 @@ def _service_unit_path(install: dict) -> Path | None:
     return None
 
 
-def _unit_content(install: dict) -> tuple[str, str]:
+_ACCOUNT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
+
+
+def _systemd_quote(arg: str) -> str:
+    """ExecStart 的一个参数：整体加双引号；反斜杠、引号转义，% 与 $ 双写（systemd 的说明符与变量展开）。"""
+    escaped = (arg.replace("\\", "\\\\").replace('"', '\\"')
+               .replace("%", "%%").replace("$", "$$"))
+    return f'"{escaped}"'
+
+
+def _service_account(install: dict, override: str | None = None) -> str:
+    """服务以谁的身份跑：--user 指定，否则取数据目录的属主（服务要读写的就是它）。"""
+    if override:
+        return override
+    try:
+        import pwd
+
+        return pwd.getpwuid(Path(install["data"]).stat().st_uid).pw_name
+    except (ImportError, KeyError, OSError):
+        return ""
+
+
+def _unit_content(install: dict, account: str = "") -> tuple[str, str]:
     argv = _serve_argv(install)
     if sys.platform.startswith("linux"):
+        user_line = f"User={account}\n" if account else ""
         return "compile-excel-server.service", f"""\
 [Unit]
 Description=compile-excel-server (KMS / knowledge / artifact distribution)
 After=network.target
 
 [Service]
-ExecStart={' '.join(argv)}
+{user_line}ExecStart={' '.join(_systemd_quote(part) for part in argv)}
 Restart=on-failure
 RestartSec=3
 
@@ -266,7 +299,8 @@ WantedBy=multi-user.target
 """
     if sys.platform == "darwin":
         plist_args = "".join(
-            f"    <string>{part}</string>\n" for part in argv).rstrip()
+            f"    <string>{xml_escape(part)}</string>\n" for part in argv).rstrip()
+        log = xml_escape(f"{install['data']}/server.log")
         return "io.github.qingshanfeihu.compile-excel-server.plist", f"""\
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -279,16 +313,26 @@ WantedBy=multi-user.target
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>{install['data']}/server.log</string>
-  <key>StandardErrorPath</key><string>{install['data']}/server.log</string>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
 </dict></plist>
 """
     return "", ""
 
 
-def cmd_service(action: str) -> None:
+def cmd_service(action: str, user: str | None = None) -> None:
     install = load_install()
-    name, content = _unit_content(install)
+    account = ""
+    if sys.platform.startswith("linux") and action in ("install", "print"):
+        # launchd 用的是 LaunchAgents（当前登录用户），只有 systemd 要写 User=
+        account = _service_account(install, user)
+        if not _ACCOUNT_RE.match(account):
+            print(f"服务账号不合法或查不到：{account!r}（用 --user <账号> 指定）")
+            raise SystemExit(64)
+        if account == "root":
+            print("注意：服务将以 root 运行；建议建一个服务账号，把数据目录交给它，再用 --user 指定",
+                  file=sys.stderr)
+    name, content = _unit_content(install, account)
     if not name:
         print("当前平台无内置服务注册：Windows 可用 NSSM（见 README）")
         raise SystemExit(1)
@@ -306,20 +350,23 @@ def cmd_service(action: str) -> None:
             print(content)
             raise SystemExit(1)
         if sys.platform.startswith("linux"):
-            os.system("systemctl daemon-reload && "
-                      "systemctl enable --now compile-excel-server")
-            print("已注册并启动（systemd）")
+            subprocess.run(["systemctl", "daemon-reload"], check=False)
+            subprocess.run(["systemctl", "enable", "--now", "compile-excel-server"], check=False)
+            print(f"已注册并启动（systemd，User={account}）")
         else:
-            os.system(f"launchctl unload '{unit}' >/dev/null 2>&1; "
-                      f"launchctl load '{unit}'")
+            subprocess.run(["launchctl", "unload", str(unit)], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["launchctl", "load", str(unit)], check=False)
             print("已注册并启动（launchd）")
         return
     if action == "remove":
         if unit and unit.exists():
             if sys.platform.startswith("linux"):
-                os.system("systemctl disable --now compile-excel-server")
+                subprocess.run(["systemctl", "disable", "--now", "compile-excel-server"],
+                               check=False)
             else:
-                os.system(f"launchctl unload '{unit}' >/dev/null 2>&1")
+                subprocess.run(["launchctl", "unload", str(unit)], check=False,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             unit.unlink()
             print("已移除服务")
         else:
@@ -371,19 +418,35 @@ def cmd_serve(data: str, port: int, host: str, tls_cert: str = "", tls_key: str 
 
 
 def cmd_audit(rest: list[str]) -> int:
-    from gateway.audit_chain import verify
+    from deploy import audit_log
 
     data, args = _admin_args(rest)
-    if args[:1] != ["verify"]:
-        print("用法: ces audit verify [--data 目录]")
-        return 64
-    key = None
-    key_path = data / "audit_hmac_key"
-    if key_path.is_file():
-        key = bytes.fromhex(key_path.read_text(encoding="utf-8").strip())
-    result = verify(data / "audit.log", key)
-    print(json.dumps(result, ensure_ascii=False))
-    return 0 if result["ok"] else 1
+    action = args[0] if args else ""
+    if action == "verify":
+        try:
+            result = audit_log.verify_all(data)
+        except (OSError, ValueError) as exc:
+            result = {"ok": False, "reason": f"audit key unreadable ({type(exc).__name__})"}
+        print(json.dumps(result, ensure_ascii=False))
+        return 0 if result["ok"] else 1
+    if action == "rotate":
+        new_key = _pop_flag(args, "--new-key")
+        try:
+            info = audit_log.rotate(data, new_key=new_key,
+                                    fields={"via": "ces", "os_user": _os_user()})
+        except (OSError, ValueError) as exc:
+            print(f"轮换失败，未改动：{exc}")
+            return 1
+        print(f"已封存 {info['sealed_segment']}"
+              + ("（其密钥另存同名 .key，0600）" if info["sealed_keyed"] else "")
+              + f"；新链从 {data / 'audit.log'} 起"
+              + ("，已换新的审计签名密钥" if info["key_rotated"] else ""))
+        return 0
+    print("用法: ces audit verify | rotate [--new-key]  [--data 目录]")
+    print("  rotate：在当前 audit.log 末尾写封口行，整份移到 audit_archive/audit-NNNN.log（连同当时"
+          "的密钥），\n          新 audit.log 从一行指向它的起链记录开始；--new-key 同时换审计签名密钥。"
+          "\n          verify 逐段复核并核对段与段首尾相接。")
+    return 64
 
 
 # ── 身份与客户端配置（直接读写数据目录里的 auth.db / client_config.json）──
@@ -424,21 +487,82 @@ def _pop_option(args: list[str], name: str) -> str | None:
     return None
 
 
-def _emit_secret(label: str, value: str, out: str | None) -> None:
-    """一次性凭据：给 --out 就写 0600 文件，否则只在这里显示一次。"""
-    if out:
-        target = Path(out).expanduser()
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+def _pop_flag(args: list[str], name: str) -> bool:
+    if name in args:
+        args.remove(name)
+        return True
+    return False
+
+
+def _os_user() -> str:
+    import getpass
+
+    try:
+        user = getpass.getuser()
+    except (OSError, KeyError, ImportError):
+        user = ""
+    sudo = os.environ.get("SUDO_USER") or ""
+    return f"{sudo}(sudo:{user})" if sudo and sudo != user else user
+
+
+def _admin_audit(data: Path, event: str, **fields) -> None:
+    """管理命令对身份、配置、注册表的改动写进服务端审计链（与服务进程共用文件锁，prev 不会接错）。
+    调用方保证不含任何访问码、secret、令牌。"""
+    from deploy.audit_log import AuditLog
+
+    record = {"event": event, "via": "ces", "os_user": _os_user(), **fields}
+    if not AuditLog(data).append(record):
+        print(f"警告：审计日志写不进 {data / 'audit.log'}（本次改动已生效）", file=sys.stderr)
+
+
+def _issue_secret(label: str, out: str | None, generate, apply) -> int:
+    """一次性凭据的发放顺序：先生成，再落文件，最后才改库。
+
+    给了 --out：凭据先写进目标同目录的临时文件（0600），写不了就不动库；库改好后原子改名到位，
+    改库失败就删掉临时文件。万一最后改名失败，凭据还在那个临时文件里（给出路径）——
+    不会出现库里已经换了哈希、凭据本身却哪儿都没有的情况。没给 --out：改库后在终端显示一次。"""
+    secret = generate()
+    if not out:
+        apply(secret)
+        print(f"{label}（只显示这一次，库里只存哈希）: {secret}")
+        return 0
+    target = Path(out).expanduser()
+    try:
+        if target.is_dir():
+            raise IsADirectoryError(f"{target} 是目录")
+        fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.",
+                                   suffix=".tmp")  # mkstemp 建的就是 0600
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            stream.write(value + "\n")
-        os.chmod(target, 0o600)
-        print(f"{label}已写入 {target}（0600），交给本人后删除该文件")
-        return
-    print(f"{label}（只显示这一次，库里只存哈希）: {value}")
+            stream.write(secret + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError as exc:
+        print(f"写不了 {target}（{exc}）；库没有任何改动")
+        return 1
+    try:
+        apply(secret)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    try:
+        os.replace(tmp, target)
+    except OSError as exc:
+        print(f"{label}已生效，但移到 {target} 失败（{exc}）；凭据在 {tmp}（0600），"
+              "交给本人后删除")
+        return 1
+    print(f"{label}已写入 {target}（0600），交给本人后删除该文件")
+    return 0
 
 
 def cmd_users(rest: list[str]) -> int:
-    from auth_store import DEFAULT_USER_SCOPES, SCOPES, AuthError, AuthStore
+    from auth_store import (
+        DEFAULT_USER_SCOPES,
+        SCOPES,
+        AuthError,
+        AuthStore,
+        new_access_code,
+        normalize_scopes,
+    )
 
     data, args = _admin_args(rest)
     store = AuthStore(data / "auth.db")
@@ -447,9 +571,16 @@ def cmd_users(rest: list[str]) -> int:
         if action == "add" and len(args) >= 2:
             scopes = _pop_option(args, "--scopes")
             out = _pop_option(args, "--out")
-            code = store.add_user(args[1], scopes.split() if scopes is not None else None)
-            _emit_secret(f"用户 {args[1]} 的访问码", code, out)
-            return 0
+            name = args[1]
+            wanted = scopes.split() if scopes is not None else None
+
+            def add(code: str) -> None:
+                store.add_user(name, wanted, code=code)
+                _admin_audit(data, "admin_user_added", username=name,
+                             scope=normalize_scopes(wanted if wanted is not None
+                                                    else list(DEFAULT_USER_SCOPES)))
+
+            return _issue_secret(f"用户 {name} 的访问码", out, new_access_code, add)
         if action == "list":
             for user in store.list_users():
                 state = "停用" if user["disabled"] else "启用"
@@ -457,15 +588,22 @@ def cmd_users(rest: list[str]) -> int:
             return 0
         if action in ("disable", "enable") and len(args) >= 2:
             store.set_user_disabled(args[1], action == "disable")
+            _admin_audit(data, f"admin_user_{action}d", username=args[1])
             print(f"已{'停用（并撤销其全部令牌）' if action == 'disable' else '启用'}: {args[1]}")
             return 0
         if action == "reset-code" and len(args) >= 2:
             out = _pop_option(args, "--out")
-            code = store.reset_code(args[1])
-            _emit_secret(f"用户 {args[1]} 的新访问码（旧令牌已撤销）", code, out)
-            return 0
+            name = args[1]
+
+            def reset(code: str) -> None:
+                store.reset_code(name, code=code)
+                _admin_audit(data, "admin_user_code_reset", username=name)
+
+            return _issue_secret(f"用户 {name} 的新访问码（旧令牌已撤销）", out,
+                                 new_access_code, reset)
         if action == "scopes" and len(args) >= 3:
             granted = store.set_user_scopes(args[1], args[2].split())
+            _admin_audit(data, "admin_user_scopes_set", username=args[1], scope=granted)
             print(f"已更新 {args[1]} 的 scope（旧令牌已撤销）: {' '.join(granted)}")
             return 0
     except AuthError as exc:
@@ -479,7 +617,7 @@ def cmd_users(rest: list[str]) -> int:
 
 
 def cmd_clients(rest: list[str]) -> int:
-    from auth_store import AuthError, AuthStore
+    from auth_store import AuthError, AuthStore, new_client_secret, normalize_scopes
 
     data, args = _admin_args(rest)
     store = AuthStore(data / "auth.db")
@@ -491,21 +629,40 @@ def cmd_clients(rest: list[str]) -> int:
             if not scopes:
                 print("服务客户端必须显式给 --scopes（例：网关用 \"introspect\"）")
                 return 64
-            secret = store.add_client(args[1], scopes.split())
-            _emit_secret(f"客户端 {args[1]} 的 client secret", secret, out)
-            return 0
+            client_id = args[1]
+
+            def add(secret: str) -> None:
+                store.add_client(client_id, scopes.split(), secret=secret)
+                _admin_audit(data, "admin_client_added", client_id=client_id,
+                             scope=normalize_scopes(scopes))
+
+            return _issue_secret(f"客户端 {client_id} 的 client secret", out,
+                                 new_client_secret, add)
+        if action == "rotate-secret" and len(args) >= 2:
+            out = _pop_option(args, "--out")
+            client_id = args[1]
+
+            def rotate(secret: str) -> None:
+                store.rotate_client_secret(client_id, secret=secret)
+                _admin_audit(data, "admin_client_secret_rotated", client_id=client_id)
+
+            return _issue_secret(
+                f"客户端 {client_id} 的新 client secret（旧 secret 已失效，已签发的令牌用到过期）",
+                out, new_client_secret, rotate)
         if action == "list":
             for client in store.list_clients():
                 print(f"{client['client_id']:<24} {client['scopes']}")
             return 0
         if action == "remove" and len(args) >= 2:
             store.remove_client(args[1])
+            _admin_audit(data, "admin_client_removed", client_id=args[1])
             print(f"已删除客户端并撤销其令牌: {args[1]}")
             return 0
     except AuthError as exc:
         print(str(exc))
         return 1
-    print("用法: ces clients add <id> --scopes \"introspect\" [--out 文件] | list | remove <id>")
+    print("用法: ces clients add <id> --scopes \"introspect\" [--out 文件] | list | remove <id> | "
+          "rotate-secret <id> [--out 文件]")
     return 64
 
 
@@ -523,10 +680,14 @@ def cmd_tokens(rest: list[str]) -> int:
             return 64
         kind, subject = ("user", user) if user else ("client", client)
         count = store.revoke_subject(kind, subject)
+        _admin_audit(data, "admin_tokens_revoked", subject_kind=kind, subject=subject,
+                     count=count)
         print(f"已撤销 {subject} 的 {count} 个令牌")
         return 0
     if action == "purge":
-        print(f"已清理 {store.purge_expired()} 个过期超过一天的令牌记录")
+        count = store.purge_expired()
+        _admin_audit(data, "admin_tokens_purged", count=count)
+        print(f"已清理 {count} 个过期超过一天的令牌记录")
         return 0
     print("用法: ces tokens revoke --user <名> | --client <id> | purge")
     return 64
@@ -543,14 +704,18 @@ def cmd_config(rest: list[str]) -> int:
             return 0
         if action == "set" and len(args) == 3:
             client_config.set_key(data, args[1], args[2])
+            _admin_audit(data, "admin_config_set", key=args[1])
             print(f"已设置 {args[1]}")
             return 0
         if action == "unset" and len(args) == 2:
             removed = client_config.unset_key(data, args[1])
+            _admin_audit(data, "admin_config_unset", key=args[1], removed=removed)
             print(f"{'已删除' if removed else '本来就没有'} {args[1]}")
             return 0
         if action == "import-env" and len(args) == 2:
             imported, skipped = client_config.import_env(data, Path(args[1]).expanduser())
+            _admin_audit(data, "admin_config_imported",
+                         keys=[line.split(" → ", 1)[-1] for line in imported])
             for line in imported:
                 print(f"导入 {line}")
             for line in skipped:
@@ -566,13 +731,50 @@ def cmd_config(rest: list[str]) -> int:
     return 64
 
 
-def cmd_registry(rest: list[str]) -> int:
+def _import_dir(reg, build: str, kind: str, directory: Path, replace_kind: bool) -> dict:
+    """目录里的文件叠加到 candidate 上：同路径的条目换成目录里的版本，其余条目（含同类别的其他
+    文件）原样保留——`ces generate` 的产物目录只有本次改动的投影，按类整体替换会把没改的全丢掉。
+    replace_kind：先丢掉 candidate 里这一类的全部条目（目录必须是这一类的完整集合）。"""
     import mimetypes
 
-    from registry import CHANNELS, KINDS, Registry, RegistryError
+    from registry import check_entry_path
+
+    fresh: dict[str, dict] = {}
+    for path in sorted(directory.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        rel = check_entry_path(kind, f"{kind}/{path.relative_to(directory).as_posix()}")
+        media = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        blob = reg.put_blob_file(path, media)
+        fresh[rel.casefold()] = {"kind": kind, "path": rel, "sha256": blob["sha256"],
+                                 "media_type": media, "meta": {}}
+    base = reg.channel_bundle(build, "candidate")
+    kept: list[dict] = []
+    replaced = 0
+    if base:
+        for entry in reg.bundle_manifest(base)["entries"]:
+            if entry["path"].casefold() in fresh:
+                replaced += 1
+            elif not (replace_kind and entry["kind"] == kind):
+                kept.append({k: entry[k] for k in ("kind", "path", "sha256", "media_type", "meta")})
+    mode = "replace-kind" if replace_kind else "overlay"
+    result = reg.submit_bundle(build, [*fresh.values(), *kept], publisher="ces-cli",
+                               source={"importer": "ces registry import-dir", "kind": kind,
+                                       "mode": mode, "base": base or ""})
+    result["import"] = {"mode": mode, "base": base, "files": len(fresh), "replaced": replaced,
+                        "kept": len(kept)}
+    return result
+
+
+def cmd_registry(rest: list[str]) -> int:
+    from registry import CHANNELS, GC_GRACE_SECONDS, KINDS, Registry, RegistryError
 
     data, args = _admin_args(rest)
-    reg = Registry(data / "registry")
+    try:
+        reg = Registry(data / "registry")
+    except RegistryError as exc:  # $CES_STABLE_REQUIRED_KINDS 写错
+        print(str(exc))
+        return 2
     action = args[0] if args else ""
     try:
         if action == "list":
@@ -595,37 +797,31 @@ def cmd_registry(rest: list[str]) -> int:
                       f"{entry['path']}")
             return 0
         if action == "import-dir" and len(args) >= 4:
+            replace_kind = _pop_flag(args, "--replace-kind")
             build, kind, directory = args[1], args[2], Path(args[3]).expanduser()
             if kind not in KINDS or not directory.is_dir():
-                print(f"用法: ces registry import-dir <build> <{'|'.join(KINDS)}> <目录>")
+                print(f"用法: ces registry import-dir <build> <{'|'.join(KINDS)}> <目录> "
+                      "[--replace-kind]")
                 return 64
-            entries = []
-            for path in sorted(directory.rglob("*")):
-                if path.is_symlink() or not path.is_file():
-                    continue
-                rel = path.relative_to(directory).as_posix()
-                media = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-                blob = reg.put_blob_file(path, media)
-                entries.append({"kind": kind, "path": f"{kind}/{rel}",
-                                "sha256": blob["sha256"], "media_type": media, "meta": {}})
-            base = reg.channel_bundle(build, "candidate")
-            if base:
-                # 在 candidate 基础上替换这一类，其余类原样保留
-                old = reg.bundle_manifest(base)
-                entries += [{k: e[k] for k in ("kind", "path", "sha256", "media_type", "meta")}
-                            for e in old["entries"] if e["kind"] != kind]
-            result = reg.submit_bundle(build, entries, publisher="ces-cli",
-                                       source={"importer": "ces registry import-dir"})
+            result = _import_dir(reg, build, kind, directory, replace_kind)
+            _admin_audit(data, "admin_bundle_imported", build=build, kind=kind,
+                         bundle_id=result["bundle_id"], created=result["created"],
+                         mode=result["import"]["mode"], checks_ok=result["checks"]["ok"])
             print(json.dumps(result, ensure_ascii=False, indent=1))
             return 0
         if action == "promote" and len(args) >= 3:
             channel = _pop_option(args, "--channel") or "stable"
+            expect = _pop_option(args, "--expect")
             if channel not in CHANNELS:
                 print(f"通道只能是 {', '.join(CHANNELS)}")
                 return 64
-            reg.set_channel(args[1], channel, args[2], "ces-cli")
-            print(f"{args[1]} 的 {channel} 已指向 {args[2]}")
-            return 0
+            if len(args) == 3:
+                changed = reg.set_channel(args[1], channel, args[2], "ces-cli", expect=expect)
+                _admin_audit(data, "admin_channel_set", build=args[1], channel=channel,
+                             bundle_id=args[2], changed=changed, expect=expect)
+                print(f"{args[1]} 的 {channel} 已指向 {args[2]}" if changed
+                      else f"{args[1]} 的 {channel} 本来就指向 {args[2]}，未改动")
+                return 0
         if action == "verify":
             problems = reg.verify_all()
             for line in problems:
@@ -633,14 +829,23 @@ def cmd_registry(rest: list[str]) -> int:
             print("全部 blob 完好" if not problems else f"{len(problems)} 个 blob 有问题")
             return 0 if not problems else 1
         if action == "gc":
-            print(f"已删除 {reg.gc()} 个没有包引用的 blob")
+            hours = _pop_option(args, "--grace-hours")
+            try:
+                grace = float(hours) if hours is not None else GC_GRACE_SECONDS / 3600
+            except ValueError:
+                print("--grace-hours 要是数字（小时）")
+                return 64
+            deleted = reg.gc(grace_s=grace * 3600)
+            _admin_audit(data, "admin_registry_gc", deleted=deleted, grace_hours=grace)
+            print(f"已删除 {deleted} 个没有包引用、且 {grace:g} 小时内没有再登记的 blob")
             return 0
     except RegistryError as exc:
         print(str(exc))
         return 1
     print("用法: ces registry list | show <build> [--channel c] | "
-          "import-dir <build> <kind> <目录> | promote <build> <bundle_id> [--channel c] | "
-          "verify | gc")
+          "import-dir <build> <kind> <目录> [--replace-kind] | "
+          "promote <build> <bundle_id> [--channel c] [--expect <bundle_id>|none] | "
+          "verify | gc [--grace-hours 24]")
     return 64
 
 
@@ -759,10 +964,12 @@ def main() -> int:
         return cmd_serve(args.data, args.port, args.host, args.tls_cert, args.tls_key,
                          args.insecure_lan)
     elif command == "service":
+        user = _pop_option(rest, "--user")
         if not rest or rest[0] not in ("install", "remove", "print"):
-            print("用法: ces service install|remove|print")
+            print("用法: ces service install|remove|print [--user 服务账号]"
+                  "（systemd 的 User=，缺省取数据目录的属主）")
             return 64
-        cmd_service(rest[0])
+        cmd_service(rest[0], user)
     elif command == "uninstall":
         cmd_uninstall("--purge" in rest)
     elif command == "setup":
