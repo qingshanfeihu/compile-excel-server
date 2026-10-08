@@ -57,6 +57,22 @@ class FrozenCase:
     autoids: tuple[str, ...]
     command_lines: tuple[tuple[str, str], ...]
     cells: tuple[tuple[str, str], ...]
+    # 用到的被测设备对象（E 列 APV_k / Segk_tmp）→ 第一次出现的单元格；框架按 conf
+    # [comm] ssh_ips 的第 k 个地址连它，conf 里没有第 k 台就整卷跑不起来
+    devices: tuple[tuple[str, str], ...] = ()
+
+
+# 框架 lib/test_xlsx.py 的设备表：APV_0/1/2 走 apv_xlsx(…, k)，Seg0/1/2_tmp 走 conftest 里
+# ssh_ips[k] 的 segment 夹具
+_DEVICE_OBJECT_RE = re.compile(r"^(?:APV_(\d)|Seg(\d)_tmp)$")
+
+
+def device_index(obj: str) -> int | None:
+    """E 列对象要用 conf 里第几台设备；不是被测设备对象就是 None。"""
+    match = _DEVICE_OBJECT_RE.match(obj)
+    if match is None:
+        return None
+    return int(match.group(1) or match.group(2))
 
 
 # ── 框架怎样把 G 交给设备（lib/test_xlsx.py 的 _split_parameter_parts / _unquote_parameter /
@@ -225,12 +241,15 @@ def freeze(data: bytes) -> FrozenCase:
                                if len(formulas) > _MAX_LISTED else []))
         autoids: list[str] = []
         commands: list[tuple[str, str]] = []
+        devices: dict[str, str] = {}
         # 不在 999999999999999 处停：框架一直跑到文件末尾，它后面的行照样执行
         for row_no, row in enumerate(ws.iter_rows(values_only=True), start=1):
             first = str(row[0]).strip() if row and row[0] is not None else ""
             if _AUTOID_RE.match(first) and first != SENTINEL_AUTOID and first not in autoids:
                 autoids.append(first)
             device = str(row[4] or "").strip() if len(row) > 4 else ""
+            if device_index(device) is not None:
+                devices.setdefault(device, f"{ws.title}!E{row_no}")
             method = str(row[5] or "").strip() if len(row) > 5 else ""
             raw = row[6] if len(row) > 6 else None
             if not device.startswith("APV") or raw is None or not str(raw).strip():
@@ -251,12 +270,23 @@ def freeze(data: bytes) -> FrozenCase:
     if not autoids:
         raise GateError(["execution sheet has no case autoids"])
     return FrozenCase(data=data, sha256=hashlib.sha256(data).hexdigest(), size=len(data),
-                      autoids=tuple(autoids), command_lines=tuple(commands), cells=tuple(cells))
+                      autoids=tuple(autoids), command_lines=tuple(commands), cells=tuple(cells),
+                      devices=tuple(devices.items()))
 
 
 def check(frozen: FrozenCase, *, grammar: dict[str, Any] | Path | None,
-          credential_literals: frozenset[str]) -> None:
+          credential_literals: frozenset[str], device_count: int | None = None) -> None:
+    """device_count：本床框架 conf 里的设备台数（[comm] ssh_ips）；给了就拒收用到第 k 台
+    （k ≥ 台数）设备对象的工作簿——框架连那台时取不到地址，整卷一个案都不跑。"""
     problems: list[str] = []
+    if device_count is not None:
+        for obj, where in frozen.devices:
+            index = device_index(obj)
+            if index is not None and index >= device_count:
+                problems.append(
+                    f"{where}: {obj} needs device {index}, but this bed's framework conf lists "
+                    f"{device_count} device(s) (APV_0..APV_{device_count - 1}); the framework "
+                    "could not reach it and no case in the workbook would run")
     try:
         patterns = load_patterns(grammar if grammar is not None else {})
     except DestructiveRulesUnavailable as exc:

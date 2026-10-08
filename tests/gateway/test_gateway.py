@@ -151,7 +151,7 @@ def test_submit_status_results_end_to_end(fake_env, tmp_path):
     assert {c["case_id"]: c["result"] for c in results["cases"]} == {
         "202609240000000011": "PASS", "202609240000000012": "PASS"}
     assert all(not c["log_stale"] for c in results["cases"])
-    assert "####### end case" in results["cases"][0]["log"]
+    assert "#######   end case: 202609240000000011" in results["cases"][0]["log"]
     assert not gw.state.bed_busy(), "runner 结束后锁自动释放"
 
 
@@ -407,3 +407,55 @@ def test_gateway_audit_is_a_verifiable_hash_chain(fake_env):
     gw.audit_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     assert verify(gw.audit_path) == {"ok": False, "line": 3,
                                      "reason": "prev does not match the previous line"}
+
+
+# ── 床上有几台设备、跑在哪、没过的案带会话转储 ──────────────────────────
+def test_a_workbook_that_names_a_device_the_bed_lacks_is_refused(fake_env, tmp_path):
+    """框架按 conf [comm] ssh_ips 的第 k 个地址连 APV_k：conf 里没有第 k 台，整卷一个案都不跑。"""
+    gw, apv = fake_env["gateway"], fake_env["apv"]
+    lease = _lease(gw)
+    for obj in ("APV_2", "Seg2_tmp"):
+        data = make_workbook(tmp_path / f"{obj}.xlsx", [
+            ("202610080000000001", "APV_0", "cmd", "show slb real"),
+            ("", obj, "cmd", "show slb real")])
+        out = gw.call(ALICE, "case_submit", {**lease, "xlsx_b64": base64.b64encode(data).decode()})
+        assert out["ok"] is False and any(obj in p and "2 device(s)" in p
+                                          for p in out["problems"]), out
+    conf = apv / "conf" / "bed.conf"
+    conf.write_text(conf.read_text(encoding="utf-8").replace("127.0.0.1, 127.0.0.2", "127.0.0.1"),
+                    encoding="utf-8")
+    data = make_workbook(tmp_path / "apv1.xlsx", [("202610080000000002", "APV_1", "cmd", "show x")])
+    out = gw.call(ALICE, "case_submit", {**lease, "xlsx_b64": base64.b64encode(data).decode()})
+    assert out["ok"] is False and "APV_1 needs device 1" in out["error"], out
+
+
+def test_env_prepare_says_how_many_devices_the_bed_has(fake_env, monkeypatch):
+    gw = fake_env["gateway"]
+    lease = _lease(gw)
+    monkeypatch.setattr(framework, "device_reachable", lambda ip, **_: True)
+    monkeypatch.setattr(framework, "probe", lambda cfg, cmd, build, idx: {
+        "output": f"Software Version : {BUILD}\n"})
+    out = gw.call(ALICE, "env_prepare", lease)
+    assert out["device_count"] == 2
+    conf = next(c for c in out["checks"] if c["check"] == "framework_conf")
+    assert "APV_0, APV_1" in conf["detail"]
+
+
+def test_results_name_the_run_and_carry_sessions_of_cases_that_did_not_pass(fake_env, tmp_path):
+    gw, apv = fake_env["gateway"], fake_env["apv"]
+    a, b = "202610080000000011", "202610080000000012"
+    (apv / "fake_verdicts.json").write_text(json.dumps({b: "FAIL"}), encoding="utf-8")
+    data = make_workbook(tmp_path / "s.xlsx", [(a, "APV_0", "cmd", "show slb real"),
+                                              (b, "APV_0", "cmd", "show slb real")])
+    lease = _lease(gw)
+    submitted = gw.call(ALICE, "case_submit", {**lease, "xlsx_b64": base64.b64encode(data).decode()})
+    assert submitted["ok"] and submitted["submit_autoid"] == a and submitted["module"] == "sdns"
+    _wait_done(gw, ALICE, submitted["task_id"])
+    out = gw.call(ALICE, "case_results", {"task_id": submitted["task_id"]})
+    assert out["submit_autoid"] == a and out["module"] == "sdns"
+    assert out["report_dir"].startswith(f"report/{out['run_dir']}/")
+    assert out["report_dir"].endswith(f"ist_staging_sdns/{a}/test_xlsx/case.xlsx")
+    cases = {c["case_id"]: c for c in out["cases"]}
+    assert "sessions" not in cases[a], "a pass carries no session dumps"
+    assert cases[b]["sessions"] == {"apv_192.0.2.10.txt": f"APV(config)#show sdns node\nnode1 {b}\n"}
+    assert "######################      FAIL      ####################" in cases[b]["log"]

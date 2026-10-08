@@ -320,6 +320,37 @@ def report_run_dir(cfg: GatewayConfig, module: str, autoid: str, min_epoch: floa
     return None
 
 
+def run_report_base(cfg: GatewayConfig, module: str, autoid: str, run_dir: str) -> Path | None:
+    """本次运行那一份报告目录下的 case.xlsx 目录（每个案一个子目录）；没有就是 None。"""
+    root = cfg.apv_src / "report"
+    for base in _report_bases(cfg, module, autoid):
+        if base.relative_to(root).parts[0] == run_dir:
+            return base
+    return None
+
+
+# 每案目录里除 <autoid>.txt 之外的会话转储：设备 CLI 会话（apv_<ip>.txt，ttyS 串口的是
+# apv_ttyS<n>.txt）、触发机会话（RouterA.txt 等，框架 lib/ssh_server.py 按主机名落）
+SESSION_MAX_FILES = 8
+SESSION_MAX_CHARS = 12000
+
+
+def case_sessions(base: Path, case_id: str, max_files: int = SESSION_MAX_FILES,
+                  max_chars: int = SESSION_MAX_CHARS) -> dict[str, str]:
+    """本次运行里这个案的会话转储，名字 → 尾部至多 max_chars 字符（整行起，脱敏）。"""
+    case_dir = base / safe(case_id, "case_id")
+    out: dict[str, str] = {}
+    if not case_dir.is_dir():
+        return out
+    names = sorted(p.name for p in case_dir.iterdir()
+                   if p.is_file() and p.suffix == ".txt" and p.name != f"{case_id}.txt"
+                   and _SAFE.match(p.name))
+    for name in names[:max_files]:
+        text = (case_dir / name).read_text(encoding="utf-8", errors="replace")
+        out[name] = scrub_text(tail_lines(text, max_chars))
+    return out
+
+
 def batch_logs(cfg: GatewayConfig, module: str, autoid: str, min_epoch: float,
                max_chars: int = 20000, run_dir: str | None = None) -> dict[str, dict[str, Any]]:
     """每个用例的框架日志；mtime 早于 min_epoch 的判为 stale（上一轮留下的）。

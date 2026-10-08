@@ -83,6 +83,8 @@ TOOL_SPECS: list[dict[str, Any]] = [
      "description": "Check the bed before running cases: framework files present, framework conf "
                     "readable, devices reachable, the device's own build matches the gateway's "
                     "bundle build, destructive-command rules and credential literals available. "
+                    "device_count is how many devices the framework conf lists (APV_0 .. "
+                    "APV_<device_count-1>); a case can only use those. "
                     "Pass device_build (the build your cases were compiled for): a different build "
                     "is refused; without it the result says build_checked=false. "
                     "Read-only; needs your lease.",
@@ -93,8 +95,10 @@ TOOL_SPECS: list[dict[str, Any]] = [
     {"name": "case_submit", "scope": "jumphost:run", "read_only": False,
      "description": "Run a compiled case workbook on the bed. The workbook is frozen, checked "
                     "(zip/size limits, Excel contract, destructive commands, framework credential "
-                    "literals) and staged read-only; the staged sha must equal the frozen sha. "
-                    "Returns task_id; poll case_status, then read case_results.",
+                    "literals, devices the bed does not have) and staged read-only; the staged sha "
+                    "must equal the frozen sha. Returns task_id, submit_autoid (the staging folder "
+                    "name: the workbook's first case) and module; poll case_status, then read "
+                    "case_results.",
      "input_schema": _schema({**LEASE_PROPS,
                               "xlsx_b64": {"type": "string", "description": "Workbook bytes, base64."},
                               "module": {"type": "string", "description": "Staging module; defaults to the gateway's configured module."}},
@@ -107,8 +111,12 @@ TOOL_SPECS: list[dict[str, Any]] = [
     {"name": "case_results", "scope": "jumphost:run", "read_only": True,
      "description": "Per-case results of a finished run from the framework result database, with "
                     "each case's framework log. Logs older than the delivery time are marked stale "
-                    "and must not be read as this run's evidence. channel=runner_lost means the "
-                    "run died before finishing and has no verdicts; resubmit it.",
+                    "and must not be read as this run's evidence. Every case that is not a pass "
+                    "also carries sessions: the tail of each device CLI session (apv_<ip>.txt) and "
+                    "trigger-host session of that case in this run. rc is the framework process's "
+                    "exit status; run_dir / report_dir / submit_autoid / module say where the run "
+                    "lives on the jump host. channel=runner_lost means the run died before "
+                    "finishing and has no verdicts; resubmit it.",
      "input_schema": _schema({"task_id": {"type": "string"}}, ["task_id"])},
     {"name": "probe_show", "scope": "jumphost:run", "read_only": True,
      "description": "Run one read-only show/get command on a device and return its output. "
@@ -292,7 +300,8 @@ class Gateway:
             parser = framework.read_conf(cfg)
             ips = framework.device_ips(parser)
             framework.device_credentials(parser, cfg.build)
-            add("framework_conf", bool(ips), f"{len(ips)} device(s) in conf")
+            add("framework_conf", bool(ips), f"{len(ips)} device(s) in conf: "
+                + ", ".join(f"APV_{i}" for i in range(len(ips))))
         except framework.FrameworkError as exc:
             add("framework_conf", False, str(exc))
             ips = []
@@ -326,7 +335,7 @@ class Gateway:
         else:
             add("device_build", False, "no bed_probes.build in the bundle grammar")
         return {"ready": all(c["ok"] for c in checks), "checks": checks,
-                "build_checked": build_checked}
+                "build_checked": build_checked, "device_count": len(ips)}
 
     # ── 上机 ──────────────────────────────────────────────
     def case_submit(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
@@ -337,7 +346,9 @@ class Gateway:
             raise ToolError("xlsx_b64 is not valid base64") from None
         module = framework.safe(args.get("module") or self.cfg.default_module, "module")
         frozen = gates.freeze(data)
-        gates.check(frozen, grammar=self.grammar(), credential_literals=self.credential_literals())
+        device_count = len(framework.device_ips(framework.read_conf(self.cfg)))
+        gates.check(frozen, grammar=self.grammar(), credential_literals=self.credential_literals(),
+                    device_count=device_count)
         submit = framework.safe(frozen.autoids[0], "autoid")
         fd = self.state.try_bed_lock()
         if fd is None:
@@ -360,7 +371,8 @@ class Gateway:
         self.audit("case_submitted", subject=caller.subject, task_id=task_id,
                    sha256=frozen.sha256, cases=len(frozen.autoids))
         return {"task_id": task_id, "sha256": frozen.sha256, "bytes": frozen.size,
-                "case_ids": list(frozen.autoids), "deliver_epoch": int(deliver_epoch)}
+                "case_ids": list(frozen.autoids), "deliver_epoch": int(deliver_epoch),
+                "submit_autoid": submit, "module": module}
 
     def _own_task(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
         task = self.state.task(str(args.get("task_id") or ""))
@@ -401,12 +413,18 @@ class Gateway:
         logs = (framework.batch_logs(self.cfg, task["module"], task["autoid"],
                                      task["deliver_epoch"] - 3, run_dir=run_dir)
                 if run_dir else {})
+        base = (framework.run_report_base(self.cfg, task["module"], task["autoid"], run_dir)
+                if run_dir else None)
         cases = []
         results = queried.get("results") or {}
         for case_id in task["case_ids"]:
             log = logs.get(case_id) or {}
-            cases.append({"case_id": case_id, "result": results.get(case_id),
-                          "log_stale": bool(log.get("stale")), "log": log.get("log", "")})
+            case = {"case_id": case_id, "result": results.get(case_id),
+                    "log_stale": bool(log.get("stale")), "log": log.get("log", "")}
+            # 归因要看设备当时回了什么：没过的案带上本次运行里它的设备会话与触发机会话
+            if base is not None and str(case["result"] or "").lower() != "pass":
+                case["sessions"] = framework.case_sessions(base, case_id)
+            cases.append(case)
         if "error" in queried:
             channel = "query_error"
         elif any(c["result"] is None for c in cases):
@@ -415,6 +433,9 @@ class Gateway:
             channel = "ready"
         return {"task_id": task["task_id"], "channel": channel, "rc": status.get("rc"),
                 "xlsx_sha256": task["xlsx_sha256"], "cases": cases, "run_dir": run_dir,
+                "submit_autoid": task["autoid"], "module": task["module"],
+                "report_dir": (base.relative_to(self.cfg.apv_src).as_posix()
+                               if base is not None else None),
                 "ignored_rows": queried.get("ignored_rows", 0),
                 **({"query_error": queried["error"]} if "error" in queried else {})}
 

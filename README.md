@@ -276,9 +276,9 @@ cexg serve --config ~/.config/cexg/gateway.toml      # systemd 样例见 gateway
 | 工具 | scope | 说明 |
 |---|---|---|
 | `lease_acquire` / `lease_heartbeat` / `lease_release` / `lease_status` | `jumphost:run` | 单床租约，带 fencing token；碰设备的工具都要带当前租约 |
-| `env_prepare` | `jumphost:run` | 框架文件、conf、设备可达、设备自述构建与网关构建一致、规则与凭据字面量可用；客户端带 `device_build`（用例按哪个构建编的），与本床构建不符直接拒绝；不带时照查，结果里 `build_checked: false` |
-| `case_submit` | `jumphost:run` | 冻结工作簿 → 上机前闸（zip/体积、Excel 契约、自毁命令、框架凭据字面量）→ 只读落位、sha 对账 → 起跑 |
-| `case_status` / `case_results` | `jumphost:run` | 状态；结果来自框架结果库，只认本次运行报告目录下的行（同一构建表里别的床、上一轮留下的行不算，条数记在 `ignored_rows`）；早于投递时间的日志标 stale；输出经脱敏；runner 没写完成状态就死了（网关重启、OOM、人工 kill）报 `lost`，`case_results` 回 `channel: runner_lost`（没有判定，重投）；回给客户端的一切另把网关知道的口令字面值（conf 口令项、结果库口令、框架凭据字面量）换成 `***` |
+| `env_prepare` | `jumphost:run` | 框架文件、conf、设备可达、设备自述构建与网关构建一致、规则与凭据字面量可用；客户端带 `device_build`（用例按哪个构建编的），与本床构建不符直接拒绝；不带时照查，结果里 `build_checked: false`；`device_count` 是 conf `[comm] ssh_ips` 列的设备台数（用例只能用 `APV_0`..`APV_<台数-1>`） |
+| `case_submit` | `jumphost:run` | 冻结工作簿 → 上机前闸（zip/体积、Excel 契约、自毁命令、框架凭据字面量、床上没有的设备：E 列 `APV_k`/`Segk_tmp` 的 k 不小于 conf 设备台数就拒收，框架连不上第 k 台时整卷一个案都不跑）→ 只读落位、sha 对账 → 起跑；回执带 `submit_autoid`（落位目录名，即卷里第一个案）与 `module` |
+| `case_status` / `case_results` | `jumphost:run` | 状态；结果来自框架结果库，只认本次运行报告目录下的行（同一构建表里别的床、上一轮留下的行不算，条数记在 `ignored_rows`）；早于投递时间的日志标 stale；没过的案另带 `sessions`：本次运行里该案每个设备 CLI 会话（`apv_<ip>.txt`）与触发机会话的尾部（每份至多 12000 字符、至多 8 份）；回执带 `rc`（框架进程退出码）、`run_dir`、`report_dir`（相对框架根的报告目录）、`submit_autoid`、`module`；输出经脱敏；runner 没写完成状态就死了（网关重启、OOM、人工 kill）报 `lost`，`case_results` 回 `channel: runner_lost`（没有判定，重投）；回给客户端的一切另把网关知道的口令字面值（conf 口令项、结果库口令、框架凭据字面量）换成 `***` |
 | `probe_show` | `jumphost:run` | 单条 show/get，只读：一行至多 200 字符，参数只许字母数字空格与 `_ . , : / @ % + = * " ' -`；等不到设备提示符回 `truncated: true` |
 | `bed_topology` | `jumphost:run` | 本床拓扑事实（`network_topology.json`）：跳板机网卡与邻居、conf 里各台主机的接口地址（用框架自己的字面凭据登录，主机密钥首见即钉）、可达被测设备的 `show ip address`，按 InfoTest 拓扑生成器同一套纯函数合成；要租约，缓存到下次 `refresh`。客户端编写阶段的判据（VIP 选取、触发机配对、后端地址）读它；另带 `services`：`gateway.toml` 里 `[[bed.services]]` 的常驻服务清单（host/ip/proto/port/note），没配为空列表 |
 | `init_device` | `jumphost:admin` | 串口重置，两步：`prepare` 给出计划与一次性确认码，`confirm` 带码执行；每步核对配置模式提示符；确认码只把 confirm 绑定到那份计划，人的批准靠客户端对该工具的权限确认；显式 `device_count` 须 ≥ 1 |

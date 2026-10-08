@@ -74,7 +74,15 @@ def test_case(request):
             continue
         rel = "report/%s/%s/ist_staging_%s/%s/test_xlsx/case.xlsx/%s" % (run, module, module, here.name, cid)
         (root / rel).mkdir(parents=True, exist_ok=True)
-        (root / rel / (cid + ".txt")).write_text("ran %s on %s in %s\\n####### end case: %s\\n" % (cid, build, run, cid))
+        result = str(verdicts.get(cid, "PASS")).upper()
+        # 与真框架一样收尾：计数、PASS/FAIL 横幅，紧跟 end case（unfinished 里的案模拟停在案里）
+        close = "" if cid in verdicts.get("unfinished", []) else (
+            "#\\n################# The failed check point num:   %d   ####\\n#\\n"
+            "################# The passed check point num:   %d   ####\\n#\\n"
+            "######################      %s      ####################\\n#######   end case: %s\\n"
+            % (0 if result == "PASS" else 1, 1 if result == "PASS" else 0, result, cid))
+        (root / rel / (cid + ".txt")).write_text("ran %s on %s in %s\\n%s" % (cid, build, run, close))
+        (root / rel / "apv_192.0.2.10.txt").write_text("APV(config)#show sdns node\\nnode1 %s\\n" % cid)
         sub = "ist_staging_" + module
         rows = [r for r in rows if not (r["table"] == build and r["case_id"] == cid and r["sub_module"] == sub)]
         rows.append({"table": build, "case_id": cid, "sub_module": sub,
