@@ -300,7 +300,7 @@ cexg serve --config ~/.config/cexg/gateway.toml      # systemd 样例见 gateway
   测试对仓库只读、从不改写它：网关测试用手动生成的这份（没生成过就不收集），生成链测试用 skills 仓
   `cex_core` 的临时副本；与 skills 仓（或 `CEX_SKILLS_ROOT`）不一致由 `tests/gateway/test_vendor_readonly.py`
   用 `--check` 报出；
-  发版时 release 流程用只读令牌检出 skills 仓再生成（仓库 secret `CEX_SKILLS_READ_TOKEN`）。
+  发版时 release 流程检出 skills 仓再生成：skills 仓公开时用工作流自带的令牌，转私有后配只读令牌（仓库 secret `CEX_SKILLS_READ_TOKEN`）。
   本地打包前、第一次跑网关测试前（以及 skills 仓的 `cex_core` 改过之后）手动跑
   `python3 tools/sync_gateway_vendor.py --only cex_core --skills-root <skills 检出>`。
 - 测试用假框架目录（真 pytest 跑假 `test_xlsx`、假结果库）与假串口控制台；真跳板机与设备上的验收另做。

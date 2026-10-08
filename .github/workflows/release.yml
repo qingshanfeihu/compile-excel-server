@@ -41,7 +41,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/compile-excel-skills
-          token: ${{ secrets.CEX_SKILLS_READ_TOKEN }}
+          # skills 仓公开时工作流自带的令牌就读得到；转私有后配只读令牌 CEX_SKILLS_READ_TOKEN
+          token: ${{ secrets.CEX_SKILLS_READ_TOKEN || github.token }}
           path: compile-excel-skills
       - name: Build gateway (cexg, jumphost; linux only)
         if: startsWith(matrix.tag, 'linux')

@@ -17,7 +17,7 @@ from .introspect import IntrospectError
 from .tools import TOOL_SPECS, Caller, Gateway
 
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "compile-excel-gateway", "version": "0.1.0"}
+SERVER_INFO = {"name": "compile-excel-gateway", "version": "0.2.0"}
 MAX_BODY = 64 * 1024 * 1024
 HANDSHAKE_TIMEOUT_S = 10.0
 IDLE_TIMEOUT_S = 60.0
