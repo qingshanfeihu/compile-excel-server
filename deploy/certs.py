@@ -98,8 +98,9 @@ def ensure_ca(data_dir: Path) -> Path:
     key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name([
         x509.NameAttribute(NameOID.ORGANIZATION_NAME, "compile-excel-server"),
+        # 证书名称最长 64 个字符：主机名长（云主机、CI 机器常见）时截短
         x509.NameAttribute(NameOID.COMMON_NAME,
-                           f"compile-excel-server CA ({socket.gethostname()[:40]})"),
+                           f"compile-excel-server CA ({socket.gethostname()[:37]})"[:64]),
     ])
     now = dt.datetime.now(dt.timezone.utc)
     cert = (x509.CertificateBuilder()

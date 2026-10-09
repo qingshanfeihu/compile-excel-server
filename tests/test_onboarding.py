@@ -601,3 +601,15 @@ def test_config_root_follows_the_sudo_user(monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: Path("/var/root")))
     expected = Path(pwd.getpwnam(getpass.getuser()).pw_dir) / ".config" / "compile-excel-server"
     assert paths.config_root() == expected
+
+
+def test_a_long_hostname_still_gets_a_ca(tmp_path, monkeypatch):
+    """证书名称上限 64 个字符：主机名很长的机器（例如 CI 的 macOS 机器）以前生成 CA 直接失败。"""
+    import socket as socket_mod
+
+    long_name = "runner-very-long-hostname-" + "x" * 50 + ".local"
+    monkeypatch.setattr(socket_mod, "gethostname", lambda: long_name)
+    data = _provision(tmp_path / "data")
+    cert, _ = certs.ensure_server_cert(data, ["127.0.0.1"])
+    assert "127.0.0.1" in certs.cert_info(cert)["names"]
+    assert certs.cert_info(certs.ca_paths(data)[0])["issuer"].startswith("CN=compile-excel-server CA")
