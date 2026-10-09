@@ -57,14 +57,32 @@ jobs:
     env:
       DEBIAN_FRONTEND: noninteractive
     steps:
-      - name: Python 3.11 与打包工具
+      - name: 编译依赖
         run: |
           apt-get update -qq
-          apt-get install -y -qq software-properties-common git binutils ca-certificates > /dev/null
-          add-apt-repository -y ppa:deadsnakes/ppa > /dev/null
-          apt-get update -qq
-          apt-get install -y -qq python3.11 python3.11-venv python3.11-dev > /dev/null
-          python3.11 -m venv /opt/build
+          apt-get install -y -qq build-essential git binutils ca-certificates curl libssl-dev \
+            zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libffi-dev liblzma-dev uuid-dev \
+            > /dev/null
+      # 20.04 没有现成的 Python 3.11 包了（deadsnakes 已不再给 20.04 出包）：源码编译，带共享库
+      # （PyInstaller 要 libpython），编好的缓存起来
+      - name: Python 3.11 的缓存
+        id: python-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/python
+          key: python-3.11.9-shared-ubuntu20.04
+      - name: 源码编译 Python 3.11
+        if: steps.python-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL https://www.python.org/ftp/python/3.11.9/Python-3.11.9.tgz | tar -xz -C /tmp
+          cd /tmp/Python-3.11.9
+          ./configure --enable-shared --prefix=/opt/python LDFLAGS="-Wl,-rpath,/opt/python/lib" > /dev/null
+          make -j"$(nproc)" > /dev/null 2>&1
+          make install > /dev/null 2>&1
+      - name: 打包用的虚拟环境
+        run: |
+          /opt/python/bin/python3.11 -c "import ssl, sqlite3, ctypes, lzma, bz2; print(ssl.OPENSSL_VERSION)"
+          /opt/python/bin/python3.11 -m venv /opt/build
           echo /opt/build/bin >> "$GITHUB_PATH"
       - uses: actions/checkout@v4
       - name: Version matches tag
