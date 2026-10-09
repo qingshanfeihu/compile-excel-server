@@ -3,25 +3,22 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # 手动触发：只打包、算 SHA256SUMS、留作构建产物下载，不发版（上机验收、离线拷到跳板机前试包用）
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  build-macos:
     strategy:
       matrix:
         include:
-          - os: macos-14
-            tag: darwin-arm64
+          - tag: darwin-arm64
             pyarch: arm64
-          - os: macos-14          # arm64 runner 经 Rosetta 跑 x64 Python 出 x86_64 包
-            tag: darwin-x86_64
+          - tag: darwin-x86_64     # arm64 runner 经 Rosetta 跑 x64 Python 出 x86_64 包
             pyarch: x64
-          - os: ubuntu-22.04
-            tag: linux-x86_64
-            pyarch: x64
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -29,6 +26,7 @@ jobs:
           python-version: "3.11"
           architecture: ${{ matrix.pyarch }}
       - name: Version matches tag
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           version="$(python -c 'import ces_version; print(ces_version.__version__)')"
           test "v${version}" = "${GITHUB_REF_NAME}" || { echo "ces_version.py 是 ${version}，tag 是 ${GITHUB_REF_NAME}"; exit 1; }
@@ -41,16 +39,56 @@ jobs:
             --name compile-excel-server --onedir \
             --collect-all uvicorn --collect-all fastapi \
             ces_main.py
-      - name: Check out compile-excel-skills (gateway criteria source; linux only)
-        if: startsWith(matrix.tag, 'linux')
+          tar -czf "compile-excel-server-${{ matrix.tag }}.tar.gz" -C dist compile-excel-server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.tag }}
+          path: compile-excel-server-*.tar.gz
+          if-no-files-found: error
+
+  # Linux 包在 Ubuntu 20.04（glibc 2.31）里打：打包机的 glibc 就是包能跑的最低版本。
+  # 以前在 22.04 上打，到 20.04 的跳板机上报 GLIBC_2.35 not found，网关根本起不来。
+  build-linux:
+    runs-on: ubuntu-22.04
+    container: ubuntu:20.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Python 3.11 与打包工具
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq software-properties-common git binutils ca-certificates > /dev/null
+          add-apt-repository -y ppa:deadsnakes/ppa > /dev/null
+          apt-get update -qq
+          apt-get install -y -qq python3.11 python3.11-venv python3.11-dev > /dev/null
+          python3.11 -m venv /opt/build
+          echo /opt/build/bin >> "$GITHUB_PATH"
+      - uses: actions/checkout@v4
+      - name: Version matches tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version="$(python -c 'import ces_version; print(ces_version.__version__)')"
+          test "v${version}" = "${GITHUB_REF_NAME}" || { echo "ces_version.py 是 ${version}，tag 是 ${GITHUB_REF_NAME}"; exit 1; }
+          grep -q "\"version\": \"${version}\"" gateway/service.py || { echo "gateway/service.py 的版本号没同步"; exit 1; }
+      - name: Build onedir
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+          pyinstaller --clean --noconfirm \
+            --name compile-excel-server --onedir \
+            --collect-all uvicorn --collect-all fastapi \
+            ces_main.py
+      - name: Check out compile-excel-skills (gateway criteria source)
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/compile-excel-skills
           # skills 仓公开时工作流自带的令牌就读得到；转私有后配只读令牌 CEX_SKILLS_READ_TOKEN
           token: ${{ secrets.CEX_SKILLS_READ_TOKEN || github.token }}
           path: compile-excel-skills
-      - name: Build gateway (cexg, jumphost; linux only)
-        if: startsWith(matrix.tag, 'linux')
+      - name: Build gateway (cexg, jumphost)
         run: |
           python -m pip install openpyxl
           python tools/sync_gateway_vendor.py --only cex_core --skills-root compile-excel-skills
@@ -60,24 +98,27 @@ jobs:
             --add-data "gateway/agent/jumphost_agent.py:gateway/agent" \
             --add-data "gateway/gateway.example.toml:gateway" \
             gateway/cexg.py
-          tar -czf "cexg-${{ matrix.tag }}.tar.gz" -C dist cexg
-      - name: Package
+      - name: Package and smoke test
         run: |
-          tar -czf "compile-excel-server-${{ matrix.tag }}.tar.gz" \
-            -C dist compile-excel-server
+          dist/compile-excel-server/compile-excel-server version
+          dist/cexg/cexg sample-config > /dev/null
+          echo "glibc: $(ldd --version | head -1)"
+          tar -czf compile-excel-server-linux-x86_64.tar.gz -C dist compile-excel-server
+          tar -czf cexg-linux-x86_64.tar.gz -C dist cexg
       - uses: actions/upload-artifact@v4
         with:
-          name: dist-${{ matrix.tag }}
+          name: dist-linux-x86_64
           path: |
             compile-excel-server-*.tar.gz
             cexg-*.tar.gz
           if-no-files-found: error
 
-  # 所有平台的包到齐后统一算 SHA256SUMS 并发布：下载方用 sha256sum -c SHA256SUMS 核对
+  # 所有平台的包到齐后统一算 SHA256SUMS：打 tag 时发布；手动触发时只留作构建产物
   release:
-    needs: build
+    needs: [build-macos, build-linux]
     runs-on: ubuntu-22.04
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: dist-*
@@ -85,11 +126,20 @@ jobs:
           path: dist
       - name: SHA256SUMS
         run: |
+          cp install.sh dist/   # 离线安装要的三样（install.sh、安装包、SHA256SUMS）在发布页一次下齐
           cd dist
           sha256sum *.tar.gz > SHA256SUMS
           cat SHA256SUMS
+      - name: Keep the packages (manual run)
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: dist/
       - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
             dist/*.tar.gz
             dist/SHA256SUMS
+            dist/install.sh

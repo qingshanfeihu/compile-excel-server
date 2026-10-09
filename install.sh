@@ -15,6 +15,7 @@
 #
 # 环境变量：
 #   CES_VERSION     指定版本（例如 0.2.0）；不设就装最新版
+#   CES_ASSET_DIR   离线安装：从这个目录取安装包和 SHA256SUMS，不连 GitHub（跳板机通常上不了外网）
 #   CES_REPO        默认 qingshanfeihu/compile-excel-server
 #   CES_BIN_DIR     命令放在哪里，默认 ~/.local/bin
 #   CES_PREFIX      程序放在哪里，默认 ~/.local/share/compile-excel-server（网关是 ~/.local/share/cexg）
@@ -47,8 +48,11 @@ compile-excel-server 一键安装（macOS / Linux）
   curl -fsSL …/install.sh | bash -s -- --gateway     改装跳板机网关 cexg（只有 Linux x86_64）
   ./install.sh --from-source                         从当前代码目录安装（开发用）
 
-环境变量：CES_VERSION（指定版本）、CES_PREFIX（程序放在哪里）、CES_BIN_DIR（命令放在哪里）、
-CES_DATA_HOME（默认数据目录）、CES_REPO（从哪个仓库下载）
+离线安装（跳板机上不了外网时）：在能上网的电脑上下载 install.sh、安装包和 SHA256SUMS，拷到同一个目录，
+  CES_ASSET_DIR=<那个目录> bash install.sh --gateway
+
+环境变量：CES_VERSION（指定版本）、CES_ASSET_DIR（离线安装包所在目录）、CES_PREFIX（程序放在哪里）、
+CES_BIN_DIR（命令放在哪里）、CES_DATA_HOME（默认数据目录）、CES_REPO（从哪个仓库下载）
 EOF
 }
 
@@ -120,6 +124,16 @@ sha256_of() {
     else die "缺少 sha256sum 或 shasum，无法核对安装包"; fi
 }
 
+guard_foreign_layout() {
+    # current 指向 versions/ 以外（例如按提交号部署的 releases/<提交>，由系统服务用自带的 Python 启动）：
+    # 那是别的方式部署的，换掉链接会让正在运行的服务下次重启时起不来
+    [[ -L "$PREFIX/current" ]] || return 0
+    local target
+    target="$(readlink "$PREFIX/current")"
+    [[ "$target" == versions/* ]] && return 0
+    die "${PREFIX} 里已经有别的方式部署的程序（current → ${target}），安装脚本不覆盖它。换一个目录（CES_PREFIX=<新目录>），或者先停掉原来的服务、挪走这个目录"
+}
+
 switch_current() {  # 原子地把 current 链接换到 $1（相对路径）
     local tmp="$PREFIX/.current.$$"
     rm -f -- "$tmp"
@@ -167,12 +181,23 @@ install_release() {
         fi
         die "没有 ${plat} 的安装包。可以从源码安装：git clone https://github.com/${REPO}.git && cd compile-excel-server && ./install.sh --from-source（需要 python3）"
     fi
-    version="$(resolve_version)"
+    guard_foreign_layout
     asset="${NAME}-${plat}.tar.gz"
     download="$(mktemp -d)"
-    log "下载 ${asset}（版本 ${version}）"
-    fetch "$asset" "$version" "$download/$asset" || die "下载失败：版本 ${version} 里没有 ${asset}，或者网络不通"
-    fetch "SHA256SUMS" "$version" "$download/SHA256SUMS" || {
+    if [[ -n "${CES_ASSET_DIR:-}" ]]; then
+        version="${CES_VERSION:-local}"
+        version="${version#v}"
+        log "离线安装：从 ${CES_ASSET_DIR} 取 ${asset}"
+        [[ -f "$CES_ASSET_DIR/$asset" ]] || die "${CES_ASSET_DIR} 里没有 ${asset}（在能上网的电脑上从发布页下载后拷过来）"
+        cp -- "$CES_ASSET_DIR/$asset" "$download/$asset"
+        [[ -f "$CES_ASSET_DIR/SHA256SUMS" ]] && cp -- "$CES_ASSET_DIR/SHA256SUMS" "$download/SHA256SUMS"
+    else
+        version="$(resolve_version)"
+        log "下载 ${asset}（版本 ${version}）"
+        fetch "$asset" "$version" "$download/$asset" || die "下载失败：版本 ${version} 里没有 ${asset}，或者网络不通（上不了外网时用 CES_ASSET_DIR 离线安装）"
+        fetch "SHA256SUMS" "$version" "$download/SHA256SUMS" || true
+    fi
+    [[ -f "$download/SHA256SUMS" ]] || {
         [[ "${CES_SKIP_VERIFY:-}" == 1 ]] || die "版本 ${version} 没有 SHA256SUMS，无法核对安装包（确认来源可信后可设 CES_SKIP_VERIFY=1）"
         log "警告：按 CES_SKIP_VERIFY=1 跳过了核对"
     }

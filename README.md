@@ -22,7 +22,8 @@ curl -fsSL https://raw.githubusercontent.com/qingshanfeihu/compile-excel-server/
 - 支持 macOS（Apple 芯片和 Intel）与 Linux x86_64，不需要先装 Python。
 - 安装脚本会核对安装包的 SHA256，先试运行新版本，再替换旧版本；中途失败不影响已装的版本。
 - 程序装在 `~/.local/share/compile-excel-server`，命令是 `ces`。脚本会把 `~/.local/bin` 加进 PATH，按提示重开终端即可。
-- 其他平台用源码安装，见 [开发与发版](docs/development.md)。
+- 服务器上不了外网时，在能上网的电脑上从发布页下载 `install.sh`、安装包和 `SHA256SUMS`，拷到服务器的同一个目录，运行 `CES_ASSET_DIR=. CES_VERSION=<版本号> bash install.sh`。
+- Linux 安装包能在 Ubuntu 20.04（glibc 2.31）及更新的系统上运行。其他平台用源码安装，见 [开发与发版](docs/development.md)。
 
 要装指定版本，在 `bash` 前面加上版本号：
 

@@ -4,13 +4,27 @@
 
 ## 安装
 
-在跳板机上（只有 Linux x86_64 的安装包）：
+网关只有 Linux x86_64 的安装包，能在 Ubuntu 20.04（glibc 2.31）及更新的系统上运行。
+
+实验室的跳板机通常上不了外网，所以用离线安装：
+
+1. 在能上网的电脑上，从 [发布页](https://github.com/qingshanfeihu/compile-excel-server/releases) 下载三个文件：`install.sh`、`cexg-linux-x86_64.tar.gz`、`SHA256SUMS`（0.3.0 之前的版本发布页里没有 `install.sh`，从仓库根目录取）。
+2. 把三个文件拷到跳板机的同一个目录，例如 `~/cexg-install/`。
+3. 在跳板机上运行：
+
+```bash
+cd ~/cexg-install && CES_ASSET_DIR=. CES_VERSION=<版本号> bash install.sh --gateway
+```
+
+跳板机能上外网时，也可以直接运行：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/qingshanfeihu/compile-excel-server/main/install.sh | bash -s -- --gateway
 ```
 
-程序装在 `~/.local/share/cexg/versions/<版本>/`，`current` 指向当前版本，命令是 `cexg`。以后更新时重新运行这条命令，再重启网关（`sudo systemctl restart cexg`）即可，配置不受影响。
+- 安装脚本会核对 SHA256，先试运行新版本再切换。程序装在 `~/.local/share/cexg/versions/<版本>/`，`current` 指向当前版本，命令是 `cexg`。
+- 以后更新时按同样的步骤再装一次，然后重启网关（`sudo systemctl restart cexg`），配置不受影响。
+- 如果 `~/.local/share/cexg` 里已经有别的方式部署的网关（例如 `current` 指向按提交号部署的 `releases/<提交>`、由系统服务用自带的 Python 启动），安装脚本会拒绝覆盖，免得正在运行的服务重启后起不来。这时用 `CES_PREFIX=<新目录>` 装到别处，确认无误后再改系统服务。
 
 ## 配置
 

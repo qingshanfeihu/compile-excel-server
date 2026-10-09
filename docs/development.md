@@ -73,7 +73,8 @@ python3 tools/sync_gateway_vendor.py --only cex_core --skills-root <skills 仓�
 2. 提交后打 tag：`git tag v<版本号> && git push origin v<版本号>`。
 3. `.github/workflows/release.yml` 自动执行：
    - 先检查 tag 与 `ces_version.py` 一致、网关版本号已同步，不一致就停止；
-   - 在 macOS（Apple 芯片与 Intel）和 Linux x86_64 上用 PyInstaller 打包 `compile-excel-server-<平台>.tar.gz`；
-   - Linux 上另外检出 skills 仓库、同步判据代码，打包网关 `cexg-linux-x86_64.tar.gz`。skills 仓库公开时用工作流自带的令牌；转为私有后要配只读令牌（仓库机密 `CEX_SKILLS_READ_TOKEN`）；
+   - 在 macOS（Apple 芯片与 Intel）上用 PyInstaller 打包 `compile-excel-server-<平台>.tar.gz`；
+   - Linux 包在 Ubuntu 20.04 容器里打（打包机的 glibc 就是包能运行的最低版本：在 22.04 上打的包，到 20.04 的跳板机上会报 `GLIBC_2.35 not found`）。另外检出 skills 仓库、同步判据代码，打包网关 `cexg-linux-x86_64.tar.gz`。skills 仓库公开时用工作流自带的令牌；转为私有后要配只读令牌（仓库机密 `CEX_SKILLS_READ_TOKEN`）；
    - 全部平台到齐后统一计算 `SHA256SUMS`，和安装包一起发布。
 4. 推送代码不会发布新版本，只有推送 `v*` tag 才会。
+5. 想先拿到安装包试一试（例如拷到跳板机上验收）：在 GitHub 的 Actions 页面手动运行 `release` 工作流（或 `gh workflow run release.yml`），它只打包、算 `SHA256SUMS`，结果在这次运行的 `packages` 构建产物里，不发版。
