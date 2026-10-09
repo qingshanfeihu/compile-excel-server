@@ -31,6 +31,7 @@
   GET  /v1/artifacts/{name}        旧版工件下载：发不可变 blob（artifacts:read）
   POST /v1/docs/query              知识库关键词检索（docs:query）
   GET  /healthz                    探活（只答 ok，不透出构建与后端）
+  GET  /ca.pem                     内置 CA 的证书（公开；客户端按连接串里的指纹核对后才信任）
 
 跑法：python3 server.py [--port 8900] [--data <数据目录>]
 依赖：fastapi + uvicorn。
@@ -58,7 +59,7 @@ import anyio
 import anyio.to_thread
 from anyio.lowlevel import RunVar
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 import auth_backends
 import client_config
@@ -287,6 +288,16 @@ async def healthz() -> dict[str, Any]:
     return {"ok": True, "service": "compile-excel-server"}
 
 
+@app.get("/ca.pem")
+async def ca_certificate() -> Response:
+    # 不鉴权：内置 CA 的证书（公开信息）。客户端拿连接串里的指纹核对它，对上了才用它校验服务器证书
+    path = DATA_DIR / "tls" / "ca.pem"
+    if not path.is_file():
+        return JSONResponse({"detail": "本服务没有使用内置 CA"}, status_code=404)
+    return Response(path.read_bytes(), media_type="application/x-pem-file",
+                    headers={"Cache-Control": "no-store"})
+
+
 def _prune_flows() -> None:
     now = time.time()
     for code in [c for c, f in _device_flows.items() if f["exp"] < now]:
@@ -337,17 +348,58 @@ async def device_authorize(request: Request) -> JSONResponse:
     })
 
 
-_PAGE_STYLE = ("body{font-family:sans-serif;max-width:32em;margin:4em auto;line-height:1.6}"
-               "code{background:#f4f4f4;padding:.2em .5em;font-size:1.2em}"
-               "label{display:block;margin:.6em 0}")
+_PAGE_STYLE = """
+:root{--bg:#f5f6f8;--card:#fff;--text:#1d2129;--muted:#5c6370;--line:#dcdfe6;--accent:#2563eb;
+--ok:#15803d;--bad:#b91c1c;--code:#eef2ff}
+@media (prefers-color-scheme:dark){:root{--bg:#16181d;--card:#1f2228;--text:#e6e8eb;--muted:#9aa1ab;
+--line:#353a43;--accent:#60a5fa;--ok:#4ade80;--bad:#f87171;--code:#25304a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);
+font:16px/1.6 -apple-system,"PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif}
+main{max-width:30em;margin:3em auto;padding:0 16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:24px}
+.brand{color:var(--muted);font-size:14px;margin:0 0 6px}
+h1{font-size:22px;margin:0 0 16px}
+.code{font:600 28px/1.2 ui-monospace,Menlo,Consolas,monospace;letter-spacing:.15em;
+background:var(--code);border-radius:8px;padding:12px;text-align:center;margin:8px 0 16px}
+.muted{color:var(--muted);font-size:14px}
+ul.scopes{list-style:none;padding:0;margin:6px 0 16px}
+ul.scopes li{padding:5px 0;border-bottom:1px dashed var(--line)}
+label{display:block;margin:14px 0 4px;font-weight:600}
+input{width:100%;padding:10px;font-size:16px;border:1px solid var(--line);border-radius:6px;
+background:var(--card);color:var(--text)}
+.hint{color:var(--muted);font-size:13px;margin-top:4px}
+button{margin-top:20px;width:100%;padding:12px;font-size:16px;border:0;border-radius:6px;
+background:var(--accent);color:#fff;cursor:pointer}
+.ok{color:var(--ok)}.bad{color:var(--bad)}
+a{color:var(--accent)}
+"""
+# 授权页上显示给人看的客户端名称；没登记的照原样显示 client_id
+_CLIENT_NAMES = {"compile-excel-skill": "编译助手（compile-excel）"}
+# 访问码输入框下面的提示：用户最常卡在"访问码从哪来"
+_FIELD_HINTS = {"access_code": "访问码由管理员建账号时发给你；忘了请找管理员重置。"}
 
 
 def _page(title: str, body: str, status: int = 200) -> HTMLResponse:
     return HTMLResponse(
-        f'<!doctype html><html lang="zh"><head><meta charset="utf-8">'
+        f'<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
+        f'<meta name="viewport" content="width=device-width,initial-scale=1">'
         f"<title>{html.escape(title)}</title><style>{_PAGE_STYLE}</style></head>"
-        f"<body>{body}</body></html>", status_code=status,
-        headers={"X-Frame-Options": "DENY", "Cache-Control": "no-store"})
+        f'<body><main><p class="brand">compile-excel-server</p><div class="card">{body}'
+        f"</div></main></body></html>", status_code=status,
+        headers={"X-Frame-Options": "DENY", "Cache-Control": "no-store",
+                 "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; "
+                                            "form-action 'self'; frame-ancestors 'none'"})
+
+
+def _scope_items(scopes: list[str], mark: str = "") -> str:
+    order = list(SCOPES)
+    ranked = sorted(scopes, key=lambda s: order.index(s) if s in order else len(order))
+    return "".join(f"<li>{mark}{html.escape(SCOPES.get(scope, scope))}</li>" for scope in ranked)
+
+
+def _client_name(client_id: str) -> str:
+    return html.escape(_CLIENT_NAMES.get(client_id, client_id))
 
 
 def _find_flow(user_code: str) -> dict[str, Any] | None:
@@ -356,25 +408,42 @@ def _find_flow(user_code: str) -> dict[str, Any] | None:
                  if f["user_code"] == user_code and f["exp"] > now), None)
 
 
+def _fail(title: str, message: str, status: int, retry_code: str = "") -> HTMLResponse:
+    retry = (f'<p><a href="/activate?user_code={html.escape(retry_code)}">返回重新填写</a></p>'
+             if retry_code else "<p>请回到终端重新登录。</p>")
+    return _page(title, f'<h1 class="bad">{html.escape(title)}</h1><p>{message}</p>{retry}', status)
+
+
 @app.get("/activate", response_class=HTMLResponse)
 async def activate_page(user_code: str = "") -> HTMLResponse:
-    flow = _find_flow(user_code.strip().upper()) if user_code else None
-    fields = "".join(
-        f'<label>{html.escape(field.label)}：<input name="{html.escape(field.name)}" '
-        f'type="{html.escape(field.input_type)}" required autocomplete="off"></label>'
-        for field in AUTH_BACKEND.fields)
-    request_line = ""
+    code = user_code.strip().upper()
+    flow = _find_flow(code) if code else None
     if flow is not None:
-        request_line = (f"<p>客户端 <code>{html.escape(flow['client_id'])}</code> 申请："
-                        f"<code>{html.escape(' '.join(flow['scope']))}</code></p>")
-    body = (
-        "<h2>设备授权请求</h2>"
-        f"<p>确认设备码：<code>{html.escape(user_code or '________')}</code></p>"
-        f"{request_line}"
-        '<form method="post" action="/activate">'
-        f'<label>设备码：<input name="user_code" required value="{html.escape(user_code)}"></label>'
-        f"{fields}<button type=\"submit\">授权</button></form>")
-    return _page("compile-excel-server 设备授权", body)
+        # 设备码已经从链接带进来：只显示一次让人核对，不再给输入框
+        intro = (f"<p>你正在登录 <b>{_client_name(flow['client_id'])}</b>。"
+                 "请确认下面的设备码与终端里显示的一致：</p>"
+                 f'<div class="code">{html.escape(code)}</div>'
+                 "<p>它申请以下权限，只会授予你的账号已有的那些：</p>"
+                 f'<ul class="scopes">{_scope_items(flow["scope"])}</ul>'
+                 f'<input type="hidden" name="user_code" value="{html.escape(code)}">')
+    else:
+        notice = ('<p class="bad">这个设备码无效或已过期，请回到终端重新登录，或输入新的设备码。</p>'
+                  if code else "<p>请输入终端里显示的设备码。</p>")
+        intro = (f"{notice}<label for=\"user_code\">设备码</label>"
+                 f'<input id="user_code" name="user_code" required autocomplete="off" '
+                 f'autocapitalize="characters" value="{html.escape(user_code)}">')
+    fields = "".join(
+        f'<label for="{html.escape(field.name)}">{html.escape(field.label)}</label>'
+        f'<input id="{html.escape(field.name)}" name="{html.escape(field.name)}" '
+        f'type="{html.escape(field.input_type)}" required autocomplete="off">'
+        + (f'<div class="hint">{html.escape(_FIELD_HINTS[field.name])}</div>'
+           if field.name in _FIELD_HINTS else "")
+        for field in AUTH_BACKEND.fields)
+    body = ("<h1>登录授权</h1>"
+            f'<form method="post" action="/activate">{intro}{fields}'
+            '<button type="submit">授权登录</button></form>'
+            '<p class="muted">这个页面不会保存你的访问码。</p>')
+    return _page("登录授权", body)
 
 
 @app.post("/activate")
@@ -383,30 +452,41 @@ async def activate_submit(request: Request) -> HTMLResponse:
     user_code = (payload.get("user_code") or "").strip().upper()
     flow = _find_flow(user_code)
     if flow is None:
-        return _page("授权失败", "<h2>设备码无效或已过期</h2>", 400)
+        return _fail("设备码无效或已过期", "设备码只在几分钟内有效。", 400)
     if flow["status"] != "pending":
-        return _page("授权失败", "<h2>这个设备码已经处理过</h2>", 400)
+        return _fail("这个设备码已经用过了", "同一个设备码只能授权一次。", 400)
     principal = await _off_loop(AUTH_BACKEND.authenticate, payload)
     if flow["status"] != "pending":  # 校验期间同一设备码已被另一次提交处理
-        return _page("授权失败", "<h2>这个设备码已经处理过</h2>", 400)
+        return _fail("这个设备码已经用过了", "同一个设备码只能授权一次。", 400)
     attempted = (payload.get("username") or "").strip()[:64]
     if principal is None:
         _audit("activate_rejected", username=attempted, client_id=flow["client_id"])
-        return _page("授权失败", "<h2>用户名或访问码不对，或账号已停用/暂时锁定</h2>", 403)
+        return _fail("登录失败",
+                     "用户名或访问码不对，或者账号已停用。连续输错 5 次会锁定 15 分钟；"
+                     "确认无误仍然失败，请找管理员。", 403, user_code)
     granted = sorted(set(flow["scope"]) & set(principal.scopes))
     if not granted:
         flow["status"] = "denied"
         _audit("activate_denied_scope", username=principal.username,
                client_id=flow["client_id"], requested=flow["scope"])
-        return _page("授权失败", "<h2>账号没有客户端申请的任何权限</h2>", 403)
+        return _fail("没有可授予的权限",
+                     f"你的账号没有{_client_name(flow['client_id'])}申请的任何权限，"
+                     "请找管理员开通。", 403)
     flow["status"] = "approved"
     flow["username"] = principal.username
     flow["granted"] = granted
     flow["credential"] = principal.credential
     _audit("device_authorized", username=principal.username, client_id=flow["client_id"],
            scope=granted)
-    return _page("已授权", f"<h2>已授权（{html.escape(principal.username)}）</h2>"
-                           "<p>回到终端继续；登录完成后可关闭本页。</p>")
+    missing = sorted(set(flow["scope"]) - set(granted))
+    body = (f'<h1 class="ok">✓ 已授权</h1>'
+            f"<p>账号 <b>{html.escape(principal.username)}</b> 已登录"
+            f"{_client_name(flow['client_id'])}。回到终端继续即可，这个页面可以关掉。</p>"
+            f'<p>已获得的权限：</p><ul class="scopes">{_scope_items(granted, "✓ ")}</ul>')
+    if missing:
+        body += ("<p>没有获得的权限（你的账号没有；需要时请找管理员开通）：</p>"
+                 f'<ul class="scopes">{_scope_items(missing, "－ ")}</ul>')
+    return _page("已授权", body)
 
 
 def _token_error(error: str, description: str = "", status: int = 400) -> JSONResponse:

@@ -162,7 +162,8 @@ class Gateway:
     def __init__(self, cfg: GatewayConfig, server: ServerClient | None = None):
         self.cfg = cfg
         self.state = StateStore(cfg.state_dir, cfg.lease_ttl_s)
-        self.server = server or ServerClient(cfg.server_url, cfg.client_id, cfg.client_secret_file)
+        self.server = server or ServerClient(cfg.server_url, cfg.client_id, cfg.client_secret_file,
+                                             ca_file=cfg.ca_file)
         self._grammar_lock = threading.Lock()
         self._literals: tuple[float, frozenset[str]] | None = None
         self.audit_path = cfg.state_dir / "audit.log"

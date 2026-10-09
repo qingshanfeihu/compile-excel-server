@@ -60,7 +60,12 @@ def healthz(port: int, host: str = "127.0.0.1", tls_cert: str = "",
     scheme = "https" if tls_cert else "http"
     context = None
     if tls_cert:
-        context = ssl.create_default_context(cafile=str(Path(tls_cert).expanduser()))
+        cert = Path(tls_cert).expanduser()
+        # 内置 CA 签的证书：信任锚用旁边的 ca.pem；别的证书以它自己为锚（允许不完整的链）
+        ca = cert.parent / "ca.pem" if cert.name == "server.pem" else None
+        anchor = ca if ca is not None and ca.is_file() else cert
+        context = ssl.create_default_context(cafile=str(anchor))
+        context.verify_flags |= getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
         context.check_hostname = False
     try:
         with urllib.request.urlopen(f"{scheme}://{probe_host(host)}:{port}/healthz",

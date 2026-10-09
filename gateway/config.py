@@ -27,6 +27,8 @@ class GatewayConfig:
     client_id: str
     client_secret_file: Path
     build: str
+    # 服务端证书由内置 CA 签发时填那张 CA 证书（ces tls gateway 给出的 ca.pem）；空＝只用系统证书库
+    ca_file: Path | None = None
     # 监听
     host: str = "127.0.0.1"
     port: int = 8910
@@ -137,6 +139,9 @@ def load(path: Path) -> GatewayConfig:
     url = str(server.get("url") or "").rstrip("/")
     if not url.startswith(("https://", "http://")):
         raise ConfigError("server.url 必须是 http(s) 地址")
+    if "#" in url or "?" in url:
+        raise ConfigError("server.url 只填地址（例如 https://192.168.1.20:8900），不要带连接串里 # 后面的"
+                          "部分；CA 证书另填 server.ca_file")
     conf_name = str(fw.get("conf_name") or "")
     if not conf_name:
         raise ConfigError("framework.conf_name 必填（不再按网卡地址推导）")
@@ -146,6 +151,9 @@ def load(path: Path) -> GatewayConfig:
     tls_key = _path(listen.get("tls_key"), "listen.tls_key", required=False)
     if bool(tls_cert) != bool(tls_key):
         raise ConfigError("listen.tls_cert 与 listen.tls_key 要么都给，要么都不给")
+    ca_file = _path(server.get("ca_file"), "server.ca_file", required=False)
+    if ca_file is not None and not ca_file.is_file():
+        raise ConfigError(f"server.ca_file 不存在：{ca_file}")
     commands = init.get("commands") or []
     if not isinstance(commands, list) or not all(isinstance(c, str) for c in commands):
         raise ConfigError("init_device.commands 必须是字符串列表")
@@ -158,6 +166,7 @@ def load(path: Path) -> GatewayConfig:
         client_id=_safe(server.get("client_id"), "server.client_id"),
         client_secret_file=_path(server.get("client_secret_file"), "server.client_secret_file"),
         build=_safe(server.get("build"), "server.build"),
+        ca_file=ca_file,
         host=str(listen.get("host") or "127.0.0.1"),
         port=int(listen.get("port") or 8910),
         tls_cert=tls_cert,

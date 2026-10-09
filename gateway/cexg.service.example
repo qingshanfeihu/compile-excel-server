@@ -6,7 +6,7 @@ After=network.target
 
 [Service]
 User=test
-ExecStart=/home/test/.local/share/cexg/current/cexg serve --config /home/test/.config/cexg/gateway.toml
+ExecStart=/home/test/.local/share/cexg/current/cexg/cexg serve --config /home/test/.config/cexg/gateway.toml
 Restart=on-failure
 RestartSec=3
 # 上机的 runner（bash → timeout → pytest）是网关起的子进程，与网关同在一个 cgroup；默认的

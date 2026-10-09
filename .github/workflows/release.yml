@@ -28,6 +28,11 @@ jobs:
         with:
           python-version: "3.11"
           architecture: ${{ matrix.pyarch }}
+      - name: Version matches tag
+        run: |
+          version="$(python -c 'import ces_version; print(ces_version.__version__)')"
+          test "v${version}" = "${GITHUB_REF_NAME}" || { echo "ces_version.py 是 ${version}，tag 是 ${GITHUB_REF_NAME}"; exit 1; }
+          grep -q "\"version\": \"${version}\"" gateway/service.py || { echo "gateway/service.py 的版本号没同步"; exit 1; }
       - name: Build onedir
         run: |
           python -m pip install --upgrade pip

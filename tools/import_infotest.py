@@ -39,6 +39,7 @@ import ipaddress
 import json
 import os
 import re
+import ssl
 import stat
 import sys
 import tarfile
@@ -665,11 +666,60 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
+def split_connection_string(value: str) -> tuple[str, str]:
+    """连接串 https://主机:端口#ca=<指纹> 拆成（地址, 64 位小写十六进制指纹）；普通地址指纹为空。"""
+    url, _, fragment = (value or "").strip().partition("#")
+    pin = ""
+    if fragment:
+        key, _, raw = fragment.partition("=")
+        pin = re.sub(r"[\s:]", "", raw.lower().removeprefix("sha256:"))
+        if key != "ca" or not re.fullmatch(r"[0-9a-f]{64}", pin):
+            raise PublishError("--server 的连接串里 #ca= 后面应是 64 位十六进制的 CA 指纹"
+                               "（原样复制服务端 ces link 的输出）")
+    return url.strip(), pin
+
+
+_PEM_BLOCK = re.compile(r"-----BEGIN CERTIFICATE-----([A-Za-z0-9+/=\s]+)-----END CERTIFICATE-----")
+MAX_CA_BYTES = 64 << 10
+
+
+def single_cert_der(text: str) -> bytes:
+    """严格解析：恰好一个证书块、base64 严格解码。ssl.PEM_cert_to_DER_cert 解码不严，拼接两张证书的
+    PEM 会算出第一张的指纹，若再把整份 PEM 装进信任库，第二张（冒充者的 CA）也会被信任。"""
+    if text.count("-----BEGIN ") != 1:
+        raise ValueError("应当只有一张证书")
+    match = _PEM_BLOCK.search(text)
+    if match is None:
+        raise ValueError("不是 PEM 证书")
+    return base64.b64decode(re.sub(r"\s", "", match.group(1)), validate=True)
+
+
+def pinned_ca(url: str, pin: str, *, timeout: float = 30.0) -> ssl.SSLContext:
+    """先不校验证书取 /ca.pem，核对连接串里的指纹；对上了只把这一张 CA（加上系统证书库）用来校验服务端。"""
+    loose = ssl.create_default_context()
+    loose.check_hostname = False
+    loose.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(url + "/ca.pem", timeout=timeout, context=loose) as resp:
+            raw = resp.read(MAX_CA_BYTES + 1)
+        if len(raw) > MAX_CA_BYTES:
+            raise ValueError("回应太大，不是一张 CA 证书")
+        der = single_cert_der(raw.decode("ascii"))
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise PublishError(f"取不到服务端的 CA 证书（{url}/ca.pem）：{exc}") from None
+    if hashlib.sha256(der).hexdigest() != pin:
+        raise PublishError("服务端 CA 证书的指纹与连接串不一致：连接串抄错了，或者连到了别的机器")
+    context = ssl.create_default_context()
+    context.load_verify_locations(cadata=der)  # 用解出的 DER，不用原文
+    return context
+
+
 def check_publish_server(url: str, *, insecure_lan: bool = False) -> str:
     """服务端地址：https 放行；http 只放行回环地址，或显式 --insecure-lan（可信实验网）。
+    也接受连接串（https://主机:端口#ca=<指纹>），这里只核地址部分。
 
     发布方的 client secret 走 Basic 认证、令牌走 Bearer：明文 http 会让同网段的人直接拿到。"""
-    url = (url or "").strip().rstrip("/")
+    url = split_connection_string(url)[0].rstrip("/")
     parts = urllib.parse.urlsplit(url)
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise PublishError(f"--server 必须是 http(s) 地址：{url!r}")
@@ -689,13 +739,16 @@ class Publisher:
         self._secret = client_secret
         self.timeout = timeout
         self._token = ""
+        # 连接串带 #ca= 时：服务端用内置 CA，先核对指纹再信任它
+        pin = split_connection_string(server)[1]
+        self._ssl = pinned_ca(self.server, pin) if pin else None
 
     def _request(self, method: str, path: str, *, data: bytes | None = None,
                  headers: dict[str, str] | None = None) -> tuple[int, bytes]:
         req = urllib.request.Request(self.server + path, data=data, method=method,
                                      headers=headers or {})
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=self.timeout, context=self._ssl) as resp:
                 return resp.status, resp.read()
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
@@ -840,7 +893,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--infotest-root", required=True)
     parser.add_argument("--device-build", required=True,
                         help="设备 show version 的完整版本串（与该床批入口用的一致）")
-    parser.add_argument("--server", default="")
+    parser.add_argument("--server", default="",
+                        help="服务端地址，或服务端 ces link 显示的连接串（带 #ca= 时自动核对证书）")
     parser.add_argument("--client-id", default="publisher")
     parser.add_argument("--client-secret-file", default="")
     parser.add_argument("--spec-sync-timeout", type=int, default=180)

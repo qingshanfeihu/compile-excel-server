@@ -12,10 +12,7 @@
 --sample 额外调用 sample_data.py 生成合成工件与手册（用于自测/冒烟，
 不含任何内部资产）。
 
-真实资产接入（2.90 或内网部署）：
-- 把晋升的 excel 模板 / 框架子集 tar / xml 命令树等放入 data/artifacts/；
-- data/artifacts_meta.json 填 device_build 与每工件 version/media_type/receipt；
-- data/docs/ 放知识库 markdown。
+手册与旧版工件装好后用管理菜单（ces → 手册与旧版工件）导入，或 ces docs add / ces artifacts add。
 """
 
 from __future__ import annotations
@@ -51,21 +48,18 @@ def provision(data_dir: Path, *, sample: bool) -> int:
 
     key_path = data_dir / "audit_hmac_key"
     if key_path.exists():
-        print(f"已存在（不动）: {key_path}")
+        print(f"审计签名密钥已存在，沿用：{key_path}")
     else:
         key_path.write_text(secrets.token_hex(32) + "\n", encoding="utf-8")
         os.chmod(key_path, 0o600)
-        print(f"已生成审计签名密钥: {key_path}（600；勿提交勿外传）")
+        print(f"已生成审计签名密钥：{key_path}（只有你能读，不要外传）")
 
     meta_path = data_dir / "artifacts_meta.json"
-    if meta_path.exists():
-        print(f"已存在（不动）: {meta_path}")
-    else:
+    if not meta_path.exists():  # 旧版工件清单的骨架；导入工件时（ces artifacts add）补全
         meta_path.write_text(
             json.dumps(META_SKELETON, ensure_ascii=False, indent=1) + "\n",
             encoding="utf-8")
         os.chmod(meta_path, 0o600)
-        print(f"已写元数据骨架: {meta_path}（按实际构建填写 device_build/artifacts）")
 
     if sample:
         rc = os.system(f"{sys.executable} '{REPO_ROOT / 'deploy' / 'sample_data.py'}' "
@@ -75,8 +69,7 @@ def provision(data_dir: Path, *, sample: bool) -> int:
             return 1
 
     mode = stat.S_IMODE(os.stat(data_dir).st_mode)
-    print(f"数据目录就绪: {data_dir} (mode={oct(mode)})。"
-          "灌入真实工件/手册后启动：python3 server.py --data <目录>")
+    print(f"数据目录就绪：{data_dir}（权限 {oct(mode)[2:]}）")
     return 0
 
 

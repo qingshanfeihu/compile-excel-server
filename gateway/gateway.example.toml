@@ -1,19 +1,29 @@
 # cexg 网关配置样例。复制成 gateway.toml 后按跳板机实际情况填写；路径一律写绝对路径。
-# 网关不读任何 environment 文件：迁移表里“跳板机本机路径”那一组都在这里。
+# 网关不读任何 environment 文件，跳板机本机的路径都写在这里。
+#
+# 服务端要准备的三样东西（在服务端运行 ces，菜单里都有）：
+#   1. 网关客户端密钥：服务客户端 → 新建网关客户端（ces clients add gateway ...）
+#   2. 网关证书：连接与证书 → 为跳板机网关签发证书（ces tls gateway <跳板机地址> --out <目录>）
+#      会得到 gateway.pem、gateway.key、ca.pem 三个文件
+#   3. 下发网关地址给用户：客户端配置 → 设置 gateway.url（ces config set gateway.url https://<跳板机>:8910/mcp）
+# 把密钥文件和三个证书文件拷到跳板机（权限 600），按下面的注释填路径。
 
 [server]
-# compile-excel-server 地址；网关用自己的客户端身份做令牌内省、取数据包里的规则文件
-url = "https://ces.example.test"
+# compile-excel-server 地址（不带连接串里 # 后面的部分）；网关用自己的客户端身份核验用户登录、取规则文件
+url = "https://ces.example.test:8900"
 client_id = "gateway"
-# ces clients add gateway --scopes "introspect bundles:read" --out <这个文件>；权限必须 0600
+# 网关客户端密钥文件；权限必须 600
 client_secret_file = "/home/test/.config/cexg/client.secret"
+# 服务端用内置 CA 时填 ca.pem（ces tls gateway 给出的）；服务端用正式证书时留空
+ca_file = ""
 # 这张床对应的执行构建名（数据包按它发布；env_prepare 核对设备自述版本与它一致）
 build = "SAMPLE_BUILD_LOCAL"
 
 [listen]
 host = "127.0.0.1"
 port = 8910
-# 监听非回环地址必须配 TLS；受信任的实验网可设 insecure_lan = true
+# 监听非回环地址（0.0.0.0）必须配证书：填 ces tls gateway 给出的 gateway.pem / gateway.key；
+# 受信任的实验网暂时没有证书时可设 insecure_lan = true（明文）
 tls_cert = ""
 tls_key = ""
 insecure_lan = false

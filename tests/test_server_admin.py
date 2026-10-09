@@ -3,7 +3,7 @@
 覆盖：改动身份/配置/注册表的管理命令写进服务端审计链，且与服务进程交替写入后链照样完整；
 `ces audit rotate [--new-key]` 封存旧段、换钥后 `ces audit verify` 仍通过，篡改旧段或删掉旧段密钥
 能被发现；一次性凭据先落文件再改库（--out 写不了就不建账号、不覆盖已有文件）；client secret 轮换；
-systemd unit 写 User= 且参数加引号；安装向导断点续填不丢 TLS 答案。
+systemd unit 写 User= 且参数加引号。（向导的断点续填见 test_onboarding.py）
 """
 
 from __future__ import annotations
@@ -186,24 +186,3 @@ def test_systemd_unit_names_the_account_and_quotes_arguments(monkeypatch, tmp_pa
     parsed = plistlib.loads(plist.encode("utf-8"))
     assert str(tmp_path / "a&b<c>") in parsed["ProgramArguments"]
     assert parsed["StandardOutPath"] == f"{tmp_path / 'a&b<c>'}/server.log"
-
-
-@pytest.mark.parametrize("tls", [
-    {"tls_cert": "/etc/ces/cert.pem", "tls_key": "/etc/ces/key.pem", "insecure_lan": ""},
-    {"tls_cert": "", "tls_key": "", "insecure_lan": "y"},
-])
-def test_wizard_resume_keeps_tls_answers(tmp_path, monkeypatch, tls):
-    from deploy import setup as setup_mod
-
-    draft_path = tmp_path / "wizard.draft.json"
-    monkeypatch.setattr(setup_mod, "CONFIG_ROOT", tmp_path)
-    monkeypatch.setattr(setup_mod, "DRAFT_PATH", draft_path)
-    draft_path.write_text(json.dumps({
-        "progress": 7, "data": str(tmp_path / "d"), "device_build": "B", "kms": "",
-        "port": "8900", "host": "0.0.0.0", **tls, "force": "n", "start": "n",
-        "artifacts": [], "docs": []}), encoding="utf-8")
-    answers = iter(["y", "y"])  # 从断点继续？确认部署？
-    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
-    state = setup_mod.wizard()
-    for key, value in tls.items():
-        assert state[key] == value, key

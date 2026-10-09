@@ -437,6 +437,26 @@ class Registry:
                          "meta": json.loads(r["meta_json"])} for r in rows],
         }
 
+    def list_bundles(self, build: str) -> list[dict[str, Any]]:
+        """某个构建的全部包，新的在前；回滚时从这里挑一个自检通过的旧包。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT b.bundle_id, b.created_at, b.publisher, b.checks_json,"
+                " (SELECT COUNT(*) FROM entries e WHERE e.bundle_id=b.bundle_id) AS n"
+                " FROM bundles b WHERE b.build=? ORDER BY b.created_at DESC, b.bundle_id",
+                (build,)).fetchall()
+            pointers = conn.execute("SELECT channel, bundle_id FROM channels WHERE build=?",
+                                    (build,)).fetchall()
+        channels: dict[str, list[str]] = {}
+        for row in pointers:
+            channels.setdefault(row["bundle_id"], []).append(row["channel"])
+        return [{"bundle_id": row["bundle_id"],
+                 "created_at": time.strftime("%Y-%m-%d %H:%M", time.localtime(row["created_at"])),
+                 "publisher": row["publisher"],
+                 "checks_ok": bool(json.loads(row["checks_json"]).get("ok")),
+                 "entries": row["n"],
+                 "channels": sorted(channels.get(row["bundle_id"], []))} for row in rows]
+
     def list_builds(self) -> list[dict[str, Any]]:
         with self._conn() as conn:
             builds = conn.execute("SELECT build, created_at FROM builds ORDER BY build").fetchall()

@@ -25,16 +25,17 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-# 权限面：服务端各路由与网关按这张表校验（网关经 introspect 拿到 scope）
+# 权限面：服务端各路由与网关按这张表校验（网关经 introspect 拿到 scope）。
+# 说明文字会显示在授权页和管理菜单里，写给使用者看
 SCOPES: dict[str, str] = {
-    "artifacts:read": "旧版工件清单与下载",
-    "docs:query": "知识库检索",
-    "bundles:read": "读取数据包与 blob",
-    "bundles:publish": "发布数据包、切换通道（导入器/生成器用）",
-    "config:read": "读取组织下发的客户端常量",
-    "jumphost:run": "经网关租床、部署环境、提交用例",
-    "jumphost:admin": "经网关初始化设备（两步确认）",
-    "introspect": "令牌内省（网关用）",
+    "artifacts:read": "下载旧版工件",
+    "docs:query": "检索手册",
+    "bundles:read": "下载编译数据",
+    "bundles:publish": "发布编译数据（发布器用）",
+    "config:read": "读取组织配置（网关、门户等地址）",
+    "jumphost:run": "在跳板机上租床、跑用例",
+    "jumphost:admin": "初始化设备（管理员权限）",
+    "introspect": "核验登录令牌（网关用）",
 }
 DEFAULT_USER_SCOPES = ("artifacts:read", "docs:query", "bundles:read", "config:read",
                        "jumphost:run")

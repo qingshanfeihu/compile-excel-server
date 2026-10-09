@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import ssl
 import threading
 import time
 import urllib.error
@@ -24,13 +25,27 @@ class IntrospectError(RuntimeError):
     pass
 
 
+def _unreachable(exc: BaseException) -> IntrospectError:
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return IntrospectError(
+            "服务端证书不受信任：在 gateway.toml 的 [server] ca_file 填服务端的 CA 证书"
+            "（服务端运行 ces tls gateway 会一并给出 ca.pem）")
+    return IntrospectError(f"server unreachable ({type(exc).__name__})")
+
+
 class ServerClient:
     def __init__(self, server_url: str, client_id: str, secret_file: Path, *,
-                 timeout: float = 15.0):
+                 timeout: float = 15.0, ca_file: Path | None = None):
         self.server_url = server_url.rstrip("/")
         self.client_id = client_id
         self.secret_file = Path(secret_file)
         self.timeout = timeout
+        # 服务端用内置 CA 签的证书时，网关要额外信任那张 CA（系统证书库照常信任）
+        self._ssl = None
+        if ca_file is not None:
+            self._ssl = ssl.create_default_context()
+            self._ssl.load_verify_locations(cafile=str(ca_file))
         self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._lock = threading.Lock()
 
@@ -50,7 +65,7 @@ class ServerClient:
             headers={"Authorization": self._basic(),
                      "Content-Type": "application/x-www-form-urlencoded"}, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=self.timeout, context=self._ssl) as resp:
                 return resp.status, json.loads(resp.read() or b"{}")
         except urllib.error.HTTPError as exc:
             try:
@@ -59,7 +74,7 @@ class ServerClient:
                 body = {}
             return exc.code, body
         except (urllib.error.URLError, OSError, ValueError) as exc:
-            raise IntrospectError(f"server unreachable ({type(exc).__name__})") from None
+            raise _unreachable(exc) from None
 
     def introspect(self, token: str) -> dict[str, Any]:
         key = hashlib.sha256(token.encode()).hexdigest()
@@ -92,12 +107,13 @@ class ServerClient:
         def get(url: str) -> bytes:
             req = urllib.request.Request(self.server_url + url, headers=headers)
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                with urllib.request.urlopen(req, timeout=self.timeout,
+                                            context=self._ssl) as resp:
                     return resp.read()
             except urllib.error.HTTPError as exc:
                 raise IntrospectError(f"GET {url} failed (HTTP {exc.code})") from None
             except (urllib.error.URLError, OSError) as exc:
-                raise IntrospectError(f"server unreachable ({type(exc).__name__})") from None
+                raise _unreachable(exc) from None
 
         manifest = json.loads(get(f"/v1/builds/{urllib.parse.quote(build)}/bundle"))
         entry = next((e for e in manifest.get("entries") or [] if e.get("path") == path), None)
