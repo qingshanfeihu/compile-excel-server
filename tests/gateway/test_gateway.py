@@ -182,16 +182,15 @@ def test_submit_needs_a_current_lease_and_rejects_gated_workbooks(fake_env, tmp_
     refused = gw.call(ALICE, "case_submit", {**lease, "xlsx_b64": b64})
     assert refused["ok"] is False and refused["problems"]
     assert not list((fake_env["apv"] / "smoke_test" / "sdns").rglob("case.xlsx")), "被拒的不落位"
-    # 服务端不可达：有上次取到的规则缓存就用缓存；缓存也没有就拒绝
-    fake_env["server"].grammar = None
-    cache = gw.cfg.state_dir / "domain_grammar.json"
-    assert cache.is_file()
-    cache.unlink()
+    # 规则文件是跳板机本地的：被拿走就拒绝上机，不拿上一次读到的内容凑数
+    rules = gw.cfg.grammar_file
+    assert rules.is_file()
+    rules.unlink()
     clean = make_workbook(tmp_path / "d.xlsx", [
         ("202609240000000032", "APV_1", "cmd", "show version")])
     no_rules = gw.call(ALICE, "case_submit", {**lease,
                                               "xlsx_b64": base64.b64encode(clean).decode()})
-    assert no_rules["ok"] is False and "unreachable" in no_rules["error"]
+    assert no_rules["ok"] is False and "rules file missing" in no_rules["error"]
     assert gw.call(BOB, "lease_acquire", {})["ok"] is False
 
 

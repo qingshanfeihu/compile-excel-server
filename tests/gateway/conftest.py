@@ -136,27 +136,17 @@ for raw in sys.stdin:
 '''
 
 
-class FakeServer:
-    """鸭子类型的 ServerClient：令牌表 + 规则文件。"""
+# hub 的两把静态密钥（明文只在测试里）：普通一把带 jumphost:run，管理一把另带 jumphost:admin
+RUN_TOKEN = "run-token"
+ADMIN_TOKEN = "admin-token"
 
-    def __init__(self):
-        self.tokens = {
-            "run-token": {"active": True, "username": "alice", "scope": "jumphost:run"},
-            "admin-token": {"active": True, "username": "root",
-                            "scope": "jumphost:run jumphost:admin"},
-            "bob-token": {"active": True, "username": "bob", "scope": "jumphost:run"},
-        }
-        self.grammar = GRAMMAR
 
-    def introspect(self, token):
-        return self.tokens.get(token, {"active": False})
+def write_secret_digest(path: Path, secret: str) -> Path:
+    from gateway.auth import secret_digest
 
-    def fetch_bundle_file(self, build, path):
-        from gateway.introspect import IntrospectError
-
-        if self.grammar is None:
-            raise IntrospectError("server unreachable (test)")
-        return json.dumps(self.grammar).encode()
+    path.write_text(secret_digest(secret) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    return path
 
 
 @pytest.fixture()
@@ -184,15 +174,16 @@ def fake_env(tmp_path, monkeypatch):
         """), encoding="utf-8")
     fake_cu = tmp_path / "fake_cu.py"
     fake_cu.write_text(FAKE_CU, encoding="utf-8")
-    secret = tmp_path / "client.secret"
-    secret.write_text("s", encoding="utf-8")
-    secret.chmod(0o600)
+    secret = write_secret_digest(tmp_path / "hub.secret.sha256", RUN_TOKEN)
+    admin_secret = write_secret_digest(tmp_path / "hub.admin.sha256", ADMIN_TOKEN)
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "domain_grammar.json").write_text(json.dumps(GRAMMAR), encoding="utf-8")
     config = tmp_path / "gateway.toml"
     config.write_text(textwrap.dedent(f"""\
-        [server]
-        url = "http://127.0.0.1:1"
-        client_id = "gateway"
-        client_secret_file = "{secret}"
+        [hub]
+        secret_sha256_file = "{secret}"
+        admin_secret_sha256_file = "{admin_secret}"
         build = "{BUILD}"
         [framework]
         apv_src = "{apv}"
@@ -215,10 +206,9 @@ def fake_env(tmp_path, monkeypatch):
     from gateway.config import load
     from gateway.tools import Gateway
 
-    server = FakeServer()
-    gateway = Gateway(load(config), server=server)
-    return {"gateway": gateway, "server": server, "apv": apv, "config": config,
-            "tmp": tmp_path}
+    gateway = Gateway(load(config))
+    return {"gateway": gateway, "apv": apv, "config": config, "tmp": tmp_path,
+            "secret_file": secret, "admin_secret_file": admin_secret}
 
 
 def make_workbook(path: Path, rows: list[tuple[str, str, str, str]]) -> bytes:

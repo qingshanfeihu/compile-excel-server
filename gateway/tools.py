@@ -14,18 +14,16 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 from . import console, framework, gates
 from .audit_chain import AuditChain
+from .auth import Caller, StaticSecretAuth  # noqa: F401 — Caller 在这里再导出，service 与测试从这里取
 from .config import GatewayConfig
-from .introspect import IntrospectError, ServerClient
 from .state import LeaseError, StateStore
 from .vendor.credential_literals import MirrorCredentialLiteralError, mirror_credential_literals
 
-GRAMMAR_PATH = "projections/domain_grammar.json"
 LITERALS_TTL_S = 600
 RUNNER_LOST = ("the runner exited without recording an end (killed by a gateway restart, OOM or "
                "an operator); this run produced no verdicts to read - resubmit the workbook")
@@ -47,12 +45,6 @@ def mysql_safe_build(raw: str) -> str:
     if s and s[0].isdigit():
         s = "b_" + s
     return s
-
-
-@dataclass
-class Caller:
-    subject: str
-    scopes: frozenset[str]
 
 
 LEASE_PROPS = {
@@ -159,12 +151,12 @@ TOOL_SPECS: list[dict[str, Any]] = [
 
 
 class Gateway:
-    def __init__(self, cfg: GatewayConfig, server: ServerClient | None = None):
+    def __init__(self, cfg: GatewayConfig, auth: StaticSecretAuth | None = None):
         self.cfg = cfg
         self.state = StateStore(cfg.state_dir, cfg.lease_ttl_s)
-        self.server = server or ServerClient(cfg.server_url, cfg.client_id, cfg.client_secret_file,
-                                             ca_file=cfg.ca_file)
+        self.auth = auth or StaticSecretAuth.from_config(cfg)
         self._grammar_lock = threading.Lock()
+        self._grammar: tuple[tuple[int, int], dict[str, Any]] | None = None
         self._literals: tuple[float, frozenset[str]] | None = None
         self.audit_path = cfg.state_dir / "audit.log"
         self._audit = AuditChain(self.audit_path)
@@ -193,8 +185,7 @@ class Gateway:
             return {"ok": False, "error": "arguments must be an object"}
         try:
             result = self.handlers[name](caller, args)
-        except (LeaseError, ToolError, gates.GateError, framework.FrameworkError,
-                IntrospectError) as exc:
+        except (LeaseError, ToolError, gates.GateError, framework.FrameworkError) as exc:
             secrets = self.secrets()
             problems = getattr(exc, "problems", None)
             self.audit("tool_refused", tool=name, subject=caller.subject,
@@ -208,18 +199,25 @@ class Gateway:
         return self.state.check(caller.subject, str(args.get("lease_id") or ""), args.get("token"))
 
     def grammar(self) -> dict[str, Any]:
-        """自毁规则等文法：从服务端 stable 包取，缓存到状态目录；取不到且无缓存就拒绝。"""
-        cache = self.cfg.state_dir / "domain_grammar.json"
+        """自毁规则等文法：跳板机本地文件（hub.grammar_file），由运维随 hub 的规则资产更新，按 mtime 重读。
+        文件不在或不是 JSON 就拒绝上机，不猜。"""
+        path = self.cfg.grammar_file
         with self._grammar_lock:
             try:
-                data = self.server.fetch_bundle_file(self.cfg.build, GRAMMAR_PATH)
-                tmp = cache.with_suffix(".tmp")
-                tmp.write_bytes(data)
-                tmp.replace(cache)
-            except IntrospectError:
-                if not cache.is_file():
-                    raise
-            return json.loads(cache.read_text(encoding="utf-8"))
+                info = path.stat()
+            except OSError:
+                raise ToolError(f"rules file missing on the jumphost: {path} (publish the hub's "
+                                "rule asset there before submitting)") from None
+            key = (info.st_mtime_ns, info.st_size)
+            if self._grammar is None or self._grammar[0] != key:
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except ValueError as exc:
+                    raise ToolError(f"rules file is not valid JSON: {path} ({exc})") from None
+                if not isinstance(data, dict):
+                    raise ToolError(f"rules file must be a JSON object: {path}")
+                self._grammar = (key, data)
+            return self._grammar[1]
 
     def credential_literals(self) -> frozenset[str]:
         """框架 lib/ 与 smoke_test/ 源码里的凭据字面量（与 InfoTest 镜像同一范围）。

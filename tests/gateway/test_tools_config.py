@@ -54,7 +54,7 @@ def test_bed_services_come_from_the_config_and_ride_on_bed_topology(fake_env, tm
         {"host": "server232", "ip": "192.0.2.232", "proto": "dns", "port": 53, "note": ""})
     monkeypatch.setattr(bed, "collect", lambda cfg, **_kw: {
         "topology": {"devices": []}, "sha256": "a" * 64, "rag_md": "", "observation": {}})
-    gw = Gateway(cfg, server=fake_env["server"])
+    gw = Gateway(cfg)
     lease = _lease(gw)
     fresh = gw.call(ALICE, "bed_topology", {**lease, "refresh": True})
     cached = gw.call(ALICE, "bed_topology", lease)

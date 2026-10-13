@@ -1,6 +1,7 @@
 """网关 HTTP 服务：MCP streamable HTTP 的请求/应答子集（POST /mcp，JSON-RPC 2.0），只用标准库。
 
-- 每个请求都要 `Authorization: Bearer <用户令牌>`，经服务端 /v1/introspect 确认有效、取 scope；
+- 每个请求都要 `Authorization: Bearer <hub 的静态密钥>`，网关本地比对 SHA-256（gateway/auth.py），不回调
+  任何服务端；可带 X-Circle-Hub-Actor 说明替谁执行，只进审计和租约持有人；
 - 监听非回环地址时必须配 TLS（config 加载时已检查）；TLS 握手在每个连接自己的线程里做、带超时——
   放在 accept() 里做，一个只连不说话的 TCP 连接就能卡住整个监听；
 - GET /healthz 不鉴权，只回 ok，不泄露任何床状态。
@@ -13,11 +14,11 @@ import ssl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from .introspect import IntrospectError
+from .auth import ACTOR_HEADER, ActorError, AuthError
 from .tools import TOOL_SPECS, Caller, Gateway
 
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "compile-excel-gateway", "version": "0.2.0"}
+SERVER_INFO = {"name": "compile-excel-gateway", "version": "0.3.0"}
 MAX_BODY = 64 * 1024 * 1024
 HANDSHAKE_TIMEOUT_S = 10.0
 IDLE_TIMEOUT_S = 60.0
@@ -101,14 +102,7 @@ def make_handler(gateway: Gateway) -> type[BaseHTTPRequestHandler]:
             header = self.headers.get("Authorization") or ""
             if not header.lower().startswith("bearer "):
                 return None
-            try:
-                info = gateway.server.introspect(header[7:].strip())
-            except IntrospectError:
-                raise
-            if not info.get("active"):
-                return None
-            return Caller(subject=str(info.get("username") or info.get("sub") or ""),
-                          scopes=frozenset(str(info.get("scope") or "").split()))
+            return gateway.auth.caller(header[7:].strip(), self.headers.get(ACTOR_HEADER))
 
         def do_POST(self) -> None:  # noqa: N802
             if self.path != "/mcp":
@@ -116,8 +110,11 @@ def make_handler(gateway: Gateway) -> type[BaseHTTPRequestHandler]:
                 return
             try:
                 caller = self._caller()
-            except IntrospectError as exc:
-                self._send(503, {"error": f"cannot verify token: {exc}"})
+            except AuthError as exc:
+                self._send(503, {"error": f"gateway auth is misconfigured: {exc}"})
+                return
+            except ActorError:
+                self._send(400, {"error": f"bad {ACTOR_HEADER}"})
                 return
             if caller is None or not caller.subject:
                 self._send(401, {"error": "missing, invalid or expired bearer token"},

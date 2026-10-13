@@ -22,13 +22,14 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True)
 class GatewayConfig:
-    # 身份：向 compile-excel-server 内省令牌、取数据包
-    server_url: str
-    client_id: str
-    client_secret_file: Path
+    # 这张床对应的执行构建名（env_prepare 核对设备自述版本与它一致）
     build: str
-    # 服务端证书由内置 CA 签发时填那张 CA 证书（ces tls gateway 给出的 ca.pem）；空＝只用系统证书库
-    ca_file: Path | None = None
+    # 调用方只有 circle-hub 的 worker：本地比对静态密钥的 SHA-256，不回调任何服务端
+    hub_secret_file: Path
+    hub_admin_secret_file: Path | None = None
+    hub_subject: str = "circle-hub"
+    # 自毁规则等文法：跳板机本地文件，由运维随 hub 的规则资产更新；不配就是 <state.dir>/domain_grammar.json
+    grammar_file: Path = Path()
     # 监听
     host: str = "127.0.0.1"
     port: int = 8910
@@ -127,7 +128,10 @@ def load(path: Path) -> GatewayConfig:
         raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError(f"读不了配置 {path}：{exc}") from None
-    server = raw.get("server") or {}
+    if raw.get("server"):
+        raise ConfigError("[server] 已废弃：网关不再回调服务端（不内省令牌、不取数据包）。改用 [hub]："
+                          "secret_sha256_file 与 build 必填；样例见 cexg sample-config")
+    hub = raw.get("hub") or {}
     listen = raw.get("listen") or {}
     fw = raw.get("framework") or {}
     state = raw.get("state") or {}
@@ -136,12 +140,6 @@ def load(path: Path) -> GatewayConfig:
     init = raw.get("init_device") or {}
     bed = raw.get("bed") or {}
 
-    url = str(server.get("url") or "").rstrip("/")
-    if not url.startswith(("https://", "http://")):
-        raise ConfigError("server.url 必须是 http(s) 地址")
-    if "#" in url or "?" in url:
-        raise ConfigError("server.url 只填地址（例如 https://192.168.1.20:8900），不要带连接串里 # 后面的"
-                          "部分；CA 证书另填 server.ca_file")
     conf_name = str(fw.get("conf_name") or "")
     if not conf_name:
         raise ConfigError("framework.conf_name 必填（不再按网卡地址推导）")
@@ -151,9 +149,9 @@ def load(path: Path) -> GatewayConfig:
     tls_key = _path(listen.get("tls_key"), "listen.tls_key", required=False)
     if bool(tls_cert) != bool(tls_key):
         raise ConfigError("listen.tls_cert 与 listen.tls_key 要么都给，要么都不给")
-    ca_file = _path(server.get("ca_file"), "server.ca_file", required=False)
-    if ca_file is not None and not ca_file.is_file():
-        raise ConfigError(f"server.ca_file 不存在：{ca_file}")
+    state_dir = _path(state.get("dir"), "state.dir")
+    grammar_file = (_path(hub.get("grammar_file"), "hub.grammar_file", required=False)
+                    or state_dir / "domain_grammar.json")
     commands = init.get("commands") or []
     if not isinstance(commands, list) or not all(isinstance(c, str) for c in commands):
         raise ConfigError("init_device.commands 必须是字符串列表")
@@ -162,11 +160,12 @@ def load(path: Path) -> GatewayConfig:
         raise ConfigError("init_device.long_commands 必须是 {命令: 秒数}")
     console = device.get("console_command") or ["cu", "-s", "9600", "-l", "{tty}"]
     cfg = GatewayConfig(
-        server_url=url,
-        client_id=_safe(server.get("client_id"), "server.client_id"),
-        client_secret_file=_path(server.get("client_secret_file"), "server.client_secret_file"),
-        build=_safe(server.get("build"), "server.build"),
-        ca_file=ca_file,
+        build=_safe(hub.get("build"), "hub.build"),
+        hub_secret_file=_path(hub.get("secret_sha256_file"), "hub.secret_sha256_file"),
+        hub_admin_secret_file=_path(hub.get("admin_secret_sha256_file"),
+                                    "hub.admin_secret_sha256_file", required=False),
+        hub_subject=_safe(hub.get("subject") or "circle-hub", "hub.subject"),
+        grammar_file=grammar_file,
         host=str(listen.get("host") or "127.0.0.1"),
         port=int(listen.get("port") or 8910),
         tls_cert=tls_cert,
@@ -178,7 +177,7 @@ def load(path: Path) -> GatewayConfig:
         staging_parent=_path(fw.get("staging_parent"), "framework.staging_parent"),
         default_module=_safe(fw.get("default_module"), "framework.default_module"),
         run_max_s=int(fw.get("run_max_s") or 2400),
-        state_dir=_path(state.get("dir"), "state.dir"),
+        state_dir=state_dir,
         lease_ttl_s=int(state.get("lease_ttl_s") or 1800),
         mysql_password_file=_path(results.get("mysql_password_file"),
                                   "results.mysql_password_file", required=False),

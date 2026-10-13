@@ -195,24 +195,6 @@ def test_gateway_cert_comes_from_the_same_ca(tmp_path, cfg_env):
 
     shown = _ces(cfg_env, "tls", "show").stdout
     assert "内置 CA 签发" in shown and "CA 指纹" in shown
-
-
-def test_gateway_trusts_the_server_ca_from_its_config(tmp_path):
-    from gateway import introspect
-    from gateway.config import ConfigError, load
-
-    sample = (REPO_ROOT / "gateway" / "gateway.example.toml").read_text(encoding="utf-8")
-    secret = tmp_path / "client.secret"
-    secret.write_text("x\n", encoding="utf-8")
-    text = (sample.replace("/home/test/.config/cexg/client.secret", str(secret))
-            .replace('ca_file = ""', f'ca_file = "{tmp_path / "missing.pem"}"'))
-    (tmp_path / "gw.toml").write_text(text, encoding="utf-8")
-    with pytest.raises(ConfigError, match="ca_file"):
-        load(tmp_path / "gw.toml")
-    message = str(introspect._unreachable(ssl.SSLCertVerificationError("self-signed")))
-    assert "ca_file" in message
-
-
 # ── 授权页 ───────────────────────────────────────────────
 def test_activate_page_shows_the_code_once_and_scopes_in_plain_words(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient

@@ -39,8 +39,13 @@ def cmd_check(config: Path) -> int:
     except ConfigError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
         return 2
+    from gateway.auth import check_secret_file
+
     gateway = Gateway(cfg)
     checks = []
+    checks.append({"check": "hub_secret", **check_secret_file(cfg.hub_secret_file)})
+    if cfg.hub_admin_secret_file:
+        checks.append({"check": "hub_admin_secret", **check_secret_file(cfg.hub_admin_secret_file)})
     checks.append({"check": "py38", "ok": cfg.py38.is_file()})
     checks.append({"check": "test_xlsx", "ok": (cfg.apv_src / "lib" / "test_xlsx.py").is_file()})
     try:
@@ -50,9 +55,9 @@ def cmd_check(config: Path) -> int:
         checks.append({"check": "conf", "ok": False, "error": str(exc)})
     try:
         gateway.grammar()
-        checks.append({"check": "bundle_grammar", "ok": True})
+        checks.append({"check": "grammar_file", "ok": True, "path": str(cfg.grammar_file)})
     except Exception as exc:  # noqa: BLE001
-        checks.append({"check": "bundle_grammar", "ok": False, "error": str(exc)})
+        checks.append({"check": "grammar_file", "ok": False, "error": str(exc)})
     ok = all(c["ok"] for c in checks)
     print(json.dumps({"ok": ok, "checks": checks}, ensure_ascii=False, indent=1))
     return 0 if ok else 1

@@ -1,28 +1,31 @@
 # cexg 网关配置样例。复制成 gateway.toml 后按跳板机实际情况填写；路径一律写绝对路径。
 # 网关不读任何 environment 文件，跳板机本机的路径都写在这里。
 #
-# 服务端要准备的三样东西（在服务端运行 ces，菜单里都有）：
-#   1. 网关客户端密钥：服务客户端 → 新建网关客户端（ces clients add gateway ...）
-#   2. 网关证书：连接与证书 → 为跳板机网关签发证书（ces tls gateway <跳板机地址> --out <目录>）
-#      会得到 gateway.pem、gateway.key、ca.pem 三个文件
-#   3. 下发网关地址给用户：客户端配置 → 设置 gateway.url（ces config set gateway.url https://<跳板机>:8910/mcp）
-# 把密钥文件和三个证书文件拷到跳板机（权限 600），按下面的注释填路径。
+# 网关只有一个调用方：circle-hub 的 worker。它拿一把静态密钥来调用，网关本地比对密钥的 SHA-256，
+# 不回调任何服务端。要准备的三样东西：
+#   1. 密钥：`openssl rand -hex 32`。明文登记到 hub 的执行资源（凭据模式 static-secret）；跳板机上只放
+#      它的 SHA-256，一行 64 位十六进制，权限 600：
+#        printf '%s' '<明文>' | sha256sum | cut -d' ' -f1 > ~/.config/cexg/hub.secret.sha256
+#      换密钥就是换这个文件的内容，不用重启网关。
+#   2. 网关证书：由实验室 CA 签发（gateway.crt / gateway.key）；hub 的执行 profile 里信任那张 CA。
+#   3. 规则文件：hub 的规则资产（domain_grammar.json）放到 hub.grammar_file；不配就用状态目录里的那份。
 
-[server]
-# compile-excel-server 地址（不带连接串里 # 后面的部分）；网关用自己的客户端身份核验用户登录、取规则文件
-url = "https://ces.example.test:8900"
-client_id = "gateway"
-# 网关客户端密钥文件；权限必须 600
-client_secret_file = "/home/test/.config/cexg/client.secret"
-# 服务端用内置 CA 时填 ca.pem（ces tls gateway 给出的）；服务端用正式证书时留空
-ca_file = ""
-# 这张床对应的执行构建名（数据包按它发布；env_prepare 核对设备自述版本与它一致）
+[hub]
+# 密钥摘要文件（SHA-256 十六进制）；权限必须 600
+secret_sha256_file = "/home/test/.config/cexg/hub.secret.sha256"
+# 可选：另一把密钥，带 jumphost:admin（init_device 用）；hub 只在设备初始化时拿它调用。留空 = 不开
+admin_secret_sha256_file = ""
+# 审计里的调用方名字；hub 可带 X-Circle-Hub-Actor 头说明替谁执行，只进审计和租约持有人
+subject = "circle-hub"
+# 这张床对应的执行构建名（env_prepare 核对设备自述版本与它一致）
 build = "SAMPLE_BUILD_LOCAL"
+# 自毁规则等文法；留空 = <state.dir>/domain_grammar.json
+grammar_file = ""
 
 [listen]
 host = "127.0.0.1"
 port = 8910
-# 监听非回环地址（0.0.0.0）必须配证书：填 ces tls gateway 给出的 gateway.pem / gateway.key；
+# 监听非回环地址（0.0.0.0）必须配证书：填实验室 CA 签发的 gateway.crt / gateway.key；
 # 受信任的实验网暂时没有证书时可设 insecure_lan = true（明文）
 tls_cert = ""
 tls_key = ""

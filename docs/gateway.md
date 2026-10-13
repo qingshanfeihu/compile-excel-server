@@ -1,6 +1,6 @@
 # 跳板机网关（cexg）
 
-网关装在跳板机上，以测试框架所在的用户身份运行。它把“上机”变成几个需要登录的工具（编译助手通过 `POST /mcp` 调用）：租床、准备环境、提交用例、取结果、只读探测、初始化设备。跳板机和设备的口令只存在跳板机上（网关读框架的 conf），用户电脑上只有自己的登录令牌。
+网关装在跳板机上，以测试框架所在的用户身份运行。它把“上机”变成几个工具（circle-hub 的 worker 通过 `POST /mcp` 调用）：租床、准备环境、提交用例、取结果、只读探测、初始化设备。跳板机和设备的口令只存在跳板机上（网关读框架的 conf）。网关只有一个调用方——hub 的 worker，它拿一把静态密钥来调用，网关本地比对密钥的 SHA-256，不回调任何服务端；谁能用 hub、能做什么，由 hub 自己决定。
 
 ## 安装
 
@@ -8,7 +8,7 @@
 
 实验室的跳板机通常上不了外网，所以用离线安装：
 
-1. 在能上网的电脑上，从 [发布页](https://github.com/qingshanfeihu/compile-excel-server/releases) 下载三个文件：`install.sh`、`cexg-linux-x86_64.tar.gz`、`SHA256SUMS`（0.3.0 之前的版本发布页里没有 `install.sh`，从仓库根目录取）。
+1. 在能上网的电脑上，从 [发布页](https://github.com/qingshanfeihu/compile-excel-server/releases) 下载三个文件：`install.sh`、`cexg-linux-x86_64.tar.gz`、`SHA256SUMS`（0.3.0 起网关不再回调服务端；0.3.0 之前的版本发布页里没有 `install.sh`，从仓库根目录取）。
 2. 把三个文件拷到跳板机的同一个目录，例如 `~/cexg-install/`。
 3. 在跳板机上运行：
 
@@ -28,17 +28,13 @@ curl -fsSL https://raw.githubusercontent.com/qingshanfeihu/compile-excel-server/
 
 ## 配置
 
-### 第一步：在服务端准备三样东西
+### 第一步：准备三样东西
 
-在服务端运行 `ces` 进入管理菜单：
-
-| 要准备的 | 菜单 | 对应命令 |
-|---|---|---|
-| 网关客户端密钥 | 3. 服务客户端 → 新建网关客户端 | `ces clients add gateway --scopes "introspect bundles:read" --out ~/cexg-client.secret` |
-| 网关证书（服务端用内置 CA 时） | 6. 连接与证书 → 为跳板机网关签发证书 | `ces tls gateway <跳板机 IP 或主机名> --out ~/cexg-tls` |
-| 把网关地址告诉用户 | 7. 客户端配置 → 设置一项 → `gateway.url` | `ces config set gateway.url https://<跳板机>:8910/mcp` |
-
-把密钥文件和 `~/cexg-tls` 里的三个文件（`gateway.pem`、`gateway.key`、`ca.pem`）拷到跳板机，例如 `~/.config/cexg/`，权限保持 600。
+| 要准备的 | 怎么做 |
+|---|---|
+| 密钥 | `openssl rand -hex 32`。明文登记到 hub 的执行资源（凭据模式 `static-secret`）；跳板机上只放它的 SHA-256：`printf '%s' '<明文>' \| sha256sum \| cut -d' ' -f1 > ~/.config/cexg/hub.secret.sha256`，权限 600。换密钥就是换这个文件的内容，不用重启网关。要开 `init_device`，再生成一把管理密钥，同样放摘要到 `admin_secret_sha256_file` |
+| 网关证书 | 由实验室 CA 签发 `gateway.crt` / `gateway.key`，放在 `~/.config/cexg/tls/`，权限 600；hub 的执行 profile 里信任那张 CA |
+| 规则文件 | hub 的规则资产 `domain_grammar.json` 放到 `hub.grammar_file`（不配就是状态目录里的那份）；由运维随 hub 更新 |
 
 ### 第二步：在跳板机上写配置
 
@@ -51,10 +47,10 @@ cexg sample-config > ~/.config/cexg/gateway.toml
 
 | 配置项 | 填什么 |
 |---|---|
-| `[server] url` | 服务端地址，例如 `https://192.168.1.20:8900`（不要带连接串里 `#` 后面的部分，带了会报错） |
-| `[server] client_secret_file` | 网关客户端密钥文件 |
-| `[server] ca_file` | 服务端的 CA 证书 `ca.pem`；服务端用正式证书时留空 |
-| `[server] build` | 这张床对应的执行构建名 |
+| `[hub] secret_sha256_file` | hub 密钥的 SHA-256 摘要文件（600） |
+| `[hub] admin_secret_sha256_file` | 可选，管理密钥的摘要文件；配了 `init_device` 才可用 |
+| `[hub] build` | 这张床对应的执行构建名 |
+| `[hub] grammar_file` | 可选，规则文件路径；留空用 `<state.dir>/domain_grammar.json` |
 | `[listen] host` / `port` | 给其他电脑用填 `0.0.0.0`，端口默认 8910 |
 | `[listen] tls_cert` / `tls_key` | `gateway.pem` / `gateway.key` |
 | `[framework]` 各项 | 测试框架的路径、Python 3.8 解释器、conf 文件名、落位目录 |
@@ -96,8 +92,8 @@ sudo systemctl daemon-reload && sudo systemctl enable --now cexg
 - **连接**：证书握手在连接线程里做（10 秒超时），空闲连接 60 秒后断开。
 - **拓扑缓存**：床拓扑缓存在 `<状态目录>/bed_topology.json`；登录床内主机时见过的主机密钥钉在 `<状态目录>/bed_host_key_pins.json`，之后对不上的主机不再递口令，只在结果里报出来。
 - **设备命令**：设备初始化的命令全部来自 `gateway.toml` 的 `init_device.commands`，代码里不写设备命令。
-- **规则文件**：`projections/domain_grammar.json` 从服务端该构建的 `stable` 包里取并缓存；取不到又没有缓存时拒绝上机。
-- **证书报错**：日志或 `cexg check` 里出现“服务端证书不受信任”，说明 `[server] ca_file` 没填或填错了。
+- **规则文件**：`hub.grammar_file`（默认 `<状态目录>/domain_grammar.json`）是跳板机本地文件，按修改时间重读；文件不在或不是 JSON 时拒绝上机。
+- **鉴权报错**：`cexg check` 的 `hub_secret` 不通过，或请求回 503 “gateway auth is misconfigured”，说明密钥摘要文件缺失、权限不是 600 或内容不是 64 位十六进制；401 则是 hub 用的密钥与摘要对不上。
 
 ## 判据代码
 
