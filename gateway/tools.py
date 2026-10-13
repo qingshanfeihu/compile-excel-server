@@ -76,7 +76,9 @@ TOOL_SPECS: list[dict[str, Any]] = [
                     "readable, devices reachable, the device's own build matches the gateway's "
                     "bundle build, destructive-command rules and credential literals available. "
                     "device_count is how many devices the framework conf lists (APV_0 .. "
-                    "APV_<device_count-1>); a case can only use those. "
+                    "APV_<device_count-1>); a case can only use those. conf.device_ips gives "
+                    "their management IPs in conf order (conf.device_names their names when the "
+                    "conf names them); the conf field is absent when the conf cannot be read. "
                     "Pass device_build (the build your cases were compiled for): a different build "
                     "is refused; without it the result says build_checked=false. "
                     "Read-only; needs your lease.",
@@ -295,12 +297,19 @@ class Gateway:
         cfg = self.cfg
         add("framework_files", (cfg.apv_src / "lib" / "test_xlsx.py").is_file()
             and cfg.py38.is_file(), f"apv_src={cfg.apv_src.name}, py38={cfg.py38.name}")
+        conf: dict[str, Any] | None = None
         try:
             parser = framework.read_conf(cfg)
             ips = framework.device_ips(parser)
             framework.device_credentials(parser, cfg.build)
             add("framework_conf", bool(ips), f"{len(ips)} device(s) in conf: "
                 + ", ".join(f"APV_{i}" for i in range(len(ips))))
+            # hub 结果解析按 conf 顺序把 runner 日志行归到 APV_<i>：IP 按 conf 原顺序交出，
+            # 不重排、不猜；conf 给了设备名（[comm] marks）就同序附上，没给就没有这个键
+            conf = {"device_ips": list(ips)}
+            names = framework.device_names(parser)
+            if names:
+                conf["device_names"] = names
         except framework.FrameworkError as exc:
             add("framework_conf", False, str(exc))
             ips = []
@@ -333,8 +342,12 @@ class Gateway:
                             f"device reports {device_build}, gateway bundle is {cfg.build}")
         else:
             add("device_build", False, "no bed_probes.build in the bundle grammar")
-        return {"ready": all(c["ok"] for c in checks), "checks": checks,
-                "build_checked": build_checked, "device_count": len(ips)}
+        out = {"ready": all(c["ok"] for c in checks), "checks": checks,
+               "build_checked": build_checked, "device_count": len(ips)}
+        # conf 读不到就没有 conf 字段：空数组会冒充“读到了、零台设备”
+        if conf is not None:
+            out["conf"] = conf
+        return out
 
     # ── 上机 ──────────────────────────────────────────────
     def case_submit(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:

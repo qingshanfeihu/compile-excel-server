@@ -66,6 +66,18 @@ def device_ips(parser: configparser.ConfigParser) -> list[str]:
     return [ip.strip() for ip in parser.get("comm", "ssh_ips").split(",") if ip.strip()]
 
 
+def device_names(parser: configparser.ConfigParser) -> list[str]:
+    """conf [comm] marks 里的设备名，与 ssh_ips 同序（与 cex_core parse_conf 同一规则：取 %% 之后）。
+
+    conf 没带 marks 时是空表：调用方据此省略字段，不拿空表冒充设备名。
+    """
+    if not parser.has_option("comm", "marks"):
+        return []
+    raw = parser.get("comm", "marks")
+    tail = raw.split("%%", 1)[1] if "%%" in raw else raw
+    return [name.strip() for name in tail.split(",") if name.strip()]
+
+
 def device_credentials(parser: configparser.ConfigParser, build: str) -> dict[str, str]:
     """按构建名选设备段（与 InfoTest _parse_device_conn 同一规则），取 user/passwd/hostname。"""
     prefix = ""

@@ -440,6 +440,43 @@ def test_env_prepare_says_how_many_devices_the_bed_has(fake_env, monkeypatch):
     assert "APV_0, APV_1" in conf["detail"]
 
 
+def test_env_prepare_reports_conf_device_ips_in_conf_order(fake_env, monkeypatch):
+    """hub 结果解析按 conf 顺序把 runner 日志行归到 APV_<i>：device_ips 必须原序交出。"""
+    gw = fake_env["gateway"]
+    lease = _lease(gw)
+    monkeypatch.setattr(framework, "device_reachable", lambda ip, **_: True)
+    monkeypatch.setattr(framework, "probe", lambda cfg, cmd, build, idx: {
+        "output": f"Software Version : {BUILD}\n"})
+    out = gw.call(ALICE, "env_prepare", lease)
+    assert out["ok"], out
+    assert out["conf"]["device_ips"] == ["127.0.0.1", "127.0.0.2"]
+    assert len(out["conf"]["device_ips"]) == out["device_count"]
+    assert "device_names" not in out["conf"], "conf 没带 marks 就没有 device_names"
+
+    # conf 的 [comm] marks 给了设备名：与 ssh_ips 同序附上
+    conf_path = fake_env["apv"] / "conf" / "bed.conf"
+    conf_path.write_text(conf_path.read_text(encoding="utf-8").replace(
+        "ssh_ips = 127.0.0.1, 127.0.0.2",
+        "ssh_ips = 127.0.0.1, 127.0.0.2\nmarks = exec%%APV0,APV1"), encoding="utf-8")
+    out = gw.call(ALICE, "env_prepare", lease)
+    assert out["conf"]["device_ips"] == ["127.0.0.1", "127.0.0.2"]
+    assert out["conf"]["device_names"] == ["APV0", "APV1"]
+
+
+def test_env_prepare_omits_conf_when_it_cannot_be_read(fake_env):
+    """conf 读不到时没有 conf 字段（不拿空数组冒充），framework_conf 检查 ok=false。"""
+    gw = fake_env["gateway"]
+    lease = _lease(gw)
+    (fake_env["apv"] / "conf" / "bed.conf").unlink()
+    out = gw.call(ALICE, "env_prepare", lease)
+    assert out["ok"], out
+    assert "conf" not in out
+    assert out["device_count"] == 0
+    conf = next(c for c in out["checks"] if c["check"] == "framework_conf")
+    assert conf["ok"] is False and "unreadable" in conf["detail"]
+    assert out["ready"] is False
+
+
 def test_results_name_the_run_and_carry_sessions_of_cases_that_did_not_pass(fake_env, tmp_path):
     gw, apv = fake_env["gateway"], fake_env["apv"]
     a, b = "202610080000000011", "202610080000000012"

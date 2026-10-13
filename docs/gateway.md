@@ -75,7 +75,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now cexg
 | 工具 | 需要的权限 | 说明 |
 |---|---|---|
 | `lease_acquire` / `lease_heartbeat` / `lease_release` / `lease_status` | `jumphost:run` | 单床租约，带防并发令牌；会碰设备的工具都要带着当前租约 |
-| `env_prepare` | `jumphost:run` | 检查框架文件、conf、设备可达、设备自述的构建与网关构建一致、规则与凭据字面量可用。客户端带上用例编译时的构建号，与本床不符直接拒绝；不带时照常检查，结果里 `build_checked: false`。`device_count` 是 conf `[comm] ssh_ips` 列出的设备台数（用例只能用 `APV_0` 到 `APV_<台数-1>`） |
+| `env_prepare` | `jumphost:run` | 检查框架文件、conf、设备可达、设备自述的构建与网关构建一致、规则与凭据字面量可用。客户端带上用例编译时的构建号，与本床不符直接拒绝；不带时照常检查，结果里 `build_checked: false`。`device_count` 是 conf `[comm] ssh_ips` 列出的设备台数（用例只能用 `APV_0` 到 `APV_<台数-1>`）。结果另带 `conf.device_ips`：这些设备的管理地址，按 conf `[comm] ssh_ips` 的原顺序（hub 结果解析按它把 runner 日志行归到 `APV_<序号>`）；conf `[comm] marks` 给了设备名时另有同序的 `conf.device_names`。conf 读不到时没有 `conf` 字段（不拿空数组冒充），`framework_conf` 检查 `ok=false` |
 | `case_submit` | `jumphost:run` | 冻结工作簿 → 上机前检查（压缩包与体积、Excel 契约、自毁命令、框架凭据字面量、床上没有的设备：E 列 `APV_k` / `Segk_tmp` 的 k 不小于设备台数就拒收；框架连不上第 k 台时整卷一个案都不跑）→ 只读落位、哈希对账 → 开始运行。回执带 `submit_autoid`（落位目录名，即卷里第一个案）和 `module` |
 | `case_status` / `case_results` | `jumphost:run` | 状态与结果。结果来自框架结果库，只认本次运行报告目录下的行（同一构建表里别的床、上一轮留下的行不算，条数记在 `ignored_rows`）；早于投递时间的日志标为过期。没过的案另带 `sessions`：本次运行里该案每个设备的命令行会话（`apv_<ip>.txt`）与触发机会话的尾部（每份最多 12000 字符、最多 8 份）。回执带 `rc`（框架进程退出码）、`run_dir`、`report_dir`、`submit_autoid`、`module`。运行进程没写完成状态就消失了（网关重启、内存不足、被人杀掉）时报 `lost`，`case_results` 回 `channel: runner_lost`（没有判定，需要重投） |
 | `probe_show` | `jumphost:run` | 单条只读命令：一行最多 200 字符，参数只许字母、数字、空格和 `_ . , : / @ % + = * " ' -`；等不到设备提示符时回 `truncated: true` |
