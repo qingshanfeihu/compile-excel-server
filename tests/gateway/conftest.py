@@ -174,6 +174,27 @@ def fake_env(tmp_path, monkeypatch):
         """), encoding="utf-8")
     fake_cu = tmp_path / "fake_cu.py"
     fake_cu.write_text(FAKE_CU, encoding="utf-8")
+    # runner 脚本以 GNU coreutils 的 `timeout --kill-after=30 <秒> …` 起 pytest；本机（macOS）
+    # 没有 timeout，runner 一起跑就 rc=127。给它一个吃掉选项与时长的替身放 PATH 最前——只影响
+    # 没有真 timeout 的机器（跳板机/CI 上有真的，PATH 不动），测试也不打到超时的边界。
+    if shutil.which("timeout") is None:
+        shim = tmp_path / "bin" / "timeout"
+        shim.parent.mkdir()
+        shim.write_text(textwrap.dedent("""\
+            #!/bin/sh
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --kill-after=*) shift ;;
+                    --kill-after|-k|-s|--signal) shift 2 ;;
+                    -*) shift ;;
+                    *) break ;;
+                esac
+            done
+            shift
+            exec "$@"
+            """), encoding="utf-8")
+        shim.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{shim.parent}{os.pathsep}{os.environ['PATH']}")
     secret = write_secret_digest(tmp_path / "hub.secret.sha256", RUN_TOKEN)
     admin_secret = write_secret_digest(tmp_path / "hub.admin.sha256", ADMIN_TOKEN)
     state = tmp_path / "state"
