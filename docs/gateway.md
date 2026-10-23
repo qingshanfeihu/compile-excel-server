@@ -4,6 +4,12 @@
 
 ## 安装
 
+**0.4.0 安装前置条件**：仅在床空闲、没有进行中任务时升级。集成者须先只读核对真实框架收集器，
+确认它在报告目录及结果库 URL 中完整保留 `<task_id>/ist_staging_<module>/<首案编号>`，并核对结果库覆盖/保留规则。
+这一步在安装之前完成，不只是认证版本之前。本仓仅用假框架验证，尚未完成真实收集器核对。
+新目录对所有调用方生效（含不传 request_id 的旧调用方）；若 task_id 层被丢掉，所有调用方均会缺结果或无法证明归属，
+不能安装后靠重读恢复，也不能回退借用另一派发的结果。
+
 网关只有 Linux x86_64 的安装包，能在 Ubuntu 20.04（glibc 2.31）及更新的系统上运行。
 
 实验室的跳板机通常上不了外网，所以用离线安装：
@@ -92,7 +98,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now cexg
 - **请求状态**：`received` → `rejected`（带阶段），或 `received` → `starting` → `started`；中断且确认没启动的为 `not_started`。任务与请求的 `starting/task_id` 在同一事务里先记，之后才起 runner。runner 的第一步写 `<task_id>.started`，之后才进入 pytest；父进程在 fork 前持有并传递 `.alive` 锁。查询和重复提交会对账：开始标记存在就是 `started/reached_device: true`；没有标记、请求处理锁和存活锁都已释放才记 `not_started`。正在处理或正在起进程时保持过渡状态，给出继续 `case_request` 的动作；原来的处理/runner 会继续，查询不会重发提交。状态变化在同一 SQLite 事务里留审计事件，随后追加到审计链；重启补写未追加的事件。写链后、确认前中断可能重复追加同一个 `event_id`，但不会漏掉已提交的状态变化。
 - **拒绝阶段**：回答和 `tool_refused` 审计带 `stage`、`reached_device`。提交依次为 `admission`、`lease`、`precheck`、`bed_busy`、`staging`、`launch`，拒绝一律 `false`；runner 已起以后回任务状态，不伪装成拒绝。探测用 `probe`，初始化用 `initialization`；代理在 SSH 登录后明确回传标记，响应丢失时用本地登录标记补回事实；初始化也保留登录状态，登录后失败不会报成未上机。
 - **查账与保留边界**：`case_request` 找到时给 `request_id/state/stage/reached_device/xlsx_sha256/received_at/not_after`，确认 runner 已启动时再给 `task_id`。找不到仍给 `found: false/gateway_time/gc_before/journal_id/journal_since/subject`（外加工具通用 `ok`）；所有时间字段均是 UTC Unix 秒。只有 journal_id、subject 与投递前冻结身份相同，且 `gateway_time > 调用方原 not_after > gc_before >= journal_since` 才能用缺记录证明未执行。查询的快照和当前时刻也在 SQLite 写锁里取，晚到提交不能穿过该截止保证。`gc_before` 为已删记录的最大截止时间，持久、只增；尚未过截止或仍在恢复的请求不清理，相关任务和目录也保留。初始值为日志创建时刻，不能据此推断旧版不支持此协议的调用；先核对发送投递的会话 `initialize.serverInfo.version`。
-- **派发目录与兼容边界**：0.4.0 新目录是 `<staging_parent>/<task_id>/ist_staging_<module>/<首案编号>`，紧邻父目录仍给模块、最后一级仍给首案编号。假框架按这两级取名字，并在报告路径中保留 task_id；查询只认完整路径，结果库旧行被覆盖时保留“该派发缺结果行”的发现，不借新派发的行。若没有或出现多份对应报告，不选择最新一份冒充；返回明确缺失原因及检查本次日志、恢复归属证据的动作。回执回显请求 id，结果各通道回显请求 id、task_id，确认唯一目录时回 `ownership: staging_directory`，否则回 `ownership: none`。**真实框架对此目录布局尚未核对**：本次只跑合成夹具；集成者须先只读核对真实收集路径、报告 URL 和结果库保留规则，再为该版本认证。升级前任务不具有新目录归属保证。
+- **派发目录与兼容边界**：0.4.0 新目录是 `<staging_parent>/<task_id>/ist_staging_<module>/<首案编号>`，紧邻父目录仍给模块、最后一级仍给首案编号。假框架按这两级取名字，并在报告路径中保留 task_id；查询只认完整路径，结果库旧行被覆盖时保留“该派发缺结果行”的发现，不借新派发的行。若没有或出现多份对应报告，不选择最新一份冒充；返回明确缺失原因及检查本次日志、恢复归属证据的动作。回执回显请求 id，结果各通道回显请求 id、task_id，确认唯一目录时回 `ownership: staging_directory`，否则回 `ownership: none`。**真实框架对此目录布局尚未核对**：本次只跑合成夹具；集成者须在安装之前只读核对真实收集路径、报告 URL 和结果库保留规则（不是仅在版本认证之前核对）。升级前任务不具有新目录归属保证。
 - **清理**：`cexg gc --config … [--days 30] [--apply]` 列出（加 `--apply` 才删，要求床空闲）N 天前已结束任务的记录、落位目录，以及框架报告里网关落位跑出来的目录。N 必须比 `run_max_s` 多一小时以上。新落位和报告按带 task_id 的目录形状清理，保留无对应网关落位的旧形状报告；请求删除数为 `requests_deleted`，删后查账仍带持久保留边界。
 - **审计**：`cexg audit-verify --config …` 复核网关的审计日志哈希链。
 - **互斥**：床锁 `<状态目录>/bed.lock` 用 `flock`，锁随测试进程组继承，进程结束时内核自动释放；不写进程号、不删锁文件。运行进程另继承 `<状态目录>/tasks/<任务>.alive` 锁，进程号记在 `<任务>.runner.json`。

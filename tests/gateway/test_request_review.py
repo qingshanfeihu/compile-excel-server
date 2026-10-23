@@ -344,3 +344,12 @@ def test_default_fake_result_store_overwrites_a_case_row(fake_env, tmp_path):
     rows = json.loads((fake_env['apv'] / 'fake_results.json').read_text())
     keys = [(r['table'], r['case_id'], r['sub_module']) for r in rows]
     assert len(keys) == len(set(keys))
+
+
+def test_installation_requires_real_collector_shape_verification_before_upgrade():
+    from pathlib import Path
+    text = (Path(__file__).resolve().parents[2] / 'docs' / 'gateway.md').read_text()
+    install = text[text.index('## 安装'):text.index('## 配置')]
+    assert '0.4.0 安装前置条件' in install
+    assert 'task_id' in install and 'URL' in install and '只读' in install
+    assert '所有调用方' in install and '缺结果' in install and '床空闲' in install
