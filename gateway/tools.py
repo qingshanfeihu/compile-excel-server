@@ -10,6 +10,8 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import hashlib
+from datetime import datetime, timezone
 import os
 import re
 import threading
@@ -94,7 +96,9 @@ TOOL_SPECS: list[dict[str, Any]] = [
                     "name: the workbook's first case) and module; poll case_status, then read "
                     "case_results.",
      "input_schema": _schema({**LEASE_PROPS,
-                              "xlsx_b64": {"type": "string", "description": "Workbook bytes, base64."},
+                              "request_id": {"type": "string", "maxLength": 128, "pattern": "^[A-Za-z0-9:._-]+$"},
+            "not_after": {"type": "string"},
+            "xlsx_b64": {"type": "string", "description": "Workbook bytes, base64."},
                               "module": {"type": "string", "description": "Staging module; defaults to the gateway's configured module."}},
                              ["lease_id", "token", "xlsx_b64"])},
     {"name": "case_status", "scope": "jumphost:run", "read_only": True,
@@ -185,6 +189,11 @@ class Gateway:
             return {"ok": False, "error": f"your token lacks the {spec['scope']} scope"}
         if not isinstance(args, dict):
             return {"ok": False, "error": "arguments must be an object"}
+        if name == "case_submit" and ("request_id" in args or "not_after" in args):
+            return self._request_submit(caller, args)
+        return self._invoke(caller, name, args)
+
+    def _invoke(self, caller, name, args):
         try:
             result = self.handlers[name](caller, args)
         except (LeaseError, ToolError, gates.GateError, framework.FrameworkError) as exc:
@@ -195,7 +204,44 @@ class Gateway:
             return framework.redact({"ok": False, "error": str(exc),
                                      **({"problems": problems} if problems else {})}, secrets)
         # 日志尾、每案日志、探测回显、结果库报错……回给客户端的一切都过一遍已知口令
-        return framework.redact({"ok": True, **result}, self.secrets())
+        return framework.redact({"ok": True, **({"request_record": "none"} if name == "case_submit" else {}),
+                                 **result}, self.secrets())
+
+    def _request_submit(self, caller, args):
+        try:
+            rid = args.get('request_id')
+            if 'request_id' not in args or 'not_after' not in args:
+                raise ToolError('request_id and not_after must be supplied together')
+            if not isinstance(rid,str) or not re.fullmatch(r'[A-Za-z0-9:._-]{1,128}',rid):
+                raise ToolError('request_id must contain 1 to 128 ASCII letters, digits or :._-')
+            stamp = datetime.fromisoformat(str(args['not_after']).replace('Z','+00:00'))
+            if stamp.tzinfo is None or stamp.utcoffset().total_seconds() != 0:
+                raise ValueError('not UTC')
+            deadline = stamp.timestamp()
+            raw = base64.b64decode(str(args.get('xlsx_b64') or ''), validate=True)
+        except (ToolError,ValueError,binascii.Error) as exc:
+            return {'ok':False,'error':str(exc),'stage':'admission','reached_device':False}
+        with self.state.request_lock(rid):
+            row, fresh = self.state.reserve_request(rid, caller.subject, hashlib.sha256(raw).hexdigest(), deadline)
+            if row['holder'] != caller.subject or row['xlsx_sha256'] != hashlib.sha256(raw).hexdigest():
+                return {'ok':False,'error':'request_id conflicts with an existing request; use a new request_id',
+                        'stage':'admission','reached_device':False}
+            if not fresh:
+                if row['reply']:
+                    return json.loads(row['reply'])
+                return {'ok':True,'request_id':rid,'state':row['state'],'reached_device':bool(row['reached_device'])}
+            self.audit('request_state',request_id=rid,state='received')
+            if deadline <= row['received_at']:
+                reply = {'ok':False,'error':'request expired before admission; use a new request_id and deadline',
+                         'stage':'admission','reached_device':False}
+            else:
+                reply = self._invoke(caller,'case_submit',args)
+            reply.update(request_id=rid,request_record='recorded')
+            state = 'started' if reply['ok'] else 'rejected'
+            self.state.update_request(rid,reply=json.dumps(reply),state=state,
+                                      stage=reply.get('stage'),reached_device=int(reply['ok']))
+            self.audit('request_state',request_id=rid,state=state)
+            return reply
 
     def _lease(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
         return self.state.check(caller.subject, str(args.get("lease_id") or ""), args.get("token"))

@@ -22,6 +22,12 @@ from pathlib import Path
 from typing import Any, Iterator
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS requests (
+ request_id TEXT PRIMARY KEY, holder TEXT NOT NULL, xlsx_sha256 TEXT NOT NULL,
+ not_after REAL NOT NULL, received_at REAL NOT NULL, state TEXT NOT NULL,
+ reply TEXT, task_id TEXT, stage TEXT, reached_device INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS request_meta (name TEXT PRIMARY KEY, value REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS lease (
     bed        TEXT PRIMARY KEY,
     lease_id   TEXT NOT NULL,
@@ -83,6 +89,47 @@ class StateStore:
             yield conn
         finally:
             conn.close()
+
+    @contextmanager
+    def request_lock(self, request_id: str):
+        path = self.dir / ('request-' + hashlib.sha256(request_id.encode()).hexdigest() + '.lock')
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
+
+    def reserve_request(self, request_id, holder, sha256, not_after):
+        with self._conn() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            now = time.time()
+            row = conn.execute('SELECT * FROM requests WHERE request_id=?', (request_id,)).fetchone()
+            if row:
+                conn.commit()
+                return dict(row), False
+            conn.execute('INSERT INTO requests(request_id,holder,xlsx_sha256,not_after,received_at,state) '
+                         'VALUES(?,?,?,?,?,?)', (request_id,holder,sha256,not_after,now,'received'))
+            row = dict(conn.execute('SELECT * FROM requests WHERE request_id=?', (request_id,)).fetchone())
+            conn.commit()
+            return row, True
+
+    def update_request(self, request_id, **fields):
+        with self._conn() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            conn.execute('UPDATE requests SET ' + ','.join(k+'=?' for k in fields) +
+                         ' WHERE request_id=?', (*fields.values(),request_id))
+            conn.commit()
+
+    def request_snapshot(self, request_id, holder):
+        with self._conn() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            now = time.time()
+            row = conn.execute('SELECT * FROM requests WHERE request_id=? AND holder=?',
+                               (request_id,holder)).fetchone()
+            floor = conn.execute("SELECT value FROM request_meta WHERE name='gc_before'").fetchone()
+            conn.commit()
+            return (dict(row) if row else None), now, (floor[0] if floor else 0.0)
 
     # ── 床锁 ─────────────────────────────────────────────
     def try_bed_lock(self) -> int | None:
