@@ -105,3 +105,6 @@ sudo systemctl daemon-reload && sudo systemctl enable --now cexg
 ## 判据代码
 
 网关的上机前检查用的判据代码在 `gateway/vendor/`，由 `tools/sync_gateway_vendor.py` 从 compile-excel-skills 的 `cex_core` 和 InfoTest 的凭据字面量提取器同步过来，不要在 vendor 里手改。同步与发版的细节见 [开发与发版](development.md#同步判据代码)。
+
+请求查询的 `subject` 是网关解析后的完整调用主体（含 actor），无论找到与否都会回传。
+缺记录仅在查询 subject 与原投递 subject 完全一致时才可能证明未执行；主体变更不能作为未执行证据。

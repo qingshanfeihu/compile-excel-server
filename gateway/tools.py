@@ -292,7 +292,7 @@ class Gateway:
             raise ToolError('invalid request_id; supply the id from the submit receipt')
         self.reconcile_request(rid,caller.subject)
         row,now,floor = self.state.request_snapshot(rid,caller.subject)
-        result = {'found':bool(row),'gateway_time':now,'gc_before':floor}
+        result = {'found':bool(row),'gateway_time':now,'gc_before':floor,'subject':caller.subject}
         if row:
             result.update(request_id=rid,state=row['state'],stage=row['stage'],
                           reached_device=bool(row['reached_device']),
