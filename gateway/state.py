@@ -134,6 +134,10 @@ class StateStore:
             if row:
                 conn.commit()
                 return dict(row), False
+            floor = conn.execute("SELECT value FROM request_meta WHERE name='gc_before'").fetchone()
+            if floor and not_after <= floor[0]:
+                conn.commit()
+                return {'collected': True}, False
             conn.execute('INSERT INTO requests(request_id,holder,xlsx_sha256,not_after,received_at,state) '
                          'VALUES(?,?,?,?,?,?)', (request_id,holder,sha256,not_after,now,'received'))
             row = dict(conn.execute('SELECT * FROM requests WHERE request_id=?', (request_id,)).fetchone())

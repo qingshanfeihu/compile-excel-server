@@ -332,6 +332,8 @@ class Gateway:
             decode_error = 'xlsx_b64 is not valid base64; fix the encoding and use a new request_id'
         with self.state.request_lock(rid):
             row, fresh = self.state.reserve_request(rid, caller.subject, digest, deadline)
+            if row.get('collected'):
+                return {**self._admission_refusal(caller, args, 'request falls within collected history; inspect the original dispatch before using a new request_id'), 'request_record': 'collected'}
             if row['holder'] != caller.subject or row['xlsx_sha256'] != digest:
                 return self._admission_refusal(caller,args,
                     'request_id conflicts with an existing request; use a new request_id')
