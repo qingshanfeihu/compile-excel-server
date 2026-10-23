@@ -142,3 +142,36 @@ def test_early_results_disclose_why_ownership_is_not_determined(fake_env, tmp_pa
     assert answer['channel'] == channel and answer['ownership'] == 'none'
     assert answer['ownership_reason'] == reason
     assert answer['next_action']
+
+
+@pytest.mark.parametrize('rotate_epoch', [False, True])
+def test_collected_id_cannot_launch_again_with_a_future_deadline(fake_env, tmp_path, monkeypatch, rotate_epoch):
+    from gateway import state
+    gw = fake_env['gateway']; values = submission(fake_env, tmp_path)
+    start = time.time()
+    values['not_after'] = datetime.fromtimestamp(start + 5, timezone.utc).isoformat()
+    calls = []
+    def launched(cfg, task_id, *_):
+        calls.append(task_id)
+        framework.task_paths(cfg, task_id)['start'].write_text('fake start')
+    monkeypatch.setattr(framework, 'launch_run', launched)
+    first = gw.call(ALICE, 'case_submit', values)
+    assert first['ok'] and len(calls) == 1
+    monkeypatch.setattr(state.time, 'time', lambda: start + 10)
+    assert gw.state.gc_requests(start + 11) == 1
+    if rotate_epoch:
+        gw.state.reset_journal_identity('synthetic complete backup restore')
+    restored = Gateway(gw.cfg)
+    absent = restored.call(ALICE, 'case_request', {'request_id': values['request_id']})
+    assert absent['ok'] and absent['found'] is False
+    assert absent['gc_before'] >= datetime.fromisoformat(values['not_after']).timestamp()
+    assert not proof_of_absence(absent, values, first)
+    future = {**values, 'not_after': datetime.fromtimestamp(start + 100, timezone.utc).isoformat()}
+    refused = restored.call(ALICE, 'case_submit', future)
+    assert refused['ok'] is False and refused['stage'] == 'admission'
+    assert refused['request_record'] == 'collected' and refused['reached_device'] is False
+    assert len(calls) == 1
+    assert restored.call(ALICE, 'case_request', {'request_id': values['request_id']})['found'] is False
+    # Collection bars this ID, rather than all new dispatches with the same bytes.
+    fresh = restored.call(ALICE, 'case_submit', {**future, 'request_id': 'intent:fresh'})
+    assert fresh['ok'] and fresh['task_id'] != first['task_id'] and len(calls) == 2

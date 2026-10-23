@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS request_events (
  event_at REAL NOT NULL, task_id TEXT, stage TEXT, reached_device INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS request_meta (name TEXT PRIMARY KEY, value REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS request_tombstones (
+ request_id TEXT PRIMARY KEY, not_after REAL NOT NULL
+);
 """
 
 _SCHEMA = _REQUEST_SCHEMA + """
@@ -218,7 +221,8 @@ class StateStore:
                 conn.commit()
                 return dict(row), False
             floor = conn.execute("SELECT value FROM request_meta WHERE name='gc_before'").fetchone()
-            if floor and not_after <= floor[0]:
+            collected = conn.execute('SELECT 1 FROM request_tombstones WHERE request_id=?', (request_id,)).fetchone()
+            if collected or (floor and not_after <= floor[0]):
                 conn.commit()
                 return {'collected': True}, False
             error = admission_error or ('request expired before admission; use a new request_id and deadline' if not_after <= now else None)
@@ -287,6 +291,10 @@ class StateStore:
                 floor = max(r['not_after'] for r in rows)
                 conn.execute("INSERT INTO request_meta(name,value) VALUES('gc_before',?) "
                              "ON CONFLICT(name) DO UPDATE SET value=max(value,excluded.value)",(floor,))
+                # Tombstones are permanent and committed atomically with collection.
+                # A caller-supplied new deadline cannot turn an old ID into a new attempt.
+                conn.executemany('INSERT INTO request_tombstones(request_id,not_after) VALUES(?,?)',
+                                 [(r['request_id'], r['not_after']) for r in rows])
                 conn.executemany('DELETE FROM requests WHERE request_id=?',[(r['request_id'],) for r in rows])
             conn.commit()
             return len(rows)

@@ -139,10 +139,18 @@ sudo systemctl daemon-reload && sudo systemctl enable --now cexg
 本机无法检测独立日志及其身份一起回退（例如从旧备份恢复两个目录或切换到旧副本）。
 发生这种恢复时，管理员必须先停止网关、核对床和未决 runner，再在离线且床空闲时运行
 `cexg journal-reset --config gateway.toml --reason "Restore reconciled backup"`，然后再启动服务。
-命令改变公开 `journal_id`，将 `journal_since` 抬到持久时钟下限与当前时间的较大值，保留请求行和清理边界；
+命令改变公开 `journal_id`，将 `journal_since` 抬到持久时钟下限与当前时间的较大值，保留请求行、清理边界和永久墓碑；
 不会把旧请求变成新的投递。命令不负责停服，运行中的服务不得并行执行此维护动作。
 旧身份下的未决投递必须人工核实，不得因查空结项；Hub 冻结身份不匹配时须继续保持未决。
 日志完整性或备份新旧无法核实时也不能采信查空。正常重启不需要换身份。
+
+清理请求详情时，在同一独立日志事务内先留永久 `request_tombstones(request_id, not_after)` 再删详情。
+墓碑命中即拒绝重交，回答 admission / request_record:collected / reached_device:false，
+与新提交的截止时间、主体或内容无关；墓碑不随常规 GC 删除，也不随 journal-reset 清空。
+查询仍给 found:false，原截止时间不大于 gc_before，因此不能证明该旧投递未执行。
+永久墓碑只保存 id 和原截止时间，需计入长期日志容量；不能通过删除墓碑释放容量后继续沿用同一日志身份。
+此保证覆盖升级时仍保留及升级后登记的请求；升级前已被旧版本删除的 id 无法凭空恢复，调用方仍须永久禁止旧 id 复用。
+新尝试使用新 id，相同工作簿字节本身不阻止新尝试。
 
 请求处于 received/starting 且尚无 runner 开始标记时，reached_device 为 null（尚未确定），不可当 false。
 即使请求处理锁忙，存在开始标记仍确认为 started/true 并给 task_id。
