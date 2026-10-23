@@ -11,6 +11,8 @@ import base64
 import binascii
 import json
 import hashlib
+import fcntl
+import secrets as random_secrets
 from datetime import datetime, timezone
 import os
 import re
@@ -206,6 +208,34 @@ class Gateway:
         # 日志尾、每案日志、探测回显、结果库报错……回给客户端的一切都过一遍已知口令
         return framework.redact({"ok": True, **({"request_record": "none"} if name == "case_submit" else {}),
                                  **result}, self.secrets())
+
+    def reconcile_request(self, rid, holder):
+        row, _, _ = self.state.request_snapshot(rid,holder)
+        if not row or row['state'] not in ('received','starting'):
+            return row
+        # Nonblocking: a live admission/launch owns this lock. Never turn its work into a refusal.
+        path = self.state.dir / ('request-' + hashlib.sha256(rid.encode()).hexdigest() + '.lock')
+        fd = os.open(path,os.O_RDWR | os.O_CREAT,0o600)
+        try:
+            try:
+                fcntl.flock(fd,fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return row
+            row, _, _ = self.state.request_snapshot(rid,holder)
+            if row['state'] not in ('received','starting'):
+                return row
+            paths = framework.task_paths(self.cfg,row['task_id']) if row['task_id'] else None
+            if paths and paths['start'].exists():
+                state,reached,reason = 'started',True,None
+            elif paths and paths['alive'].exists() and not framework.runner_gone(self.cfg,row['task_id']):
+                return row
+            else:
+                state,reached,reason = 'not_started',False,'gateway stopped before runner start; submit a new request_id'
+            self.state.update_request(rid,state=state,reached_device=int(reached))
+            self.audit('request_state',request_id=rid,state=state,reason=reason)
+            return {**row,'state':state,'reached_device':int(reached),'reason':reason}
+        finally:
+            os.close(fd)
 
     def _request_submit(self, caller, args):
         try:
@@ -415,17 +445,19 @@ class Gateway:
             # 冻结、取规则、抽凭据字面量可能要几十秒：租约在这期间过期或被接管，就不能再上机
             lease = self._lease(caller, args)
             staged = framework.stage_case(self.cfg, module, submit, frozen.data, frozen.sha256)
-            task_id = f"cex_{module}_{submit}_{int(time.time() * 1000)}"
+            task_id = f"cex_{module}_{submit}_{random_secrets.token_hex(12)}"
             deliver_epoch = time.time()
+            self.state.record_task(
+                task_id=task_id, lease_id=lease["lease_id"], token=lease["token"],
+                holder=caller.subject, module=module, autoid=submit, build=self.cfg.build,
+                case_ids=list(frozen.autoids), xlsx_sha256=frozen.sha256,
+                staging_dir=staged["staging_dir"], deliver_epoch=deliver_epoch,
+                created_at=time.time(), request_id=args.get("request_id"))
+            if args.get('request_id'):
+                self.audit('request_state',request_id=args['request_id'],state='starting',task_id=task_id)
             framework.launch_run(self.cfg, task_id, module, submit, self.cfg.build, fd)
         finally:
             os.close(fd)
-        self.state.record_task(
-            task_id=task_id, lease_id=lease["lease_id"], token=lease["token"],
-            holder=caller.subject, module=module, autoid=submit, build=self.cfg.build,
-            case_ids=list(frozen.autoids), xlsx_sha256=frozen.sha256,
-            staging_dir=staged["staging_dir"], deliver_epoch=deliver_epoch,
-            created_at=time.time())
         self.audit("case_submitted", subject=caller.subject, task_id=task_id,
                    sha256=frozen.sha256, cases=len(frozen.autoids))
         return {"task_id": task_id, "sha256": frozen.sha256, "bytes": frozen.size,

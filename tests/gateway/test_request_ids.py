@@ -68,3 +68,39 @@ def test_duplicate_conflicts_expiry_and_gc(fake_env, monkeypatch):
     assert gw.state.request_snapshot('expired','alice')[0] is None
     assert StateStore(gw.cfg.state_dir).request_snapshot('expired','alice')[2] > 0
     assert calls == [1]
+
+
+def submission(fake_env,tmp_path):
+    from conftest import make_workbook
+    gw=fake_env['gateway']
+    lease=gw.call(ALICE,'lease_acquire',{})
+    data=make_workbook(tmp_path/'case.xlsx',[('202610230000000001','APV_1','cmd','show slb real')])
+    return args(xlsx_b64=base64.b64encode(data).decode(),lease_id=lease['lease_id'],token=lease['token'])
+
+
+def test_reconcile_crashes_before_and_after_runner(fake_env,tmp_path,monkeypatch):
+    import pytest
+    from gateway import framework
+    from gateway.tools import Gateway
+    from gateway.audit_chain import verify
+    gw=fake_env['gateway']
+    values=submission(fake_env,tmp_path)
+    class Crash(BaseException): pass
+    def stop(cfg,task_id,*_):
+        assert gw.state.task(task_id) is not None
+        raise Crash()
+    monkeypatch.setattr(framework,'launch_run',stop)
+    with pytest.raises(Crash): gw.call(ALICE,'case_submit',values)
+    restarted=Gateway(gw.cfg)
+    row=restarted.reconcile_request('intent:1',ALICE.subject)
+    assert row['state']=='not_started' and not row['reached_device']
+    def started(cfg,task_id,*_):
+        framework.task_paths(cfg,task_id)['start'].write_text('started')
+        raise Crash()
+    monkeypatch.setattr(framework,'launch_run',started)
+    values['request_id']='intent:2'
+    with pytest.raises(Crash): restarted.call(ALICE,'case_submit',values)
+    again=Gateway(gw.cfg)
+    row=again.reconcile_request('intent:2',ALICE.subject)
+    assert row['state']=='started' and row['reached_device']
+    assert verify(again.audit_path)['ok']

@@ -268,11 +268,17 @@ class StateStore:
     # ── 任务 ─────────────────────────────────────────────
     def record_task(self, **fields: Any) -> None:
         fields = dict(fields)
+        request_id = fields.pop("request_id", None)
         fields["case_ids"] = json.dumps(fields["case_ids"])
         columns = ", ".join(fields)
         with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(f"INSERT INTO tasks({columns}) VALUES ({', '.join('?' * len(fields))})",
                          tuple(fields.values()))
+            if request_id:
+                conn.execute("UPDATE requests SET state='starting',task_id=? WHERE request_id=?",
+                             (fields['task_id'],request_id))
+            conn.commit()
 
     def task(self, task_id: str) -> dict[str, Any] | None:
         with self._conn() as conn:

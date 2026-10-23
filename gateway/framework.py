@@ -203,7 +203,7 @@ def stage_case(cfg: GatewayConfig, module: str, autoid: str, data: bytes,
 
 # 每个任务在 <state>/tasks/ 下的文件（cexg gc 按同一张表认领）
 TASK_FILES = (("runner", ".sh"), ("log", ".log"), ("status", ".status.json"), ("junit", ".xml"),
-              ("alive", ".alive"), ("process", ".runner.json"))
+              ("start", ".started"), ("alive", ".alive"), ("process", ".runner.json"))
 
 
 def task_paths(cfg: GatewayConfig, task_id: str) -> dict[str, Path]:
@@ -225,6 +225,7 @@ def launch_run(cfg: GatewayConfig, task_id: str, module: str, autoid: str, build
     done_json = ('{"task_id": "%s", "state": "done", "rc": %%d, "finished_at": %%d}' % task_id)
     script = "\n".join([
         "#!/bin/bash",
+        f"printf started > {q(str(paths['start']))} || exit 98",
         f"cd {q(str(cfg.apv_src))} || exit 97",
         f"timeout --kill-after=30 {int(cfg.run_max_s)} {q(str(cfg.py38))} -m pytest -s "
         f"{q(str(node))} --build {q(build)} --junitxml {q(str(paths['junit']))} "
