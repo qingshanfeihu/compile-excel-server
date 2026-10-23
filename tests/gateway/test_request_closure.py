@@ -125,3 +125,20 @@ def test_offline_journal_reset_rotates_identity_but_keeps_rows(fake_env, capsys)
     assert query['found'] and query['state'] == 'rejected'
     assert query['journal_id'] == identity['journal_id']
     assert query['journal_since'] >= original['journal_since']
+
+
+@pytest.mark.parametrize('status,channel,reason', [
+    ('lost', 'runner_lost', 'not_determined_runner_lost'),
+    ('running', 'not_completed', 'not_determined_not_completed'),
+])
+def test_early_results_disclose_why_ownership_is_not_determined(fake_env, tmp_path, monkeypatch,
+                                                              status, channel, reason):
+    gw = fake_env['gateway']; values = submission(fake_env, tmp_path)
+    monkeypatch.setattr(framework, 'launch_run', lambda *_: None)
+    receipt = gw.call(ALICE, 'case_submit', values)
+    assert receipt['ok']
+    monkeypatch.setattr(framework, 'read_status', lambda *_: {'state': status})
+    answer = gw.call(ALICE, 'case_results', {'task_id': receipt['task_id']})
+    assert answer['channel'] == channel and answer['ownership'] == 'none'
+    assert answer['ownership_reason'] == reason
+    assert answer['next_action']

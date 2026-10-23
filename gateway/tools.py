@@ -126,7 +126,8 @@ TOOL_SPECS: list[dict[str, Any]] = [
      "description": "Per-case results, owned logs and sessions for this task_id only; echoes request_id. "
                     "ownership=staging_directory means a unique delivery directory was verified, not a time "
                     "window. ownership=none and ownership_reason disclose legacy_layout, no_report or "
-                    "ambiguous_reports; inspect this dispatch evidence rather than repeatedly reading. "
+                    "ambiguous_reports; early channels disclose not_determined_runner_lost or "
+                    "not_determined_not_completed. Inspect this dispatch evidence rather than repeatedly reading. "
                     "Missing or overwritten database rows remain missing, never borrowed from another run. "
                     "channel identifies ready, missing_after_done, query_error, not_completed or runner_lost. "
                     "rc is the process exit code and does not itself establish a case verdict.",
@@ -629,9 +630,13 @@ class Gateway:
         status = framework.read_status(self.cfg, task["task_id"])
         if status.get("state") == "lost":
             return {**identity, "channel": "runner_lost", "state": "lost",
+                    "ownership_reason": "not_determined_runner_lost",
+                    "next_action": "Have the operator recover this task's runner and dispatch evidence before determining report ownership",
                     "rc": None, "explanation": RUNNER_LOST}
         if status.get("state") != "done":
             return {**identity, "channel": "not_completed",
+                    "ownership_reason": "not_determined_not_completed",
+                    "next_action": "Poll case_status for this task until done or lost, then read case_results",
                     "state": status.get("state", "unknown")}
         ownership = framework.delivery_report_lookup(self.cfg,task['staging_dir'])
         base = ownership['base']

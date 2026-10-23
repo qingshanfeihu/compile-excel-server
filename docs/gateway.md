@@ -152,7 +152,9 @@ sudo systemctl daemon-reload && sudo systemctl enable --now cexg
 含 interrupted_stage 记录最后处理阶段，不再捏造 launch 拒绝。
 
 旧共享目录任务不回退到时间窗口猜归属。找不到唯一归属报告时回 `ownership: none`，
-`ownership_reason` 区分 legacy_layout、no_report、ambiguous_reports（及越界路径）；须检查派发日志、
+`ownership_reason` 区分 legacy_layout、no_report、ambiguous_reports（及越界路径）。
+尚未跑完或 runner 丢失时未核验归属，分别为 not_determined_not_completed、not_determined_runner_lost；
+前者按 next_action 查询 case_status 后再读结果，后者由管理员恢复本任务 runner 和派发证据再核验。须检查派发日志、
 收集器目录和保留证据，由运维恢复或明确报能力缺口，重复读取本身不能修复。升级仅在床空闲时进行。
 
 凭据字面量刷新失败时保留上次成功集合和旧时间戳，下一次读取继续尝试刷新；不把失败缓存成空集合。
