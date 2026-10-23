@@ -19,3 +19,25 @@ def test_lookup_echoes_resolved_subject_even_for_hidden_or_absent_records(fake_e
     absent = gw.call(bob, 'case_request', {'request_id': 'missing'})
     assert set(hidden) == set(absent)
     assert hidden['found'] is False
+
+
+def test_journal_identity_and_lower_bound_survive_restart_but_not_reset(fake_env):
+    from dataclasses import replace
+    from gateway.state import StateStore
+    gw = fake_env['gateway']
+    answer = gw.call(ALICE, 'case_request', {'request_id': 'missing'})
+    assert isinstance(answer['journal_id'], str) and len(answer['journal_id']) >= 32
+    assert 0 < answer['journal_since'] <= answer['gateway_time']
+    assert answer['gc_before'] >= answer['journal_since']
+    reopened = Gateway(gw.cfg).call(ALICE, 'case_request', {'request_id': 'missing'})
+    assert (answer['journal_id'], answer['journal_since']) == (reopened['journal_id'], reopened['journal_since'])
+    submit = gw.call(ALICE, 'case_submit', args(not_after='2001-01-01T00:00:00Z'))
+    assert submit['journal_id'] == answer['journal_id']
+    assert submit['journal_since'] == answer['journal_since']
+    assert submit['subject'] == ALICE.subject
+    before = time.time()
+    reset = Gateway(replace(gw.cfg, state_dir=gw.cfg.state_dir / 'reset'))
+    fresh = reset.call(ALICE, 'case_request', {'request_id': 'intent:1'})
+    assert not fresh['found'] and fresh['journal_id'] != answer['journal_id']
+    assert before <= fresh['journal_since'] <= fresh['gateway_time']
+    assert StateStore(reset.cfg.state_dir).request_snapshot('missing', ALICE.subject)[2] == fresh['journal_since']

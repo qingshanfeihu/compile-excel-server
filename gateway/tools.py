@@ -204,8 +204,12 @@ class Gateway:
         if not isinstance(args, dict):
             return {"ok": False, "error": "arguments must be an object", "stage":"admission", "reached_device":False}
         if name == "case_submit" and ("request_id" in args or "not_after" in args):
-            return self._request_submit(caller, args)
-        return self._invoke(caller, name, args)
+            result = self._request_submit(caller, args)
+        else:
+            result = self._invoke(caller, name, args)
+        if name in ('case_submit', 'case_request'):
+            result.update(self.state.journal_identity(), subject=caller.subject)
+        return result
 
     def _admission_refusal(self, caller, args, message):
         reply = framework.redact({'ok':False,'error':message,'stage':'admission',

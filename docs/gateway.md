@@ -91,7 +91,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now cexg
 - **去重**：同 id、同主体和同工作簿摘要返回保存的原回答，即使租约已过期也不重查、不重跑；主体或摘要不符只回冲突，不泄露、修改原记录。调用方不能为原 id 改换内容或在清理后复用它，新的尝试使用新的 id。不同 id 即使字节相同也是不同派发。请求处理用固定 256 个 `flock` 条带串行化，内核在网关退出时释放，不按请求数永久积累锁文件。
 - **请求状态**：`received` → `rejected`（带阶段），或 `received` → `starting` → `started`；中断且确认没启动的为 `not_started`。任务与请求的 `starting/task_id` 在同一事务里先记，之后才起 runner。runner 的第一步写 `<task_id>.started`，之后才进入 pytest；父进程在 fork 前持有并传递 `.alive` 锁。查询和重复提交会对账：开始标记存在就是 `started/reached_device: true`；没有标记、请求处理锁和存活锁都已释放才记 `not_started`。正在处理或正在起进程时保持过渡状态，给出继续 `case_request` 的动作；原来的处理/runner 会继续，查询不会重发提交。状态变化在同一 SQLite 事务里留审计事件，随后追加到审计链；重启补写未追加的事件。写链后、确认前中断可能重复追加同一个 `event_id`，但不会漏掉已提交的状态变化。
 - **拒绝阶段**：回答和 `tool_refused` 审计带 `stage`、`reached_device`。提交依次为 `admission`、`lease`、`precheck`、`bed_busy`、`staging`、`launch`，拒绝一律 `false`；runner 已起以后回任务状态，不伪装成拒绝。探测用 `probe`，初始化用 `initialization`；代理在 SSH 登录后明确回传标记，响应丢失时用本地登录标记补回事实；初始化也保留登录状态，登录后失败不会报成未上机。
-- **查账与保留边界**：`case_request` 找到时给 `request_id/state/stage/reached_device/xlsx_sha256/received_at/not_after`，确认 runner 已启动时再给 `task_id`。找不到只给 `found: false/gateway_time/gc_before`（外加工具通用 `ok`）；所有时间字段均是 UTC Unix 秒。只有 `gateway_time > 调用方原 not_after > gc_before` 才能用缺记录证明未执行。查询的快照和当前时刻也在 SQLite 写锁里取，晚到提交不能穿过该截止保证。`gc_before` 为已删记录的最大截止时间，持久、只增；尚未过截止或仍在恢复的请求不清理，相关任务和目录也保留。初始值为 0，不能据此推断旧版不支持此协议的调用；先核对 `initialize.serverInfo.version`。
+- **查账与保留边界**：`case_request` 找到时给 `request_id/state/stage/reached_device/xlsx_sha256/received_at/not_after`，确认 runner 已启动时再给 `task_id`。找不到只给 `found: false/gateway_time/gc_before`（外加工具通用 `ok`）；所有时间字段均是 UTC Unix 秒。只有 `gateway_time > 调用方原 not_after > gc_before` 才能用缺记录证明未执行。查询的快照和当前时刻也在 SQLite 写锁里取，晚到提交不能穿过该截止保证。`gc_before` 为已删记录的最大截止时间，持久、只增；尚未过截止或仍在恢复的请求不清理，相关任务和目录也保留。初始值为日志创建时刻，不能据此推断旧版不支持此协议的调用；先核对 `initialize.serverInfo.version`。
 - **派发目录与兼容边界**：0.4.0 新目录是 `<staging_parent>/<task_id>/ist_staging_<module>/<首案编号>`，紧邻父目录仍给模块、最后一级仍给首案编号。假框架按这两级取名字，并在报告路径中保留 task_id；查询只认完整路径，结果库旧行被覆盖时保留“该派发缺结果行”的发现，不借新派发的行。若没有或出现多份对应报告，不选择最新一份冒充；返回缺结果及继续读取/检查本次日志的动作。回执回显请求 id，结果各通道回显请求 id、task_id 和 `ownership: staging_directory`。**真实框架对此目录布局尚未核对**：本次只跑合成夹具；集成者须先只读核对真实收集路径、报告 URL 和结果库保留规则，再为该版本认证。升级前任务不具有新目录归属保证。
 - **清理**：`cexg gc --config … [--days 30] [--apply]` 列出（加 `--apply` 才删，要求床空闲）N 天前已结束任务的记录、落位目录，以及框架报告里网关落位跑出来的目录。N 必须比 `run_max_s` 多一小时以上。新落位和报告按带 task_id 的目录形状清理，保留无对应网关落位的旧形状报告；请求删除数为 `requests_deleted`，删后查账仍带持久保留边界。
 - **审计**：`cexg audit-verify --config …` 复核网关的审计日志哈希链。
@@ -108,3 +108,16 @@ sudo systemctl daemon-reload && sudo systemctl enable --now cexg
 
 请求查询的 `subject` 是网关解析后的完整调用主体（含 actor），无论找到与否都会回传。
 缺记录仅在查询 subject 与原投递 subject 完全一致时才可能证明未执行；主体变更不能作为未执行证据。
+
+### 请求日志身份和未执行证明
+
+`case_request`（找到或未找到）与 `case_submit` 回答均增加：
+
+- `journal_id`：第一次创建请求日志时生成并持久化的随机身份；重启保持，重建/迁移到新日志时改变。
+- `journal_since`：日志开始可靠记账的 UTC Unix 秒边界，和建表在同一事务持久化。
+- `subject`：网关解析后的完整调用主体，含 actor。
+
+`gc_before` 为垃圾清理边界与 journal_since 的较大值。Hub 必须在投递前同租约下查询并冻结日志身份及主体，
+确认发送投递的会话版本支持请求协议。未找到仅在查询 journal_id 与投递前冻结值相同、subject 与投递主体相同，
+且 gateway_time > 原 not_after > gc_before >= journal_since 时能证明未执行。只核对查询会话的版本不够。
+旧库升级时从升级时刻建立新边界，不能据此证明边界以前的调用；库重置或身份改变均须保留未决，人工核对原投递事实。

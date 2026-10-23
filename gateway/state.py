@@ -83,8 +83,9 @@ class StateStore:
         self.db_path = self.dir / "state.db"
         self.lease_ttl_s = lease_ttl_s
         with self._conn() as conn:
-            conn.executescript(_SCHEMA)
-            conn.execute('BEGIN IMMEDIATE')
+            conn.executescript('BEGIN IMMEDIATE;\n' + _SCHEMA)
+            conn.execute("INSERT OR IGNORE INTO request_meta(name,value) VALUES('journal_since',?)", (time.time(),))
+            conn.execute("INSERT OR IGNORE INTO request_meta(name,value) VALUES('journal_id',?)", ('journal-' + secrets.token_hex(16),))
             if 'request_id' not in {r[1] for r in conn.execute('PRAGMA table_info(tasks)')}:
                 conn.execute('ALTER TABLE tasks ADD COLUMN request_id TEXT')
             conn.commit()
@@ -98,6 +99,10 @@ class StateStore:
             yield conn
         finally:
             conn.close()
+
+    def journal_identity(self):
+        with self._conn() as conn:
+            return dict(conn.execute("SELECT name,value FROM request_meta WHERE name IN ('journal_id','journal_since')"))
 
     def request_lock_path(self, request_id):
         # Fixed stripes avoid retaining a lock inode forever for every expired request.
@@ -185,7 +190,8 @@ class StateStore:
                                (request_id,holder)).fetchone()
             floor = conn.execute("SELECT value FROM request_meta WHERE name='gc_before'").fetchone()
             conn.commit()
-            return (dict(row) if row else None), now, (floor[0] if floor else 0.0)
+            since = conn.execute("SELECT value FROM request_meta WHERE name='journal_since'").fetchone()[0]
+            return (dict(row) if row else None), now, max(since, floor[0] if floor else since)
 
     # ── 床锁 ─────────────────────────────────────────────
     def try_bed_lock(self) -> int | None:
