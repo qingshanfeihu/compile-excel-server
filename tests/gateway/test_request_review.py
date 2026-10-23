@@ -183,3 +183,21 @@ def test_duplicate_request_binds_the_resolved_module(fake_env, monkeypatch):
     assert 'conflicts' in changed['error'] and calls == [1]
     assert gw.call(ALICE, 'case_submit', values) == first
     assert gw.state.request_snapshot(values['request_id'], ALICE.subject)[0]['module'] == 'synthetic_alpha'
+
+
+def test_topology_keeps_other_devices_when_one_probe_fails(fake_env, monkeypatch):
+    from gateway import bed, framework
+    from test_bed_topology import SHOW_IP
+    gw = fake_env['gateway']; lease = gw.call(ALICE, 'lease_acquire', {})
+    seen = []
+    monkeypatch.setattr(bed, '_local', lambda *_: '')
+    monkeypatch.setattr(framework, 'bed_hosts', lambda *_: {})
+    monkeypatch.setattr(framework, 'device_reachable', lambda *_: True)
+    def probe(_cfg, _command, _build, index):
+        seen.append(index)
+        return {'error': 'synthetic login refusal', 'reached_device': True} if index == 0 else {'output': SHOW_IP, 'reached_device': True}
+    monkeypatch.setattr(framework, 'probe', probe)
+    answer = gw.call(ALICE, 'bed_topology', {**lease, 'refresh': True})
+    assert answer['ok'] and seen == [0, 1]
+    assert answer['observation']['unprobed_devices']
+    assert (gw.cfg.state_dir / 'bed_topology.json').is_file()

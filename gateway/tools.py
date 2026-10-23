@@ -681,8 +681,6 @@ class Gateway:
             self._set_stage('probe')
             result = framework.probe(self.cfg,'show ip address',self.cfg.build,index)
             self._progress.reached |= bool(result.get('reached_device'))
-            if 'error' in result:
-                raise ToolError('topology probe failed: ' + result['error'])
             return result.get('output') or ''
         self._set_stage('bed_busy')
         with self.state.bed_lock() as locked:
