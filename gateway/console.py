@@ -142,11 +142,12 @@ class InitResult:
     tty: str
     status: str = "error"
     failed_step: str = ""
+    reached_device: bool = False
     log: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {"device": self.device, "tty": self.tty, "status": self.status,
-                "failed_step": self.failed_step, "log": self.log}
+                "failed_step": self.failed_step, "log": self.log, "reached_device":self.reached_device}
 
 
 def _login(con: Console, hostname: str, user: str, passwd: str, timeout: float) -> bool:
@@ -220,6 +221,7 @@ def init_one(idx: int, *, console_argv: list[str], tty: str, hostname: str, user
         if not _login(con, hostname, user, passwd, login_timeout):
             result.failed_step = "login"
             return result
+        result.reached_device = True
         result.log.append("login ok")
         con.send("conf ter\n")
         ok, out = con.read_until(r"#", step_timeout)
@@ -239,6 +241,10 @@ def init_one(idx: int, *, console_argv: list[str], tty: str, hostname: str, user
                 return result
             result.log.append(f"ok: {command}")
         result.status = "ok"
+        return result
+    except (OSError, ConsoleError) as exc:
+        result.failed_step = "device operation"
+        result.log.append(type(exc).__name__ + ": " + str(exc))
         return result
     finally:
         con.close()

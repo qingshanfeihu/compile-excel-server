@@ -439,8 +439,16 @@ def probe(cfg: GatewayConfig, command: str, build: str, device_index: int) -> di
     if not 0 <= device_index < len(ips):
         raise FrameworkError(f"device_index {device_index} is not in the framework conf")
     creds = device_credentials(parser, build)
-    result = agent_call(cfg, {"op": "probe", "ip": ips[device_index], "user": creds["user"],
-                              "passwd": creds["passwd"], "command": command}, timeout=90)
+    # Preserve the device fact even if the proxy loses its JSON reply after login.
+    import uuid
+    marker = cfg.state_dir / ('probe-' + uuid.uuid4().hex + '.login')
+    try:
+        result = agent_call(cfg, {"op": "probe", "ip": ips[device_index], "user": creds["user"],
+                                  "passwd": creds["passwd"], "command": command,
+                                  "login_marker": str(marker)}, timeout=90)
+        result['reached_device'] = bool(result.get('reached_device')) or marker.exists()
+    finally:
+        marker.unlink(missing_ok=True)
     if "output" in result:
         result["output"] = scrub_text(result["output"])
     return result

@@ -134,9 +134,14 @@ def op_probe(req):
     ssh = paramiko.SSHClient()
     # 设备常被重装，主机密钥会变；与 InfoTest 现行做法一致
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(hostname=req["ip"], port=22, username=req["user"], password=req["passwd"],
-                timeout=15, look_for_keys=False, allow_agent=False)
+    reached = False
     try:
+        ssh.connect(hostname=req["ip"], port=22, username=req["user"], password=req["passwd"],
+                timeout=15, look_for_keys=False, allow_agent=False)
+        reached = True
+        if req.get('login_marker'):
+            with open(req['login_marker'], 'w') as marker:
+                marker.write('logged in')
         chan = ssh.invoke_shell()
         banner, _ = read_until_prompt(chan, _PROMPT_END, PROMPT_WAIT_S)
         # 登录后的那一行提示符定下主机名；命令输出要等到“主机名[(模式)]#”出现在末尾才算完
@@ -154,6 +159,8 @@ def op_probe(req):
         read_until_prompt(chan, prompt, PROMPT_WAIT_S)
         chan.send(cmd + "\n")
         out, complete = read_until_prompt(chan, prompt, COMMAND_WAIT_S)
+    except Exception as exc:
+        return {"error": "%s: %s" % (type(exc).__name__, exc), "reached_device": reached}
     finally:
         ssh.close()
     raw = out.splitlines()
@@ -163,9 +170,9 @@ def op_probe(req):
         tail.pop()
     core = "\n".join(tail).strip()
     if core and re.match(r"^\^+$", core):
-        return {"command": cmd, "syntax_error": True,
+        return {"command": cmd, "syntax_error": True, "reached_device": True,
                 "output": "%% Invalid input: command %r is invalid on this device" % cmd}
-    result = {"command": cmd, "output": "\n".join(lines)}
+    result = {"command": cmd, "output": "\n".join(lines), "reached_device": True}
     if not complete:
         # 等不到设备提示符：输出可能不全，不能当完整回显用
         result.update(truncated=True, note="no device prompt within %ds; output may be "

@@ -163,6 +163,7 @@ class Gateway:
         self.cfg = cfg
         self.state = StateStore(cfg.state_dir, cfg.lease_ttl_s)
         self.auth = auth or StaticSecretAuth.from_config(cfg)
+        self._progress = threading.local()
         self._grammar_lock = threading.Lock()
         self._grammar: tuple[tuple[int, int], dict[str, Any]] | None = None
         self._literals: tuple[float, frozenset[str]] | None = None
@@ -186,24 +187,27 @@ class Gateway:
     def call(self, caller: Caller, name: str, args: dict[str, Any]) -> dict[str, Any]:
         spec = next((s for s in TOOL_SPECS if s["name"] == name), None)
         if spec is None:
-            return {"ok": False, "error": f"unknown tool {name!r}"}
+            return {"ok": False, "error": f"unknown tool {name!r}", "stage":"admission", "reached_device":False}
         if spec["scope"] not in caller.scopes or "jumphost:run" not in caller.scopes:
-            return {"ok": False, "error": f"your token lacks the {spec['scope']} scope"}
+            return {"ok": False, "error": f"your token lacks the {spec['scope']} scope", "stage":"admission", "reached_device":False}
         if not isinstance(args, dict):
-            return {"ok": False, "error": "arguments must be an object"}
+            return {"ok": False, "error": "arguments must be an object", "stage":"admission", "reached_device":False}
         if name == "case_submit" and ("request_id" in args or "not_after" in args):
             return self._request_submit(caller, args)
         return self._invoke(caller, name, args)
 
     def _invoke(self, caller, name, args):
+        self._progress.stage, self._progress.reached = "admission", False
         try:
             result = self.handlers[name](caller, args)
-        except (LeaseError, ToolError, gates.GateError, framework.FrameworkError) as exc:
+        except (LeaseError, ToolError, gates.GateError, framework.FrameworkError, OSError, ValueError) as exc:
+            stage, reached = self._progress.stage, self._progress.reached
             secrets = self.secrets()
             problems = getattr(exc, "problems", None)
             self.audit("tool_refused", tool=name, subject=caller.subject,
+                       request_id=args.get("request_id"),stage=stage,reached_device=reached,
                        reason=framework.redact(str(exc)[:500], secrets))
-            return framework.redact({"ok": False, "error": str(exc),
+            return framework.redact({"ok": False, "error": str(exc), "stage":stage,"reached_device":reached,
                                      **({"problems": problems} if problems else {})}, secrets)
         # 日志尾、每案日志、探测回显、结果库报错……回给客户端的一切都过一遍已知口令
         return framework.redact({"ok": True, **({"request_record": "none"} if name == "case_submit" else {}),
@@ -248,12 +252,18 @@ class Gateway:
             if stamp.tzinfo is None or stamp.utcoffset().total_seconds() != 0:
                 raise ValueError('not UTC')
             deadline = stamp.timestamp()
-            raw = base64.b64decode(str(args.get('xlsx_b64') or ''), validate=True)
         except (ToolError,ValueError,binascii.Error) as exc:
             return {'ok':False,'error':str(exc),'stage':'admission','reached_device':False}
+        decode_error = None
+        try:
+            raw = base64.b64decode(str(args.get('xlsx_b64') or ''),validate=True)
+            digest = hashlib.sha256(raw).hexdigest()
+        except (ValueError,binascii.Error):
+            digest = ''  # No workbook bytes exist; never present this as a workbook hash.
+            decode_error = 'xlsx_b64 is not valid base64; fix the encoding and use a new request_id'
         with self.state.request_lock(rid):
-            row, fresh = self.state.reserve_request(rid, caller.subject, hashlib.sha256(raw).hexdigest(), deadline)
-            if row['holder'] != caller.subject or row['xlsx_sha256'] != hashlib.sha256(raw).hexdigest():
+            row, fresh = self.state.reserve_request(rid, caller.subject, digest, deadline)
+            if row['holder'] != caller.subject or row['xlsx_sha256'] != digest:
                 return {'ok':False,'error':'request_id conflicts with an existing request; use a new request_id',
                         'stage':'admission','reached_device':False}
             if not fresh:
@@ -261,11 +271,17 @@ class Gateway:
                     return json.loads(row['reply'])
                 return {'ok':True,'request_id':rid,'state':row['state'],'reached_device':bool(row['reached_device'])}
             self.audit('request_state',request_id=rid,state='received')
-            if deadline <= row['received_at']:
+            if decode_error:
+                reply = {'ok':False,'error':decode_error,'stage':'admission','reached_device':False}
+            elif deadline <= row['received_at']:
                 reply = {'ok':False,'error':'request expired before admission; use a new request_id and deadline',
                          'stage':'admission','reached_device':False}
             else:
                 reply = self._invoke(caller,'case_submit',args)
+            if not reply['ok'] and reply.get('stage') == 'admission':
+                self.audit('tool_refused',tool='case_submit',subject=caller.subject,
+                           request_id=rid,stage='admission',reached_device=False,
+                           reason=reply['error'])
             reply.update(request_id=rid,request_record='recorded')
             state = 'started' if reply['ok'] else 'rejected'
             self.state.update_request(rid,reply=json.dumps(reply),state=state,
@@ -274,6 +290,7 @@ class Gateway:
             return reply
 
     def _lease(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
+        self._progress.stage = "lease"
         return self.state.check(caller.subject, str(args.get("lease_id") or ""), args.get("token"))
 
     def grammar(self) -> dict[str, Any]:
@@ -408,7 +425,9 @@ class Gateway:
                 if not locked:
                     add("device_build", False, "bed busy (a run is in progress)")
                 else:
+                    self._progress.stage = "probe"
                     out = framework.probe(cfg, str(probe_spec["cmd"]), cfg.build, 0)
+                    self._progress.reached |= bool(out.get("reached_device"))
                     match = re.search(str(probe_spec["extract"]), out.get("output") or "")
                     if match is None:
                         add("device_build", False, out.get("error") or "build not found in output")
@@ -419,7 +438,8 @@ class Gateway:
         else:
             add("device_build", False, "no bed_probes.build in the bundle grammar")
         out = {"ready": all(c["ok"] for c in checks), "checks": checks,
-               "build_checked": build_checked, "device_count": len(ips)}
+               "build_checked": build_checked, "device_count": len(ips),
+               "stage":self._progress.stage,"reached_device":self._progress.reached}
         # conf 读不到就没有 conf 字段：空数组会冒充“读到了、零台设备”
         if conf is not None:
             out["conf"] = conf
@@ -427,23 +447,26 @@ class Gateway:
 
     # ── 上机 ──────────────────────────────────────────────
     def case_submit(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
-        lease = self._lease(caller, args)
         try:
             data = base64.b64decode(str(args.get("xlsx_b64") or ""), validate=True)
         except (binascii.Error, ValueError):
             raise ToolError("xlsx_b64 is not valid base64") from None
+        lease = self._lease(caller, args)
+        self._progress.stage = "precheck"
         module = framework.safe(args.get("module") or self.cfg.default_module, "module")
         frozen = gates.freeze(data)
         device_count = len(framework.device_ips(framework.read_conf(self.cfg)))
         gates.check(frozen, grammar=self.grammar(), credential_literals=self.credential_literals(),
                     device_count=device_count)
         submit = framework.safe(frozen.autoids[0], "autoid")
+        self._progress.stage = "bed_busy"
         fd = self.state.try_bed_lock()
         if fd is None:
             raise ToolError("bed busy: another run or device operation is in progress")
         try:
             # 冻结、取规则、抽凭据字面量可能要几十秒：租约在这期间过期或被接管，就不能再上机
             lease = self._lease(caller, args)
+            self._progress.stage = "staging"
             staged = framework.stage_case(self.cfg, module, submit, frozen.data, frozen.sha256)
             task_id = f"cex_{module}_{submit}_{random_secrets.token_hex(12)}"
             deliver_epoch = time.time()
@@ -455,6 +478,7 @@ class Gateway:
                 created_at=time.time(), request_id=args.get("request_id"))
             if args.get('request_id'):
                 self.audit('request_state',request_id=args['request_id'],state='starting',task_id=task_id)
+            self._progress.stage = "launch"
             framework.launch_run(self.cfg, task_id, module, submit, self.cfg.build, fd)
         finally:
             os.close(fd)
@@ -544,6 +568,8 @@ class Gateway:
             if not locked:
                 raise ToolError("bed busy: a run is in progress")
             result = framework.probe(self.cfg, command.strip(), self.cfg.build, index)
+        self._progress.stage = "probe"
+        self._progress.reached = bool(result.get("reached_device"))
         if "error" in result:
             raise ToolError(f"probe failed: {result['error']}")
         return result
@@ -560,6 +586,13 @@ class Gateway:
                 return {**json.loads(cache.read_text(encoding="utf-8")), **services}
             except (OSError, ValueError):
                 pass
+        def topology_probe(index):
+            self._progress.stage = 'probe'
+            result = framework.probe(self.cfg,'show ip address',self.cfg.build,index)
+            self._progress.reached |= bool(result.get('reached_device'))
+            if 'error' in result:
+                raise ToolError('topology probe failed: ' + result['error'])
+            return result.get('output') or ''
         with self.state.bed_lock() as locked:
             if not locked:
                 raise ToolError("bed busy: a run is in progress")
@@ -567,8 +600,7 @@ class Gateway:
                 result = bed.collect(
                     self.cfg,
                     hosts=lambda hosts: framework.bed_hosts(self.cfg, hosts),
-                    probe_show_ip=lambda index: framework.probe(
-                        self.cfg, "show ip address", self.cfg.build, index).get("output") or "",
+                    probe_show_ip=topology_probe,
                     reachable=framework.device_reachable)
             except framework.FrameworkError as exc:
                 raise ToolError(str(exc)) from None
@@ -638,12 +670,14 @@ class Gateway:
                     long_commands=self.cfg.init_long_commands,
                     step_timeout=self.cfg.init_step_timeout_s,
                     login_timeout=self.cfg.login_timeout_s)
+                self._progress.stage = "initialization"
+                self._progress.reached |= outcome.reached_device
                 results.append(outcome.as_dict())
         ok = sum(r["status"] == "ok" for r in results)
         self.audit("init_done", subject=caller.subject, ok=ok, total=len(results),
                    failed=[r["device"] for r in results if r["status"] != "ok"])
         return {"initialized": ok, "failed": len(results) - ok, "total": len(results),
-                "details": results}
+                "details": results,"stage":self._progress.stage,"reached_device":self._progress.reached}
 
 
 def load_gateway(config_path: Path) -> Gateway:
