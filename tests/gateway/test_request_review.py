@@ -171,3 +171,15 @@ def test_interruption_retains_phase_and_query_agrees_with_duplicate(fake_env, tm
     assert query['stage'] == duplicate['stage'] == 'interrupted'
     assert duplicate['interrupted_stage'] == 'precheck'
     assert duplicate['ok'] and duplicate['reached_device'] is False
+
+
+def test_duplicate_request_binds_the_resolved_module(fake_env, monkeypatch):
+    gw = fake_env['gateway']; calls = []
+    monkeypatch.setitem(gw.handlers, 'case_submit', lambda *_: calls.append(1) or {'task_id': 'synthetic'})
+    values = args(module='synthetic_alpha')
+    first = gw.call(ALICE, 'case_submit', values)
+    changed = gw.call(ALICE, 'case_submit', {**values, 'module': 'synthetic_beta'})
+    assert not changed['ok'] and changed['stage'] == 'admission' and changed['reached_device'] is False
+    assert 'conflicts' in changed['error'] and calls == [1]
+    assert gw.call(ALICE, 'case_submit', values) == first
+    assert gw.state.request_snapshot(values['request_id'], ALICE.subject)[0]['module'] == 'synthetic_alpha'

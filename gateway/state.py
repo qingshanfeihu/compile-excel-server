@@ -25,7 +25,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS requests (
  request_id TEXT PRIMARY KEY, holder TEXT NOT NULL, xlsx_sha256 TEXT NOT NULL,
  not_after REAL NOT NULL, received_at REAL NOT NULL, state TEXT NOT NULL,
- reply TEXT, task_id TEXT, stage TEXT, reached_device INTEGER NOT NULL DEFAULT 0
+ reply TEXT, task_id TEXT, module TEXT, stage TEXT, reached_device INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS request_events (
  event_id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL, state TEXT NOT NULL,
@@ -88,6 +88,9 @@ class StateStore:
             conn.execute("INSERT OR IGNORE INTO request_meta(name,value) VALUES('journal_id',?)", ('journal-' + secrets.token_hex(16),))
             if 'request_id' not in {r[1] for r in conn.execute('PRAGMA table_info(tasks)')}:
                 conn.execute('ALTER TABLE tasks ADD COLUMN request_id TEXT')
+            if 'module' not in {r[1] for r in conn.execute('PRAGMA table_info(requests)')}:
+                conn.execute('ALTER TABLE requests ADD COLUMN module TEXT')
+                conn.execute('UPDATE requests SET module=(SELECT module FROM tasks WHERE tasks.task_id=requests.task_id)')
             conn.commit()
 
     @contextmanager
@@ -126,7 +129,7 @@ class StateStore:
         finally:
             os.close(fd)
 
-    def reserve_request(self, request_id, holder, sha256, not_after, admission_error=None):
+    def reserve_request(self, request_id, holder, sha256, not_after, admission_error=None, module=None):
         with self._conn() as conn:
             conn.execute('BEGIN IMMEDIATE')
             now = self._request_now(conn)
@@ -141,8 +144,8 @@ class StateStore:
             error = admission_error or ('request expired before admission; use a new request_id and deadline' if not_after <= now else None)
             reply = json.dumps({'ok': False, 'error': error, 'stage': 'admission', 'reached_device': False,
                                 'request_id': request_id, 'request_record': 'recorded'}) if error else None
-            conn.execute('INSERT INTO requests(request_id,holder,xlsx_sha256,not_after,received_at,state,stage,reply) '
-                         'VALUES(?,?,?,?,?,?,?,?)', (request_id,holder,sha256,not_after,now,'rejected' if error else 'received','admission',reply))
+            conn.execute('INSERT INTO requests(request_id,holder,xlsx_sha256,not_after,received_at,state,stage,reply,module) '
+                         'VALUES(?,?,?,?,?,?,?,?,?)', (request_id,holder,sha256,not_after,now,'rejected' if error else 'received','admission',reply,module))
             row = dict(conn.execute('SELECT * FROM requests WHERE request_id=?', (request_id,)).fetchone())
             self._request_event(conn,request_id)
             row['expired'] = not_after <= now

@@ -334,6 +334,11 @@ class Gateway:
             deadline = stamp.timestamp()
         except (ToolError,ValueError,binascii.Error) as exc:
             return self._admission_refusal(caller,args,str(exc))
+        module_error = None
+        try:
+            module = framework.safe(args.get('module') or self.cfg.default_module, 'module')
+        except framework.FrameworkError as exc:
+            module, module_error = None, str(exc)
         decode_error = None
         try:
             raw = base64.b64decode(str(args.get('xlsx_b64') or ''),validate=True)
@@ -342,10 +347,10 @@ class Gateway:
             digest = ''  # No workbook bytes exist; never present this as a workbook hash.
             decode_error = 'xlsx_b64 is not valid base64; fix the encoding and use a new request_id'
         with self.state.request_lock(rid):
-            row, fresh = self.state.reserve_request(rid, caller.subject, digest, deadline, admission_error=decode_error)
+            row, fresh = self.state.reserve_request(rid, caller.subject, digest, deadline, admission_error=decode_error or module_error, module=module)
             if row.get('collected'):
                 return {**self._admission_refusal(caller, args, 'request falls within collected history; inspect the original dispatch before using a new request_id'), 'request_record': 'collected'}
-            if row['holder'] != caller.subject or row['xlsx_sha256'] != digest:
+            if row['holder'] != caller.subject or row['xlsx_sha256'] != digest or row['module'] != module:
                 return self._admission_refusal(caller,args,
                     'request_id conflicts with an existing request; use a new request_id')
             if not fresh:
