@@ -124,3 +124,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now cexg
 
 请求处于 received/starting 且尚无 runner 开始标记时，reached_device 为 null（尚未确定），不可当 false。
 即使请求处理锁忙，存在开始标记仍确认为 started/true 并给 task_id。
+
+过期与 base64 拒绝在首次请求登记事务中直接持久化为 rejected/admission；处理阶段每次变化也持久化。
+中断且证实未启动时，查询和重复投递均回 not_started/interrupted；重复投递为非拒绝状态回答，
+含 interrupted_stage 记录最后处理阶段，不再捏造 launch 拒绝。

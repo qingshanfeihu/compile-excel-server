@@ -138,3 +138,36 @@ def test_constructing_a_checker_does_not_flush_or_break_service_audit(fake_env):
     assert verify(gw.audit_path)['ok']
     records = [json.loads(line) for line in gw.audit_path.read_text().splitlines()]
     assert any(r.get('request_id') == 'audit-intent' for r in records)
+
+
+@pytest.mark.parametrize('values', [args(not_after='2001-01-01T00:00:00Z'), args(xlsx_b64='!')])
+def test_admission_rejection_is_atomic_with_request_reservation(fake_env, monkeypatch, values):
+    gw = fake_env['gateway']; reserve = gw.state.reserve_request
+    class Crash(BaseException): pass
+    def stopped(*a, **kw):
+        reserve(*a, **kw)
+        raise Crash()
+    monkeypatch.setattr(gw.state, 'reserve_request', stopped)
+    with pytest.raises(Crash): gw.call(ALICE, 'case_submit', values)
+    restarted = Gateway(gw.cfg)
+    query = restarted.call(ALICE, 'case_request', {'request_id': values['request_id']})
+    duplicate = restarted.call(ALICE, 'case_submit', values)
+    assert query['state'] == 'rejected' and query['stage'] == 'admission'
+    assert duplicate['stage'] == query['stage'] and duplicate['reached_device'] is False
+
+
+def test_interruption_retains_phase_and_query_agrees_with_duplicate(fake_env, tmp_path, monkeypatch):
+    from gateway import gates
+    gw = fake_env['gateway']; values = submission(fake_env, tmp_path)
+    class Crash(BaseException): pass
+    def stopped(*_): raise Crash()
+    monkeypatch.setattr(gates, 'freeze', stopped)
+    with pytest.raises(Crash): gw.call(ALICE, 'case_submit', values)
+    assert gw.state.request_snapshot(values['request_id'], ALICE.subject)[0]['stage'] == 'precheck'
+    restarted = Gateway(gw.cfg)
+    query = restarted.call(ALICE, 'case_request', {'request_id': values['request_id']})
+    duplicate = restarted.call(ALICE, 'case_submit', values)
+    assert query['state'] == duplicate['state'] == 'not_started'
+    assert query['stage'] == duplicate['stage'] == 'interrupted'
+    assert duplicate['interrupted_stage'] == 'precheck'
+    assert duplicate['ok'] and duplicate['reached_device'] is False

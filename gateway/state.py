@@ -126,7 +126,7 @@ class StateStore:
         finally:
             os.close(fd)
 
-    def reserve_request(self, request_id, holder, sha256, not_after):
+    def reserve_request(self, request_id, holder, sha256, not_after, admission_error=None):
         with self._conn() as conn:
             conn.execute('BEGIN IMMEDIATE')
             now = self._request_now(conn)
@@ -138,8 +138,11 @@ class StateStore:
             if floor and not_after <= floor[0]:
                 conn.commit()
                 return {'collected': True}, False
-            conn.execute('INSERT INTO requests(request_id,holder,xlsx_sha256,not_after,received_at,state) '
-                         'VALUES(?,?,?,?,?,?)', (request_id,holder,sha256,not_after,now,'received'))
+            error = admission_error or ('request expired before admission; use a new request_id and deadline' if not_after <= now else None)
+            reply = json.dumps({'ok': False, 'error': error, 'stage': 'admission', 'reached_device': False,
+                                'request_id': request_id, 'request_record': 'recorded'}) if error else None
+            conn.execute('INSERT INTO requests(request_id,holder,xlsx_sha256,not_after,received_at,state,stage,reply) '
+                         'VALUES(?,?,?,?,?,?,?,?)', (request_id,holder,sha256,not_after,now,'rejected' if error else 'received','admission',reply))
             row = dict(conn.execute('SELECT * FROM requests WHERE request_id=?', (request_id,)).fetchone())
             self._request_event(conn,request_id)
             row['expired'] = not_after <= now
