@@ -87,3 +87,39 @@ def test_busy_request_stripe_still_reports_positive_runner_marker(fake_env, tmp_
         started = gw.call(ALICE, 'case_request', {'request_id': values['request_id']})
         assert started['state'] == 'started' and started['reached_device'] is True
         assert started['task_id'] == receipt['task_id']
+
+
+import pytest
+
+ADMIN = Caller('synthetic-admin', frozenset({'jumphost:run', 'jumphost:admin'}))
+
+@pytest.mark.parametrize('tool', ['probe_show', 'bed_topology', 'init_device'])
+def test_device_tool_busy_refusals_have_busy_stage(fake_env, tool):
+    gw = fake_env['gateway']
+    lease = gw.call(ADMIN, 'lease_acquire', {})
+    values = {**lease, 'command': 'show version', 'refresh': True, 'step': 'confirm'}
+    if tool == 'init_device':
+        values['confirmation'] = gw.call(ADMIN, tool, {**lease, 'step': 'prepare'})['confirmation']
+    with gw.state.bed_lock() as locked:
+        assert locked
+        out = gw.call(ADMIN, tool, values)
+    assert not out['ok'] and out['stage'] == 'bed_busy' and out['reached_device'] is False
+
+@pytest.mark.parametrize('tool,values', [
+    ('env_prepare', {'device_build': 'OTHER_SYNTHETIC_BUILD'}),
+    ('case_submit', {'module': '../invalid', 'xlsx_b64': 'eA=='}),
+    ('init_device', {'step': 'prepare', 'device_count': 0}),
+    ('init_device', {'step': 'confirm', 'confirmation': ''}),
+])
+def test_bad_device_parameters_are_rejected_at_admission_before_lease(fake_env, tool, values):
+    out = fake_env['gateway'].call(ADMIN, tool, values)
+    assert not out['ok'] and out['stage'] == 'admission' and out['reached_device'] is False
+
+
+def test_probe_setup_failure_is_probe_before_contact(fake_env, monkeypatch):
+    from gateway import framework
+    gw = fake_env['gateway']; lease = gw.call(ALICE, 'lease_acquire', {})
+    def fail(*_): raise framework.FrameworkError('synthetic probe setup failure')
+    monkeypatch.setattr(framework, 'probe', fail)
+    out = gw.call(ALICE, 'probe_show', {**lease, 'command': 'show version'})
+    assert not out['ok'] and out['stage'] == 'probe' and out['reached_device'] is False

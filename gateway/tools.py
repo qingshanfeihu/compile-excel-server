@@ -451,7 +451,6 @@ class Gateway:
 
     # ── 环境自检 ──────────────────────────────────────────
     def env_prepare(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
-        self._lease(caller, args)
         # 客户端按哪个构建编的用例：与本床不符就不用往下查了（老客户端不带，照查但注明没核对）
         wanted = args.get("device_build")
         build_checked = wanted not in (None, "")
@@ -459,6 +458,8 @@ class Gateway:
             raise ToolError(f"device_build {str(wanted)!r} is not this bed's build "
                             f"{self.cfg.build!r}; compile against {self.cfg.build!r} or use the "
                             "gateway of the bed that runs your build")
+        self._lease(caller, args)
+        self._progress.stage = 'precheck'
         checks: list[dict[str, Any]] = []
 
         def add(key: str, ok: bool, detail: str = "") -> None:
@@ -498,6 +499,7 @@ class Gateway:
             add("credential_literals", False, str(exc))
         probe_spec = (grammar.get("bed_probes") or {}).get("build") or {}
         if ips and probe_spec.get("cmd") and probe_spec.get("extract"):
+            self._progress.stage = 'bed_busy'
             with self.state.bed_lock() as locked:
                 if not locked:
                     add("device_build", False, "bed busy (a run is in progress)")
@@ -528,9 +530,9 @@ class Gateway:
             data = base64.b64decode(str(args.get("xlsx_b64") or ""), validate=True)
         except (binascii.Error, ValueError):
             raise ToolError("xlsx_b64 is not valid base64") from None
+        module = framework.safe(args.get("module") or self.cfg.default_module, "module")
         lease = self._lease(caller, args)
         self._progress.stage = "precheck"
-        module = framework.safe(args.get("module") or self.cfg.default_module, "module")
         frozen = gates.freeze(data)
         device_count = len(framework.device_ips(framework.read_conf(self.cfg)))
         gates.check(frozen, grammar=self.grammar(), credential_literals=self.credential_literals(),
@@ -635,9 +637,11 @@ class Gateway:
                             "digits, spaces and _ . , : / @ % + = * \" ' -)")
         self._lease(caller, args)
         index = int(args.get("device_index") or 0)
+        self._progress.stage = 'bed_busy'
         with self.state.bed_lock() as locked:
             if not locked:
                 raise ToolError("bed busy: a run is in progress")
+            self._progress.stage = 'probe'
             result = framework.probe(self.cfg, command.strip(), self.cfg.build, index)
         self._progress.stage = "probe"
         self._progress.reached = bool(result.get("reached_device"))
@@ -664,9 +668,11 @@ class Gateway:
             if 'error' in result:
                 raise ToolError('topology probe failed: ' + result['error'])
             return result.get('output') or ''
+        self._progress.stage = 'bed_busy'
         with self.state.bed_lock() as locked:
             if not locked:
                 raise ToolError("bed busy: a run is in progress")
+            self._progress.stage = 'probe'
             try:
                 result = bed.collect(
                     self.cfg,
@@ -712,10 +718,14 @@ class Gateway:
                             for idx in indices]}
 
     def init_device(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
-        lease = self._lease(caller, args)
         step = args.get("step")
+        if step not in ('prepare', 'confirm'):
+            raise ToolError('step must be prepare or confirm')
+        plan = self._init_plan(args) if step == 'prepare' else None
+        if step == 'confirm' and not args.get('confirmation'):
+            raise ToolError('confirmation is required; call init_device with step=prepare')
+        lease = self._lease(caller, args)
         if step == "prepare":
-            plan = self._init_plan(args)
             code = self.state.new_challenge(caller.subject, lease["lease_id"], plan)
             self.audit("init_prepared", subject=caller.subject,
                        devices=[d["device"] for d in plan["devices"]])
@@ -724,11 +734,14 @@ class Gateway:
                             "init_device with step=confirm and this confirmation code."}
         if step != "confirm":
             raise ToolError("step must be prepare or confirm")
+        self._progress.stage = 'admission'
         plan = self.state.consume_challenge(str(args.get("confirmation") or ""),
                                             caller.subject, lease["lease_id"])
+        self._progress.stage = 'initialization'
         parser = framework.read_conf(self.cfg)
         creds = framework.device_credentials(parser, self.cfg.build)
         results = []
+        self._progress.stage = 'bed_busy'
         with self.state.bed_lock() as locked:
             if not locked:
                 raise ToolError("bed busy: a run is in progress")
