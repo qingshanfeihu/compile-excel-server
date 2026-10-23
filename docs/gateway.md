@@ -119,7 +119,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now cexg
 
 `case_request`（找到或未找到）与 `case_submit` 回答均增加：
 
-- `journal_id`：第一次创建请求日志时生成并持久化的随机身份；重启保持，重建/迁移到新日志时改变。
+- `journal_id`：第一次创建请求日志时生成并持久化的随机身份；重启保持，重建、迁移到新日志或日志内容可能回退时改变。
 - `journal_since`：日志开始可靠记账的 UTC Unix 秒边界，和建表在同一事务持久化。
 - `subject`：网关解析后的完整调用主体，含 actor。
 
@@ -127,6 +127,22 @@ sudo systemctl daemon-reload && sudo systemctl enable --now cexg
 确认发送投递的会话版本支持请求协议。未找到仅在查询 journal_id 与投递前冻结值相同、subject 与投递主体相同，
 且 gateway_time > 原 not_after > gc_before >= journal_since 时能证明未执行。只核对查询会话的版本不够。
 旧库升级时从升级时刻建立新边界，不能据此证明边界以前的调用；库重置或身份改变均须保留未决，人工核对原投递事实。
+
+请求事实（含启动前任务快照）、待投审计事件、日志身份和持久时钟下限放在独立 SQLite 日志中：
+`<state.dir 的同级目录>/<state.dir 末段名>.request-journal/requests.db`，例如配置为 `state` 时使用
+同级 `state.request-journal/requests.db`。`state.db` 仍保存租约和任务列表，但不再作为请求日志的副本。
+恢复旧 `state.db` 不会抹掉已登记的投递，也不会改变请求日志身份；启动前的快照支持主库任务行丢失后的查询和去重。
+旧库首次升级会迁移原有请求并换日志身份和起点，须在服务停止、床空闲时执行。
+主库记录独立日志的存储身份，独立日志丢失或与该身份不符时拒绝启动，管理员须恢复可信的当前日志。
+备份和灾备必须单独保护请求日志；不得只恢复旧主库后删除请求日志来“修复”启动失败。
+
+本机无法检测独立日志及其身份一起回退（例如从旧备份恢复两个目录或切换到旧副本）。
+发生这种恢复时，管理员必须先停止网关、核对床和未决 runner，再在离线且床空闲时运行
+`cexg journal-reset --config gateway.toml --reason "Restore reconciled backup"`，然后再启动服务。
+命令改变公开 `journal_id`，将 `journal_since` 抬到持久时钟下限与当前时间的较大值，保留请求行和清理边界；
+不会把旧请求变成新的投递。命令不负责停服，运行中的服务不得并行执行此维护动作。
+旧身份下的未决投递必须人工核实，不得因查空结项；Hub 冻结身份不匹配时须继续保持未决。
+日志完整性或备份新旧无法核实时也不能采信查空。正常重启不需要换身份。
 
 请求处于 received/starting 且尚无 runner 开始标记时，reached_device 为 null（尚未确定），不可当 false。
 即使请求处理锁忙，存在开始标记仍确认为 started/true 并给 task_id。

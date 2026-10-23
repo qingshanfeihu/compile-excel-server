@@ -111,12 +111,26 @@ def cmd_gc(config: Path, days: float, apply: bool) -> int:
     return 0
 
 
+def cmd_journal_reset(config: Path, reason: str) -> int:
+    from gateway.state import StateStore, JournalError
+    try:
+        cfg = load(config)
+        identity = StateStore(cfg.state_dir).reset_journal_identity(reason)
+    except (ConfigError, JournalError, OSError) as exc:
+        print(json.dumps({'ok': False, 'error': str(exc)}))
+        return 2
+    print(json.dumps({'ok': True, **identity}))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="cexg", description="compile-excel 跳板机网关")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("serve", "check", "audit-verify", "gc"):
+    for name in ("serve", "check", "audit-verify", "gc", "journal-reset"):
         p = sub.add_parser(name)
         p.add_argument("--config", required=True)
+        if name == "journal-reset":
+            p.add_argument("--reason", required=True)
         if name == "gc":
             p.add_argument("--days", type=float, default=30,
                            help="只清最近一次写入早于这么多天前的（默认 30）")
@@ -127,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
         print(SAMPLE.read_text(encoding="utf-8"))
         return 0
     config = Path(args.config).expanduser()
+    if args.command == "journal-reset":
+        return cmd_journal_reset(config, args.reason)
     if args.command == "audit-verify":
         return cmd_audit_verify(config)
     if args.command == "gc":

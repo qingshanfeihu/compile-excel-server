@@ -202,7 +202,7 @@ def test_query_clock_after_lock_prevents_late_launch(fake_env,monkeypatch):
     import sqlite3,time,threading
     gw=fake_env['gateway']; launches=[]
     monkeypatch.setitem(gw.handlers,'case_submit',lambda *_:launches.append(1) or {'task_id':'fake'})
-    blocker=sqlite3.connect(gw.state.db_path,isolation_level=None)
+    blocker=sqlite3.connect(gw.state.request_db_path,isolation_level=None)
     blocker.execute('BEGIN IMMEDIATE')
     deadline=time.time()+0.15
     values=args(not_after=datetime.fromtimestamp(deadline,timezone.utc).isoformat())
@@ -266,7 +266,7 @@ def test_deliveries_own_results_logs_sessions_and_gc(fake_env,tmp_path):
     protected=prune.run(gw.cfg,30,apply=False)
     assert not protected['tasks'] and not protected['staging']
     # Expired records can now be removed, together with their owned trees.
-    with gw.state._conn() as conn: conn.execute('UPDATE requests SET not_after=?,received_at=?',(old,old))
+    with gw.state._request_conn() as conn: conn.execute('UPDATE requests SET not_after=?,received_at=?',(old,old))
     plan=prune.run(gw.cfg,30,apply=False)
     assert len(plan['staging'])==2 and len(plan['tasks'])==2
     prune.run(gw.cfg,30,apply=True)
