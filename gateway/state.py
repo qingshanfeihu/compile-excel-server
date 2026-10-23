@@ -121,6 +121,21 @@ class StateStore:
                          ' WHERE request_id=?', (*fields.values(),request_id))
             conn.commit()
 
+    def gc_requests(self, cutoff):
+        with self._conn() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            now = time.time()
+            rows = conn.execute("SELECT request_id,not_after FROM requests WHERE received_at<? "
+                                "AND not_after<? AND state IN ('rejected','started','not_started')",
+                                (cutoff,now)).fetchall()
+            if rows:
+                floor = max(r['not_after'] for r in rows)
+                conn.execute("INSERT INTO request_meta(name,value) VALUES('gc_before',?) "
+                             "ON CONFLICT(name) DO UPDATE SET value=max(value,excluded.value)",(floor,))
+                conn.executemany('DELETE FROM requests WHERE request_id=?',[(r['request_id'],) for r in rows])
+            conn.commit()
+            return len(rows)
+
     def request_snapshot(self, request_id, holder):
         with self._conn() as conn:
             conn.execute('BEGIN IMMEDIATE')

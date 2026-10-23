@@ -43,3 +43,28 @@ def test_legacy_has_explicit_no_request_record(fake_env, monkeypatch):
     monkeypatch.setitem(gw.handlers, 'case_submit', lambda *_: {'task_id': 'synthetic'})
     reply = gw.call(ALICE, 'case_submit', {})
     assert reply['request_record'] == 'none'
+
+
+def test_duplicate_conflicts_expiry_and_gc(fake_env, monkeypatch):
+    import time
+    from gateway.state import StateStore
+    gw = fake_env['gateway']
+    calls = []
+    monkeypatch.setitem(gw.handlers, 'case_submit', lambda *_: calls.append(1) or {'task_id':'synthetic'})
+    values = args()
+    first = gw.call(ALICE,'case_submit',values)
+    assert gw.call(ALICE,'case_submit',values) == first
+    assert calls == [1]
+    assert not gw.call(ALICE,'case_submit',args(xlsx_b64=base64.b64encode(b'changed').decode()))['ok']
+    bob = Caller('bob', ALICE.scopes)
+    assert not gw.call(bob,'case_submit',values)['ok']
+    assert gw.call(ALICE,'case_submit',values) == first
+    expired = args(request_id='expired',not_after='2001-01-01T00:00:00Z')
+    reply = gw.call(ALICE,'case_submit',expired)
+    assert not reply['ok'] and reply['stage'] == 'admission'
+    assert gw.call(ALICE,'case_submit',expired) == reply
+    assert gw.state.gc_requests(time.time()+1) == 1
+    assert gw.state.request_snapshot('intent:1','alice')[0] is not None
+    assert gw.state.request_snapshot('expired','alice')[0] is None
+    assert StateStore(gw.cfg.state_dir).request_snapshot('expired','alice')[2] > 0
+    assert calls == [1]

@@ -121,6 +121,7 @@ def _delete(store: StateStore, plan: dict[str, Any]) -> None:
     for path in plan["task_files"]:
         path.unlink(missing_ok=True)
     store.delete_tasks(plan["tasks"])
+    plan["requests_deleted"] = store.gc_requests(plan["cutoff"])
     for path in plan["staging"] + plan["reports"]:
         shutil.rmtree(path)
     # 空了的上层一并删：落位的 ist_staging_<模块>；报告的 <模块> 与 <run>
@@ -142,5 +143,6 @@ def _rmdir_if_empty(path: Path) -> bool:
 def report(plan: dict[str, Any], applied: bool) -> dict[str, Any]:
     return {"ok": True, "applied": applied, "days": plan["days"],
             "cutoff": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(plan["cutoff"])),
+            "requests_deleted": plan.get("requests_deleted", 0),
             "tasks": plan["tasks"], "staging": [str(p) for p in plan["staging"]],
             "reports": [str(p) for p in plan["reports"]], "bytes": plan["bytes"]}
