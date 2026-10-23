@@ -602,7 +602,7 @@ class Gateway:
     def case_results(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
         task = self._own_task(caller, args)
         identity = {'task_id':task['task_id'],'request_id':self.state.task_request(task['task_id']),
-                    'ownership':'staging_directory'}
+                    'ownership':'none'}
         status = framework.read_status(self.cfg, task["task_id"])
         if status.get("state") == "lost":
             return {**identity, "channel": "runner_lost", "state": "lost",
@@ -610,7 +610,8 @@ class Gateway:
         if status.get("state") != "done":
             return {**identity, "channel": "not_completed",
                     "state": status.get("state", "unknown")}
-        base = framework.delivery_report_base(self.cfg,task['staging_dir'])
+        ownership = framework.delivery_report_lookup(self.cfg,task['staging_dir'])
+        base = ownership['base']
         run_dir = base.relative_to(self.cfg.apv_src / 'report').parts[0] if base else None
         queried = (framework.query_results(self.cfg,task['build'],task['case_ids'],run_dir=run_dir,
                     report_path=base.relative_to(self.cfg.apv_src).as_posix()) if base else {'results':{}})
@@ -632,13 +633,13 @@ class Gateway:
         else:
             channel = "ready"
         return {"task_id": task["task_id"], "request_id":self.state.task_request(task["task_id"]),
-                "ownership":"staging_directory", "channel": channel, "rc": status.get("rc"),
+                "ownership":"staging_directory" if base is not None else "none", "ownership_reason":ownership['reason'], "channel": channel, "rc": status.get("rc"),
                 "xlsx_sha256": task["xlsx_sha256"], "cases": cases, "run_dir": run_dir,
                 "submit_autoid": task["autoid"], "module": task["module"],
                 "report_dir": (base.relative_to(self.cfg.apv_src).as_posix()
                                if base is not None else None),
                 "ignored_rows": queried.get("ignored_rows", 0),
-                **({'next_action':'Read case_results again for this task_id; if the result store has no owned row, inspect this dispatch log before a new request_id'}
+                **({'next_action':'Inspect this dispatch log, collector layout and owned result-store rows; ask the operator to restore retained evidence or report an ownership capability gap before a new request_id'}
                    if channel != 'ready' else {}),
                 **({"query_error": queried["error"]} if "error" in queried else {})}
 

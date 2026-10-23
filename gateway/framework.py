@@ -321,17 +321,27 @@ def _report_bases(cfg: GatewayConfig, module: str, autoid: str) -> list[Path]:
     return sorted(cfg.apv_src.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
-def delivery_report_base(cfg: GatewayConfig, staging: str) -> Path | None:
-    relative = Path(staging).relative_to(cfg.staging_parent)
+def delivery_report_lookup(cfg: GatewayConfig, staging: str) -> dict[str, Any]:
+    try:
+        relative = Path(staging).relative_to(cfg.staging_parent)
+    except ValueError:
+        return {'base': None, 'reason': 'outside_staging_root'}
     if len(relative.parts) != 3 or not relative.parts[0].startswith('cex_'):
-        return None  # Old shared staging directories cannot prove delivery ownership.
-    # The dispatch identifier and complete collector path must match, never a time window.
-    pattern = '*/' + '*/' + relative.as_posix() + '/test_xlsx/case.xlsx'
+        return {'base': None, 'reason': 'legacy_layout'}
+    pattern = '*/*/' + relative.as_posix() + '/test_xlsx/case.xlsx'
     bases = sorted((cfg.apv_src / 'report').glob(pattern))
+    if not bases:
+        return {'base': None, 'reason': 'no_report'}
     if len(bases) != 1:
-        return None  # missing/ambiguous is a concrete ownership failure; never borrow another run
+        return {'base': None, 'reason': 'ambiguous_reports'}
     base = bases[0]
-    return base if base.resolve().is_relative_to((cfg.apv_src / 'report').resolve()) else None
+    if not base.resolve().is_relative_to((cfg.apv_src / 'report').resolve()):
+        return {'base': None, 'reason': 'outside_report_root'}
+    return {'base': base, 'reason': None}
+
+
+def delivery_report_base(cfg: GatewayConfig, staging: str) -> Path | None:
+    return delivery_report_lookup(cfg, staging)['base']
 
 
 def delivery_logs(base: Path, max_chars: int = 20000):

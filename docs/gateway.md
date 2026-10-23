@@ -128,3 +128,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now cexg
 过期与 base64 拒绝在首次请求登记事务中直接持久化为 rejected/admission；处理阶段每次变化也持久化。
 中断且证实未启动时，查询和重复投递均回 not_started/interrupted；重复投递为非拒绝状态回答，
 含 interrupted_stage 记录最后处理阶段，不再捏造 launch 拒绝。
+
+旧共享目录任务不回退到时间窗口猜归属。找不到唯一归属报告时回 `ownership: none`，
+`ownership_reason` 区分 legacy_layout、no_report、ambiguous_reports（及越界路径）；须检查派发日志、
+收集器目录和保留证据，由运维恢复或明确报能力缺口，重复读取本身不能修复。升级仅在床空闲时进行。

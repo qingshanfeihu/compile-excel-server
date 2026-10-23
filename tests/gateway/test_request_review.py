@@ -201,3 +201,26 @@ def test_topology_keeps_other_devices_when_one_probe_fails(fake_env, monkeypatch
     assert answer['ok'] and seen == [0, 1]
     assert answer['observation']['unprobed_devices']
     assert (gw.cfg.state_dir / 'bed_topology.json').is_file()
+
+
+@pytest.mark.parametrize('shape', ['legacy_layout', 'no_report', 'ambiguous_reports'])
+def test_missing_report_ownership_has_a_concrete_reason_and_useful_exit(fake_env, shape):
+    from gateway import framework
+    gw = fake_env['gateway']; task_id = 'cex_' + 'b' * 32
+    relative = ('ist_staging_synthetic/case' if shape == 'legacy_layout' else task_id + '/ist_staging_synthetic/case')
+    stage = gw.cfg.staging_parent / relative
+    stage.mkdir(parents=True)
+    gw.state.record_task(task_id=task_id, lease_id='synthetic', token=1, holder=ALICE.subject,
+                         module='synthetic', autoid='case', build=gw.cfg.build, case_ids=['case'],
+                         xlsx_sha256='b' * 64, staging_dir=str(stage), deliver_epoch=time.time(), created_at=time.time())
+    paths = framework.task_paths(gw.cfg, task_id)
+    paths['status'].parent.mkdir(parents=True, exist_ok=True)
+    paths['status'].write_text(json.dumps({'state': 'done', 'rc': 0}))
+    for run in (['one', 'two'] if shape == 'ambiguous_reports' else ['legacy'] if shape == 'legacy_layout' else []):
+        (gw.cfg.apv_src / 'report' / run / 'synthetic' / relative / 'test_xlsx' / 'case.xlsx').mkdir(parents=True)
+    answer = gw.call(ALICE, 'case_results', {'task_id': task_id})
+    assert answer['ok'] and answer['ownership'] == 'none'
+    assert answer['ownership_reason'] == shape
+    assert answer['cases'][0]['result'] is None
+    assert 'Read case_results again' not in answer['next_action']
+    assert 'inspect' in answer['next_action'].lower()
