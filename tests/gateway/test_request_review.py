@@ -244,3 +244,56 @@ def test_gc_never_removes_the_staging_or_report_root(fake_env, delivery):
     assert plan['staging'] and plan['reports']
     assert not stage.exists() and not report.exists()
     assert gw.cfg.staging_parent.is_dir() and report_root.is_dir()
+
+
+@pytest.mark.parametrize('transport', ['no_json', 'timeout'])
+def test_login_marker_preserves_contact_when_agent_reply_is_lost(fake_env, monkeypatch, transport):
+    from pathlib import Path
+    from types import SimpleNamespace
+    from gateway import framework
+    markers = []
+    def lost(_argv, **kw):
+        request = json.loads(kw['input'])
+        marker = Path(request['login_marker']); markers.append(marker)
+        marker.write_text('logged in')
+        if transport == 'timeout': raise framework.subprocess.TimeoutExpired('synthetic agent', 90)
+        return SimpleNamespace(stdout='synthetic lost JSON', stderr='')
+    monkeypatch.setattr(framework.subprocess, 'run', lost)
+    out = framework.probe(fake_env['gateway'].cfg, 'show version', 'SYNTHETIC_BUILD', 0)
+    assert out['reached_device'] is True and 'error' in out
+    assert markers and all(not path.exists() for path in markers)
+
+
+@pytest.mark.parametrize('connected', [False, True])
+def test_agent_login_marker_is_written_only_after_connect(tmp_path, monkeypatch, connected):
+    import sys
+    from types import SimpleNamespace
+    from gateway.agent.jumphost_agent import op_probe
+    marker = tmp_path / 'login.marker'
+    class SSH:
+        def set_missing_host_key_policy(self, *_): pass
+        def connect(self, **_):
+            assert not marker.exists()
+            if not connected: raise OSError('synthetic connect refusal')
+        def invoke_shell(self): raise OSError('synthetic shell failure')
+        def close(self): pass
+    monkeypatch.setitem(sys.modules, 'paramiko', SimpleNamespace(SSHClient=SSH, AutoAddPolicy=lambda: None))
+    out = op_probe({'ip': '192.0.2.1', 'user': 'fake', 'passwd': 'fake', 'command': 'show version', 'login_marker': str(marker)})
+    assert marker.exists() is connected and out['reached_device'] is connected
+
+
+@pytest.mark.parametrize('tool', ['env_prepare', 'bed_topology', 'init_device'])
+def test_device_setup_failures_keep_truthful_contact_fields(fake_env, monkeypatch, tool):
+    from gateway import framework
+    gw = fake_env['gateway']; lease = gw.call(ADMIN, 'lease_acquire', {})
+    values = {**lease, 'refresh': True, 'step': 'confirm'}
+    if tool == 'init_device':
+        values['confirmation'] = gw.call(ADMIN, tool, {**lease, 'step': 'prepare'})['confirmation']
+    def fail(*_): raise framework.FrameworkError('synthetic setup failure')
+    monkeypatch.setattr(framework, 'read_conf', fail)
+    out = gw.call(ADMIN, tool, values)
+    assert out['reached_device'] is False
+    if tool == 'env_prepare':
+        assert out['ok'] and not out['ready'] and out['stage'] == 'precheck'
+    else:
+        assert not out['ok'] and out['stage'] == ('probe' if tool == 'bed_topology' else 'initialization')
