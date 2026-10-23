@@ -43,6 +43,10 @@ class ToolError(RuntimeError):
     pass
 
 
+class RedactionUnavailable(ToolError):
+    """No successful framework literal scan exists; no device text may escape."""
+
+
 def mysql_safe_build(raw: str) -> str:
     """同 InfoTest bed.mysql_safe_build：设备自述的完整版本 → 执行构建名。"""
     s = _MYSQL_UNSAFE_RE.sub("_", str(raw or "")).strip("_")
@@ -201,6 +205,16 @@ class Gateway:
         self.state.flush_request_events(lambda event:self.audit('request_state',**event))
 
     def call(self, caller: Caller, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return self._call(caller, name, args)
+        except RedactionUnavailable:
+            # Do not put the failed scan's source bytes or the unfiltered result in the receipt or audit.
+            self.audit('redaction_unavailable', tool=name, subject=caller.subject)
+            return {'ok': False, 'error': 'framework credential literal scan unavailable; device text withheld',
+                    'stage': 'redaction', 'reached_device': getattr(self._progress, 'reached', False),
+                    'next_action': 'Repair unreadable or invalid framework sources, then retry this read to refresh the literal set'}
+
+    def _call(self, caller: Caller, name: str, args: dict[str, Any]) -> dict[str, Any]:
         spec = next((s for s in TOOL_SPECS if s["name"] == name), None)
         if spec is None:
             return {"ok": False, "error": f"unknown tool {name!r}", "stage":"admission", "reached_device":False}
@@ -441,7 +455,10 @@ class Gateway:
             try:
                 self.credential_literals()
             except (ToolError, OSError):
-                self._literals = (time.monotonic(), frozenset())
+                if cached is None:
+                    raise RedactionUnavailable('no successful framework credential literal scan') from None
+                # Keep its original timestamp: the next call retries rather than caching a failed empty scan.
+
         values = set(self._literals[1] if self._literals else ()) | framework.conf_secrets(self.cfg)
         values.add(framework.mysql_password(self.cfg))
         return tuple(sorted((v for v in values if len(v) >= framework.MIN_SECRET_LEN),

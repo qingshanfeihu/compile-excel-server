@@ -138,3 +138,6 @@ sudo systemctl daemon-reload && sudo systemctl enable --now cexg
 旧共享目录任务不回退到时间窗口猜归属。找不到唯一归属报告时回 `ownership: none`，
 `ownership_reason` 区分 legacy_layout、no_report、ambiguous_reports（及越界路径）；须检查派发日志、
 收集器目录和保留证据，由运维恢复或明确报能力缺口，重复读取本身不能修复。升级仅在床空闲时进行。
+
+凭据字面量刷新失败时保留上次成功集合和旧时间戳，下一次读取继续尝试刷新；不把失败缓存成空集合。
+若尚无成功扫描，设备文本整份扣留，回答 ok:false、stage:redaction 与修复框架源码后重读的动作。
