@@ -332,3 +332,15 @@ def test_gc_dry_run_counts_requests_and_respects_future_deadlines(fake_env, monk
     assert gw.state.request_snapshot('expired-count', ALICE.subject)[0] is None
     assert gw.state.request_snapshot('future-count', ALICE.subject)[0]['state'] == 'started'
     assert gw.state.request_snapshot('expired-count', ALICE.subject)[2] == expired
+
+
+def test_default_fake_result_store_overwrites_a_case_row(fake_env, tmp_path):
+    from test_gateway import _wait_done
+    gw = fake_env['gateway']; values = submission(fake_env, tmp_path)
+    for rid in ['retention-one', 'retention-two']:
+        result = gw.call(ALICE, 'case_submit', {**values, 'request_id': rid})
+        assert result['ok'], result
+        _wait_done(gw, ALICE, result['task_id'])
+    rows = json.loads((fake_env['apv'] / 'fake_results.json').read_text())
+    keys = [(r['table'], r['case_id'], r['sub_module']) for r in rows]
+    assert len(keys) == len(set(keys))

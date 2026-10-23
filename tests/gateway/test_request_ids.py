@@ -217,6 +217,7 @@ def test_query_clock_after_lock_prevents_late_launch(fake_env,monkeypatch):
     assert not observed['found'] or observed['state'] in ('received','rejected')
 
 
+@pytest.mark.parametrize('fake_env', ['overwrite', 'append'], indirect=True)
 def test_deliveries_own_results_logs_sessions_and_gc(fake_env,tmp_path):
     import json,time,os
     from pathlib import Path
@@ -246,8 +247,9 @@ def test_deliveries_own_results_logs_sessions_and_gc(fake_env,tmp_path):
     (fake_env['apv']/'fake_results.json').write_text(json.dumps(rows))
     reread=gw.call(ALICE,'case_results',{'task_id':one['task_id']})
     second=gw.call(ALICE,'case_results',{'task_id':two['task_id']})
-    assert reread['cases']==first['cases']
-    assert reread['cases'][0]['result']=='FAIL' and second['cases'][0]['result']=='ERROR'
+    assert {k: v for k, v in reread['cases'][0].items() if k != 'result'} == {k: v for k, v in first['cases'][0].items() if k != 'result'}
+    assert reread['cases'][0]['result'] == ('FAIL' if fake_env['result_retention'] == 'append' else None)
+    assert second['cases'][0]['result'] == 'ERROR'
     for receipt,result in ((one,reread),(two,second)):
         task=gw.state.task(receipt['task_id'])
         assert receipt['task_id'] in Path(task['staging_dir']).parts
