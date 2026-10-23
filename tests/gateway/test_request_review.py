@@ -71,3 +71,19 @@ def test_collected_request_cannot_be_recreated_as_a_new_rejection(fake_env):
     assert reply['request_record'] == 'collected'
     observed = gw.call(ALICE, 'case_request', {'request_id': 'collected'})
     assert not observed['found'] and observed['gc_before'] >= row['not_after']
+
+
+def test_busy_request_stripe_still_reports_positive_runner_marker(fake_env, tmp_path, monkeypatch):
+    from gateway import framework
+    gw = fake_env['gateway']
+    values = submission(fake_env, tmp_path)
+    monkeypatch.setattr(framework, 'launch_run', lambda *_: None)
+    receipt = gw.call(ALICE, 'case_submit', values)
+    assert receipt['ok']
+    with gw.state.request_lock(values['request_id']):
+        pending = gw.call(ALICE, 'case_request', {'request_id': values['request_id']})
+        assert pending['state'] == 'starting' and pending['reached_device'] is None
+        framework.task_paths(gw.cfg, receipt['task_id'])['start'].write_text('started')
+        started = gw.call(ALICE, 'case_request', {'request_id': values['request_id']})
+        assert started['state'] == 'started' and started['reached_device'] is True
+        assert started['task_id'] == receipt['task_id']

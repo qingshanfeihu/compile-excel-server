@@ -121,3 +121,6 @@ sudo systemctl daemon-reload && sudo systemctl enable --now cexg
 确认发送投递的会话版本支持请求协议。未找到仅在查询 journal_id 与投递前冻结值相同、subject 与投递主体相同，
 且 gateway_time > 原 not_after > gc_before >= journal_since 时能证明未执行。只核对查询会话的版本不够。
 旧库升级时从升级时刻建立新边界，不能据此证明边界以前的调用；库重置或身份改变均须保留未决，人工核对原投递事实。
+
+请求处于 received/starting 且尚无 runner 开始标记时，reached_device 为 null（尚未确定），不可当 false。
+即使请求处理锁忙，存在开始标记仍确认为 started/true 并给 task_id。

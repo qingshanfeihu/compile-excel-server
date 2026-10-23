@@ -256,6 +256,8 @@ class Gateway:
             try:
                 fcntl.flock(fd,fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
+                if row['task_id'] and framework.task_paths(self.cfg, row['task_id'])['start'].exists():
+                    return self._recover_request_row(row)
                 return row
             row, _, _ = self.state.request_snapshot(rid,holder)
             if row['state'] not in ('received','starting'):
@@ -299,7 +301,7 @@ class Gateway:
         result = {'found':bool(row),'gateway_time':now,'gc_before':floor,'subject':caller.subject}
         if row:
             result.update(request_id=rid,state=row['state'],stage=row['stage'],
-                          reached_device=bool(row['reached_device']),
+                          reached_device=(None if row['state'] in ('received','starting') else bool(row['reached_device'])),
                           xlsx_sha256=row['xlsx_sha256'] or None,received_at=row['received_at'],
                           not_after=row['not_after'])
             if row['reached_device'] and row['task_id']:
@@ -342,7 +344,7 @@ class Gateway:
                     row = self._recover_request_row(row)
                 if row['reply']:
                     return json.loads(row['reply'])
-                return {'ok':True,'request_id':rid,'state':row['state'],'reached_device':bool(row['reached_device'])}
+                return {'ok':True,'request_id':rid,'state':row['state'],'reached_device':None if row['state'] in ('received','starting') else bool(row['reached_device'])}
             self.flush_request_audit()
             if decode_error:
                 reply = {'ok':False,'error':decode_error,'stage':'admission','reached_device':False}

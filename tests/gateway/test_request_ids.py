@@ -318,7 +318,7 @@ def test_active_starting_is_not_reconciled_to_not_started(fake_env,tmp_path,monk
         try:
             assert entered.wait(5)
             observed=gw.call(ALICE,'case_request',{'request_id':'intent:1'})
-            assert observed['state']=='starting' and observed['reached_device'] is False
+            assert observed['state']=='starting' and observed['reached_device'] is None
             assert 'task_id' not in observed and 'next_action' in observed
         finally: release.set()
         assert future.result()['stage']=='launch'
