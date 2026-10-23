@@ -172,6 +172,8 @@ class Gateway:
         self._literals: tuple[float, frozenset[str]] | None = None
         self.audit_path = cfg.state_dir / "audit.log"
         self._audit = AuditChain(self.audit_path)
+        self._audit_delivery_lock = threading.Lock()
+        self.flush_request_audit()
         self.handlers: dict[str, Callable[[Caller, dict[str, Any]], dict[str, Any]]] = {
             "lease_acquire": self.lease_acquire, "lease_heartbeat": self.lease_heartbeat,
             "lease_release": self.lease_release, "lease_status": self.lease_status,
@@ -182,10 +184,16 @@ class Gateway:
         }
 
     # ── 公共 ──────────────────────────────────────────────
-    def audit(self, event: str, **fields: Any) -> None:
-        """哈希链审计（gateway/audit_chain.py）；`cexg audit-verify` 复核。"""
-        self._audit.append({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                            "event": event, **fields})
+    def audit(self, event: str, **fields: Any) -> bool:
+        """Append a hash-chain event; expose whether AuditChain actually persisted it."""
+        with self._audit_delivery_lock:
+            previous = self._audit._prev  # AuditChain advances this only after a successful write.
+            self._audit.append({'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+                                'event':event,**fields})
+            return self._audit._prev != previous
+
+    def flush_request_audit(self):
+        self.state.flush_request_events(lambda event:self.audit('request_state',**event))
 
     def call(self, caller: Caller, name: str, args: dict[str, Any]) -> dict[str, Any]:
         spec = next((s for s in TOOL_SPECS if s["name"] == name), None)
@@ -199,11 +207,27 @@ class Gateway:
             return self._request_submit(caller, args)
         return self._invoke(caller, name, args)
 
+    def _admission_refusal(self, caller, args, message):
+        reply = framework.redact({'ok':False,'error':message,'stage':'admission',
+                                  'reached_device':False},self.secrets())
+        self.audit('tool_refused',tool='case_submit',subject=caller.subject,
+                   request_id=args.get('request_id'),stage='admission',reached_device=False,
+                   reason=reply['error'])
+        return reply
+
     def _invoke(self, caller, name, args):
         self._progress.stage, self._progress.reached = "admission", False
         try:
             result = self.handlers[name](caller, args)
         except (LeaseError, ToolError, gates.GateError, framework.FrameworkError, OSError, ValueError) as exc:
+            if name == 'case_submit' and args.get('request_id'):
+                row, _, _ = self.state.request_snapshot(args['request_id'],caller.subject)
+                if row and row['task_id']:
+                    paths = framework.task_paths(self.cfg,row['task_id'])
+                    if paths['start'].exists() or (paths['alive'].exists() and
+                                                   not framework.runner_gone(self.cfg,row['task_id'])):
+                        return framework.redact({'ok':True,**self._task_receipt(
+                            self.state.task(row['task_id']))},self.secrets())
             stage, reached = self._progress.stage, self._progress.reached
             secrets = self.secrets()
             problems = getattr(exc, "problems", None)
@@ -211,6 +235,7 @@ class Gateway:
                        request_id=args.get("request_id"),stage=stage,reached_device=reached,
                        reason=framework.redact(str(exc)[:500], secrets))
             return framework.redact({"ok": False, "error": str(exc), "stage":stage,"reached_device":reached,
+                                     **({'request_record':'none'} if name=='case_submit' and not args.get('request_id') else {}),
                                      **({"problems": problems} if problems else {})}, secrets)
         # 日志尾、每案日志、探测回显、结果库报错……回给客户端的一切都过一遍已知口令
         return framework.redact({"ok": True, **({"request_record": "none"} if name == "case_submit" else {}),
@@ -221,7 +246,7 @@ class Gateway:
         if not row or row['state'] not in ('received','starting'):
             return row
         # Nonblocking: a live admission/launch owns this lock. Never turn its work into a refusal.
-        path = self.state.dir / ('request-' + hashlib.sha256(rid.encode()).hexdigest() + '.lock')
+        path = self.state.request_lock_path(rid)
         fd = os.open(path,os.O_RDWR | os.O_CREAT,0o600)
         try:
             try:
@@ -231,18 +256,35 @@ class Gateway:
             row, _, _ = self.state.request_snapshot(rid,holder)
             if row['state'] not in ('received','starting'):
                 return row
-            paths = framework.task_paths(self.cfg,row['task_id']) if row['task_id'] else None
-            if paths and paths['start'].exists():
-                state,reached,reason = 'started',True,None
-            elif paths and paths['alive'].exists() and not framework.runner_gone(self.cfg,row['task_id']):
-                return row
-            else:
-                state,reached,reason = 'not_started',False,'gateway stopped before runner start; submit a new request_id'
-            self.state.update_request(rid,state=state,reached_device=int(reached))
-            self.audit('request_state',request_id=rid,state=state,reason=reason)
-            return {**row,'state':state,'reached_device':int(reached),'reason':reason}
+            return self._recover_request_row(row)
         finally:
             os.close(fd)
+
+    def _task_receipt(self, task):
+        return {'task_id':task['task_id'],'sha256':task['xlsx_sha256'],
+                'bytes':(Path(task['staging_dir']) / 'case.xlsx').stat().st_size,
+                'case_ids':task['case_ids'],'deliver_epoch':int(task['deliver_epoch']),
+                'submit_autoid':task['autoid'],'module':task['module']}
+
+    def _recover_request_row(self, row):
+        paths = framework.task_paths(self.cfg,row['task_id']) if row['task_id'] else None
+        if paths and paths['start'].exists():
+            state,reached,reason = 'started',True,None
+        elif paths and paths['alive'].exists() and not framework.runner_gone(self.cfg,row['task_id']):
+            return row
+        else:
+            state,reached,reason = 'not_started',False,'gateway stopped before runner start; submit a new request_id'
+        fields = dict(state=state,reached_device=int(reached))
+        if not row['reply']:
+            if reached:
+                reply = {'ok':True,**self._task_receipt(self.state.task(row['task_id']))}
+            else:
+                reply = {'ok':False,'error':reason,'stage':'launch','reached_device':False}
+            reply.update(request_id=row['request_id'],request_record='recorded')
+            fields['reply'] = json.dumps(framework.redact(reply,self.secrets()))
+        self.state.update_request(row['request_id'],**fields)
+        self.flush_request_audit()
+        return {**row,**fields,'reason':reason}
 
     def case_request(self, caller, args):
         rid = args.get('request_id')
@@ -276,7 +318,7 @@ class Gateway:
                 raise ValueError('not UTC')
             deadline = stamp.timestamp()
         except (ToolError,ValueError,binascii.Error) as exc:
-            return {'ok':False,'error':str(exc),'stage':'admission','reached_device':False}
+            return self._admission_refusal(caller,args,str(exc))
         decode_error = None
         try:
             raw = base64.b64decode(str(args.get('xlsx_b64') or ''),validate=True)
@@ -287,16 +329,18 @@ class Gateway:
         with self.state.request_lock(rid):
             row, fresh = self.state.reserve_request(rid, caller.subject, digest, deadline)
             if row['holder'] != caller.subject or row['xlsx_sha256'] != digest:
-                return {'ok':False,'error':'request_id conflicts with an existing request; use a new request_id',
-                        'stage':'admission','reached_device':False}
+                return self._admission_refusal(caller,args,
+                    'request_id conflicts with an existing request; use a new request_id')
             if not fresh:
+                if row['state'] in ('received','starting') and not row['reply']:
+                    row = self._recover_request_row(row)
                 if row['reply']:
                     return json.loads(row['reply'])
                 return {'ok':True,'request_id':rid,'state':row['state'],'reached_device':bool(row['reached_device'])}
-            self.audit('request_state',request_id=rid,state='received')
+            self.flush_request_audit()
             if decode_error:
                 reply = {'ok':False,'error':decode_error,'stage':'admission','reached_device':False}
-            elif deadline <= row['received_at']:
+            elif row['expired']:
                 reply = {'ok':False,'error':'request expired before admission; use a new request_id and deadline',
                          'stage':'admission','reached_device':False}
             else:
@@ -306,10 +350,12 @@ class Gateway:
                            request_id=rid,stage='admission',reached_device=False,
                            reason=reply['error'])
             reply.update(request_id=rid,request_record='recorded')
-            state = 'started' if reply['ok'] else 'rejected'
+            marked = (reply['ok'] and reply.get('task_id') and
+                      framework.task_paths(self.cfg,reply['task_id'])['start'].exists())
+            state = ('started' if marked else 'starting') if reply['ok'] else 'rejected'
             self.state.update_request(rid,reply=json.dumps(reply),state=state,
-                                      stage=reply.get('stage'),reached_device=int(reply['ok']))
-            self.audit('request_state',request_id=rid,state=state)
+                                      stage=reply.get('stage'),reached_device=int(bool(marked)))
+            self.flush_request_audit()
             return reply
 
     def _lease(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
@@ -490,8 +536,8 @@ class Gateway:
             # 冻结、取规则、抽凭据字面量可能要几十秒：租约在这期间过期或被接管，就不能再上机
             lease = self._lease(caller, args)
             self._progress.stage = "staging"
-            staged = framework.stage_case(self.cfg, module, submit, frozen.data, frozen.sha256)
-            task_id = f"cex_{module}_{submit}_{random_secrets.token_hex(12)}"
+            task_id = f"cex_{random_secrets.token_hex(16)}"
+            staged = framework.stage_case(self.cfg, module, submit, frozen.data, frozen.sha256, task_id)
             deliver_epoch = time.time()
             self.state.record_task(
                 task_id=task_id, lease_id=lease["lease_id"], token=lease["token"],
@@ -500,7 +546,7 @@ class Gateway:
                 staging_dir=staged["staging_dir"], deliver_epoch=deliver_epoch,
                 created_at=time.time(), request_id=args.get("request_id"))
             if args.get('request_id'):
-                self.audit('request_state',request_id=args['request_id'],state='starting',task_id=task_id)
+                self.flush_request_audit()
             self._progress.stage = "launch"
             framework.launch_run(self.cfg, task_id, module, submit, self.cfg.build, fd)
         finally:
@@ -515,6 +561,9 @@ class Gateway:
         task = self.state.task(str(args.get("task_id") or ""))
         if task is None or task["holder"] != caller.subject:
             raise ToolError("unknown task_id (or not yours)")
+        rid = self.state.task_request(task['task_id'])
+        if rid:
+            self.reconcile_request(rid,caller.subject)
         return task
 
     def case_status(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
@@ -526,32 +575,20 @@ class Gateway:
 
     def case_results(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
         task = self._own_task(caller, args)
+        identity = {'task_id':task['task_id'],'request_id':self.state.task_request(task['task_id']),
+                    'ownership':'staging_directory'}
         status = framework.read_status(self.cfg, task["task_id"])
         if status.get("state") == "lost":
-            return {"task_id": task["task_id"], "channel": "runner_lost", "state": "lost",
+            return {**identity, "channel": "runner_lost", "state": "lost",
                     "rc": None, "explanation": RUNNER_LOST}
         if status.get("state") != "done":
-            return {"task_id": task["task_id"], "channel": "not_completed",
+            return {**identity, "channel": "not_completed",
                     "state": status.get("state", "unknown")}
-        finished = status.get("finished_at")
-        max_epoch = float(finished) + 60 if finished else None
-        # 同一落位目录的下一次投递之后才出现的报告目录属于那次任务：结束后 60 秒的宽限
-        # 挡不住紧接着的下一轮（返工重投常常一两分钟内就到）
-        following = self.state.next_delivery(task["module"], task["autoid"], task["deliver_epoch"])
-        if following is not None:
-            max_epoch = following if max_epoch is None else min(max_epoch, following)
-        run_dir = framework.report_run_dir(
-            self.cfg, task["module"], task["autoid"], task["deliver_epoch"] - 3, max_epoch)
-        # 找不到本次运行的报告目录就没有本次的判定：宁可 not_run，也不借用别的运行留下的行
-        queried = (framework.query_results(self.cfg, task["build"], task["case_ids"],
-                                           run_dir=run_dir)
-                   if run_dir else {"results": {}})
-        # 日志与判定同源：只取本次运行的报告目录；找不到就不给日志，也不借别的运行的
-        logs = (framework.batch_logs(self.cfg, task["module"], task["autoid"],
-                                     task["deliver_epoch"] - 3, run_dir=run_dir)
-                if run_dir else {})
-        base = (framework.run_report_base(self.cfg, task["module"], task["autoid"], run_dir)
-                if run_dir else None)
+        base = framework.delivery_report_base(self.cfg,task['staging_dir'])
+        run_dir = base.relative_to(self.cfg.apv_src / 'report').parts[0] if base else None
+        queried = (framework.query_results(self.cfg,task['build'],task['case_ids'],run_dir=run_dir,
+                    report_path=base.relative_to(self.cfg.apv_src).as_posix()) if base else {'results':{}})
+        logs = framework.delivery_logs(base) if base else {}
         cases = []
         results = queried.get("results") or {}
         for case_id in task["case_ids"]:
@@ -568,12 +605,15 @@ class Gateway:
             channel = "missing_after_done"
         else:
             channel = "ready"
-        return {"task_id": task["task_id"], "channel": channel, "rc": status.get("rc"),
+        return {"task_id": task["task_id"], "request_id":self.state.task_request(task["task_id"]),
+                "ownership":"staging_directory", "channel": channel, "rc": status.get("rc"),
                 "xlsx_sha256": task["xlsx_sha256"], "cases": cases, "run_dir": run_dir,
                 "submit_autoid": task["autoid"], "module": task["module"],
                 "report_dir": (base.relative_to(self.cfg.apv_src).as_posix()
                                if base is not None else None),
                 "ignored_rows": queried.get("ignored_rows", 0),
+                **({'next_action':'Read case_results again for this task_id; if the result store has no owned row, inspect this dispatch log before a new request_id'}
+                   if channel != 'ready' else {}),
                 **({"query_error": queried["error"]} if "error" in queried else {})}
 
     # ── 只读探测 ──────────────────────────────────────────
@@ -686,6 +726,7 @@ class Gateway:
                 raise ToolError("bed busy: a run is in progress")
             for device in plan["devices"]:
                 argv = [part.format(tty=device["tty"]) for part in self.cfg.console_command]
+                self._progress.stage = "initialization"
                 outcome = console.init_one(
                     device["device"], console_argv=argv, tty=device["tty"],
                     hostname=creds.get("hostname") or "", user=creds["user"],

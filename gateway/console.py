@@ -160,6 +160,9 @@ def _login(con: Console, hostname: str, user: str, passwd: str, timeout: float) 
     if not ok:
         return False
 
+    if re.search(r'(?:#|>|\$)\s*$',out):
+        con.reached_device = True
+
     def enable_if_needed(text: str) -> bool:
         if re.search(r">\s*$", text.rstrip()) or re.search(rf"{host}>", text):
             con.send("enable\n")
@@ -183,11 +186,15 @@ def _login(con: Console, hostname: str, user: str, passwd: str, timeout: float) 
             return False
         con.send(passwd + "\n")
         ok, out = con.read_until(r"(#)|(>)", timeout)
+        if ok:
+            con.reached_device = True
         if not ok or not enable_if_needed(out):
             return False
     elif "assword:" in out:
         con.send(passwd + "\n")
         ok, out = con.read_until(r"(#)|(>)", timeout)
+        if ok:
+            con.reached_device = True
         if not ok or not enable_if_needed(out):
             return False
     elif re.search(r"\$ |\# ", out):
@@ -247,7 +254,12 @@ def init_one(idx: int, *, console_argv: list[str], tty: str, hostname: str, user
         result.log.append(type(exc).__name__ + ": " + str(exc))
         return result
     finally:
-        con.close()
+        result.reached_device |= getattr(con,'reached_device',False)
+        try:
+            con.close()
+        except OSError as exc:
+            result.log.append('console cleanup failed: ' + type(exc).__name__)
+
 
 
 def render_commands(template: list[str], idx: int, port_names: list[str]) -> list[str]:

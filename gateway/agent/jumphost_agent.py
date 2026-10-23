@@ -91,11 +91,12 @@ def op_results(req):
         rows = database.db_exec([(sql, params)]) or []
     # 同一构建表里一案可能有多行（别的床、上一轮）；只认 url 落在本次运行报告目录下的那行
     marker = "/report/%s/" % req["run_dir"] if req.get("run_dir") else None
+    owned = '/' + req['report_path'].strip('/') + '/' if req.get('report_path') else None
     results, ignored = {}, 0
     for row in rows:
         case_id, result = row[0], row[1]
         url = str(row[2] or "") if len(row) > 2 else ""
-        if marker is None or marker not in url:
+        if marker is None or marker not in url or (owned is not None and owned not in url):
             ignored += 1
             continue
         results[bare_autoid(case_id)] = str(result)

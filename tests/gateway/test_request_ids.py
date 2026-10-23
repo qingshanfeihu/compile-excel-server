@@ -72,7 +72,9 @@ def test_duplicate_conflicts_expiry_and_gc(fake_env, monkeypatch):
 
 def submission(fake_env,tmp_path):
     from conftest import make_workbook
+    from dataclasses import replace
     gw=fake_env['gateway']
+    gw.cfg=replace(gw.cfg,build='SYNTHETIC_10_6')
     lease=gw.call(ALICE,'lease_acquire',{})
     data=make_workbook(tmp_path/'case.xlsx',[('202610230000000001','APV_1','cmd','show slb real')])
     return args(xlsx_b64=base64.b64encode(data).decode(),lease_id=lease['lease_id'],token=lease['token'])
@@ -114,19 +116,25 @@ def test_refusals_record_stage_without_launch(fake_env,tmp_path,monkeypatch,stag
     from gateway.state import LeaseError
     gw=fake_env['gateway']; values=submission(fake_env,tmp_path)
     launches=[]
+    original_launch=framework.launch_run
     monkeypatch.setattr(framework,'launch_run',lambda *_: launches.append(1))
     def fail(*_,**kw): raise framework.FrameworkError('synthetic failure; fix injected condition and retry with a new id')
     if stage=='admission': values['xlsx_b64']='!'
     elif stage=='lease': values['token']=-1
     elif stage=='precheck': monkeypatch.setattr(gates,'check',fail)
     elif stage=='bed_busy': monkeypatch.setattr(gw.state,'try_bed_lock',lambda:None)
-    elif stage=='staging': monkeypatch.setattr(framework,'stage_case',fail)
-    elif stage=='launch': monkeypatch.setattr(framework,'launch_run',fail)
+    elif stage=='staging':
+        original=framework.stage_case
+        monkeypatch.setattr(framework,'stage_case',lambda cfg,module,autoid,data,sha,task_id:
+                            original(cfg,module,autoid,data,'0'*64,task_id))
+    elif stage=='launch':
+        monkeypatch.setattr(framework,'launch_run',original_launch)
+        # Exercise process creation failure inside launch_run, after the alive lock is made.
+        monkeypatch.setattr(framework.subprocess,'Popen',lambda *a,**kw: (_ for _ in ()).throw(OSError('synthetic process failure')))
     out=gw.call(ALICE,'case_submit',values)
     assert not out['ok'] and out['stage']==stage and out['reached_device'] is False
     assert launches==[]
-    if stage!='admission':
-        assert gw.state.request_snapshot('intent:1','alice')[0]['state']=='rejected'
+    assert gw.state.request_snapshot('intent:1','alice')[0]['state']=='rejected'
 
 
 @pytest.mark.parametrize('reached',[False,True])
@@ -204,3 +212,160 @@ def test_query_clock_after_lock_prevents_late_launch(fake_env,monkeypatch):
     assert not answer['ok'] and answer['stage']=='admission' and launches==[]
     assert observed['gateway_time']>deadline
     assert not observed['found'] or observed['state'] in ('received','rejected')
+
+
+def test_deliveries_own_results_logs_sessions_and_gc(fake_env,tmp_path):
+    import json,time,os
+    from pathlib import Path
+    from gateway import framework,prune
+    from test_gateway import _wait_done
+    gw=fake_env['gateway']; values=submission(fake_env,tmp_path)
+    cid='202610230000000001'
+    verdicts=fake_env['apv']/'fake_verdicts.json'
+    verdicts.write_text(json.dumps({cid:'FAIL'}))
+    one=gw.call(ALICE,'case_submit',values)
+    assert one['ok'],one
+    _wait_done(gw,ALICE,one['task_id'])
+    first=gw.call(ALICE,'case_results',{'task_id':one['task_id']})
+    verdicts.write_text(json.dumps({cid:'ERROR'}))
+    two=gw.call(ALICE,'case_submit',{**values,'request_id':'intent:2'})
+    assert two['ok'],two
+    _wait_done(gw,ALICE,two['task_id'])
+    assert two['deliver_epoch']-one['deliver_epoch']<60
+    # Put a newer, unrelated report and row under the same framework run name.
+    second=gw.call(ALICE,'case_results',{'task_id':two['task_id']})
+    outside=fake_env['apv']/'report'/second['run_dir']/'sdns'/'ist_staging_sdns'/cid/'test_xlsx'/'case.xlsx'/cid
+    outside.mkdir(parents=True)
+    (outside/(cid+'.txt')).write_text('UNOWNED LOG')
+    rows=json.loads((fake_env['apv']/'fake_results.json').read_text())
+    rows.append({'table':gw.cfg.build,'case_id':cid,'sub_module':'ist_staging_sdns','result':'PASS',
+                 'url':'http://192.0.2.1/'+outside.relative_to(fake_env['apv']).as_posix()+'/'+cid+'/'})
+    (fake_env['apv']/'fake_results.json').write_text(json.dumps(rows))
+    reread=gw.call(ALICE,'case_results',{'task_id':one['task_id']})
+    second=gw.call(ALICE,'case_results',{'task_id':two['task_id']})
+    assert reread['cases']==first['cases']
+    assert reread['cases'][0]['result']=='FAIL' and second['cases'][0]['result']=='ERROR'
+    for receipt,result in ((one,reread),(two,second)):
+        task=gw.state.task(receipt['task_id'])
+        assert receipt['task_id'] in Path(task['staging_dir']).parts
+        assert Path(task['staging_dir']).name==cid
+        assert result['request_id']==receipt['request_id']
+        assert result['ownership']=='staging_directory'
+        assert receipt['task_id'] in result['report_dir']
+        assert 'UNOWNED' not in result['cases'][0]['log']
+        assert receipt['task_id'] in str(result['cases'][0]['sessions'])
+    old=time.time()-40*86400
+    for root in (gw.cfg.staging_parent,gw.cfg.apv_src/'report',gw.cfg.state_dir/'tasks'):
+        for path in [root,*root.rglob('*')]: os.utime(path,(old,old),follow_symlinks=False)
+    with gw.state._conn() as conn: conn.execute('UPDATE tasks SET created_at=?',(old,))
+    protected=prune.run(gw.cfg,30,apply=False)
+    assert not protected['tasks'] and not protected['staging']
+    # Expired records can now be removed, together with their owned trees.
+    with gw.state._conn() as conn: conn.execute('UPDATE requests SET not_after=?,received_at=?',(old,old))
+    plan=prune.run(gw.cfg,30,apply=False)
+    assert len(plan['staging'])==2 and len(plan['tasks'])==2
+    prune.run(gw.cfg,30,apply=True)
+    assert not prune.run(gw.cfg,30,apply=False)['tasks']
+    assert outside.exists()  # the unrelated local report is never gateway-owned
+
+
+def test_duplicate_runs_runner_once_even_after_lease_expires(fake_env,tmp_path,monkeypatch):
+    from gateway import framework
+    from test_gateway import _wait_done
+    gw=fake_env['gateway']; values=submission(fake_env,tmp_path)
+    launch=framework.launch_run; calls=[]
+    def counted(*a,**kw):
+        calls.append(1)
+        return launch(*a,**kw)
+    monkeypatch.setattr(framework,'launch_run',counted)
+    first=gw.call(ALICE,'case_submit',values)
+    assert first['ok'],first
+    _wait_done(gw,ALICE,first['task_id'])
+    gw.state.expire_now_for_tests()
+    assert gw.call(ALICE,'case_submit',{**values,'token':-1})==first
+    assert calls==[1]
+    row=gw.call(ALICE,'case_request',{'request_id':values['request_id']})
+    assert row['state']=='started' and row['reached_device'] and row['task_id']==first['task_id']
+
+
+def test_lost_launch_return_is_not_a_refusal(fake_env,tmp_path,monkeypatch):
+    from gateway import framework
+    from test_gateway import _wait_done
+    gw=fake_env['gateway']; values=submission(fake_env,tmp_path)
+    launch=framework.launch_run
+    def lost(*a,**kw):
+        launch(*a,**kw)
+        raise OSError('synthetic lost return after spawn')
+    monkeypatch.setattr(framework,'launch_run',lost)
+    reply=gw.call(ALICE,'case_submit',values)
+    assert reply['ok'] and reply['task_id']
+    _wait_done(gw,ALICE,reply['task_id'])
+    assert gw.call(ALICE,'case_submit',values)==reply
+
+
+def test_active_starting_is_not_reconciled_to_not_started(fake_env,tmp_path,monkeypatch):
+    import threading
+    from gateway import framework
+    gw=fake_env['gateway']; values=submission(fake_env,tmp_path)
+    entered=threading.Event(); release=threading.Event()
+    def waiting(*_):
+        entered.set()
+        assert release.wait(5)
+        raise framework.FrameworkError('synthetic stop before launch')
+    monkeypatch.setattr(framework,'launch_run',waiting)
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        future=pool.submit(gw.call,ALICE,'case_submit',values)
+        try:
+            assert entered.wait(5)
+            observed=gw.call(ALICE,'case_request',{'request_id':'intent:1'})
+            assert observed['state']=='starting' and observed['reached_device'] is False
+            assert 'task_id' not in observed and 'next_action' in observed
+        finally: release.set()
+        assert future.result()['stage']=='launch'
+
+
+
+def test_restart_recovers_audit_for_committed_request_transition(fake_env,monkeypatch):
+    import json
+    from gateway.tools import Gateway
+    from gateway.audit_chain import verify
+    gw=fake_env['gateway']
+    reserve=gw.state.reserve_request
+    class Crash(BaseException): pass
+    def stop(*a,**kw):
+        reserve(*a,**kw)
+        raise Crash()
+    monkeypatch.setattr(gw.state,'reserve_request',stop)
+    with pytest.raises(Crash): gw.call(ALICE,'case_submit',args())
+    restarted=Gateway(gw.cfg)
+    answer=restarted.call(ALICE,'case_request',{'request_id':'intent:1'})
+    assert answer['state']=='not_started' and answer['reached_device'] is False
+    events=[json.loads(line) for line in restarted.audit_path.read_text().splitlines()]
+    assert [e['state'] for e in events if e.get('event')=='request_state']==['received','not_started']
+    assert verify(restarted.audit_path)['ok']
+
+
+
+def test_console_setup_failure_after_login_is_not_prelogin(monkeypatch):
+    from gateway import console
+    class FakeConsole:
+        def __init__(self,*_): pass
+        def read_until(self,pattern,*_):
+            return True, 'Connected.' if 'Connected' in pattern else 'APV#'
+        def send(self,text):
+            if text=='terminal length 0\n': raise OSError('synthetic terminal setup failure')
+        def close(self): pass
+    monkeypatch.setattr(console,'Console',FakeConsole)
+    outcome=console.init_one(0,console_argv=['fake'],tty='synthetic',hostname='APV',
+                             user='fake',passwd='fake',commands=[],long_commands={},step_timeout=1,login_timeout=1)
+    assert outcome.reached_device is True
+
+
+
+def test_legacy_report_without_delivery_id_is_not_owned(fake_env):
+    from gateway import framework
+    gw=fake_env['gateway']
+    stage=gw.cfg.staging_parent/'ist_staging_sdns'/'202610230000000001'
+    report=gw.cfg.apv_src/'report'/'legacy-run'/'sdns'/'ist_staging_sdns'/'202610230000000001'/'test_xlsx'/'case.xlsx'
+    report.mkdir(parents=True)
+    assert framework.delivery_report_base(gw.cfg,str(stage)) is None

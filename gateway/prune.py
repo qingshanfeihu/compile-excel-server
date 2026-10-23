@@ -65,6 +65,7 @@ def collect(cfg: GatewayConfig, days: float, now: float | None = None) -> dict[s
                          f"({cfg.run_max_s}s)")
     cutoff = (time.time() if now is None else now) - days * DAY_S
     store = StateStore(cfg.state_dir, cfg.lease_ttl_s)
+    protected = store.protected_request_tasks()
     groups: dict[str, list[Path]] = {}
     tasks_dir = cfg.state_dir / "tasks"
     if tasks_dir.is_dir():
@@ -76,6 +77,8 @@ def collect(cfg: GatewayConfig, days: float, now: float | None = None) -> dict[s
     files: list[Path] = []
     size = 0
     for task_id in sorted(set(groups) | set(store.tasks_created_before(cutoff))):
+        if task_id in protected:
+            continue
         paths = groups.get(task_id, [])
         scans = [_scan(path) for path in paths]
         if any(newest >= cutoff for newest, _ in scans):
@@ -89,13 +92,19 @@ def collect(cfg: GatewayConfig, days: float, now: float | None = None) -> dict[s
         size += sum(bytes_ for _, bytes_ in scans)
     trees: dict[str, list[Path]] = {"staging": [], "reports": []}
     for key, root, pattern in (("staging", cfg.staging_parent, "ist_staging_*/*"),
+                               ("delivery_staging", cfg.staging_parent, "cex_*/ist_staging_*/*"),
+                               ("delivery_reports", cfg.apv_src / "report", "*/*/cex_*/ist_staging_*"),
                                ("reports", cfg.apv_src / "report", "*/*/ist_staging_*")):
         for path in sorted(root.glob(pattern)) if root.is_dir() else []:
+            if any(part in protected for part in path.parts):
+                continue
             if not _inside(path, root):
+                continue
+            if key == 'reports' and not (cfg.staging_parent / path.name).exists():
                 continue
             newest, bytes_ = _scan(path)
             if newest < cutoff:
-                trees[key].append(path)
+                trees["staging" if "staging" in key else "reports"].append(path)
                 size += bytes_
     return {"days": days, "cutoff": int(cutoff), "tasks": tasks, "task_files": files,
             **trees, "bytes": size}
@@ -126,10 +135,12 @@ def _delete(store: StateStore, plan: dict[str, Any]) -> None:
         shutil.rmtree(path)
     # 空了的上层一并删：落位的 ist_staging_<模块>；报告的 <模块> 与 <run>
     for path in plan["staging"]:
-        _rmdir_if_empty(path.parent)
-    for path in plan["reports"]:
         if _rmdir_if_empty(path.parent):
             _rmdir_if_empty(path.parent.parent)
+    for path in plan["reports"]:
+        if _rmdir_if_empty(path.parent):
+            if _rmdir_if_empty(path.parent.parent):
+                _rmdir_if_empty(path.parent.parent.parent)
 
 
 def _rmdir_if_empty(path: Path) -> bool:

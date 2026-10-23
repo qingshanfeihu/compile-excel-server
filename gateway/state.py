@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS requests (
  not_after REAL NOT NULL, received_at REAL NOT NULL, state TEXT NOT NULL,
  reply TEXT, task_id TEXT, stage TEXT, reached_device INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS request_events (
+ event_id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL, state TEXT NOT NULL,
+ event_at REAL NOT NULL, task_id TEXT, stage TEXT, reached_device INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS request_meta (name TEXT PRIMARY KEY, value REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS lease (
     bed        TEXT PRIMARY KEY,
@@ -40,6 +44,7 @@ CREATE TABLE IF NOT EXISTS lease (
 CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS tasks (
     task_id    TEXT PRIMARY KEY,
+    request_id TEXT,
     lease_id   TEXT NOT NULL,
     token      INTEGER NOT NULL,
     holder     TEXT NOT NULL,
@@ -79,6 +84,10 @@ class StateStore:
         self.lease_ttl_s = lease_ttl_s
         with self._conn() as conn:
             conn.executescript(_SCHEMA)
+            conn.execute('BEGIN IMMEDIATE')
+            if 'request_id' not in {r[1] for r in conn.execute('PRAGMA table_info(tasks)')}:
+                conn.execute('ALTER TABLE tasks ADD COLUMN request_id TEXT')
+            conn.commit()
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -90,9 +99,13 @@ class StateStore:
         finally:
             conn.close()
 
+    def request_lock_path(self, request_id):
+        # Fixed stripes avoid retaining a lock inode forever for every expired request.
+        return self.dir / ('request-' + hashlib.sha256(request_id.encode()).hexdigest()[:2] + '.lock')
+
     @contextmanager
     def request_lock(self, request_id: str):
-        path = self.dir / ('request-' + hashlib.sha256(request_id.encode()).hexdigest() + '.lock')
+        path = self.request_lock_path(request_id)
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
@@ -111,15 +124,43 @@ class StateStore:
             conn.execute('INSERT INTO requests(request_id,holder,xlsx_sha256,not_after,received_at,state) '
                          'VALUES(?,?,?,?,?,?)', (request_id,holder,sha256,not_after,now,'received'))
             row = dict(conn.execute('SELECT * FROM requests WHERE request_id=?', (request_id,)).fetchone())
+            self._request_event(conn,request_id)
+            row['expired'] = not_after <= now
             conn.commit()
             return row, True
 
     def update_request(self, request_id, **fields):
         with self._conn() as conn:
             conn.execute('BEGIN IMMEDIATE')
+            before = conn.execute('SELECT state FROM requests WHERE request_id=?',(request_id,)).fetchone()
             conn.execute('UPDATE requests SET ' + ','.join(k+'=?' for k in fields) +
                          ' WHERE request_id=?', (*fields.values(),request_id))
+            if before and 'state' in fields and before[0] != fields['state']:
+                self._request_event(conn,request_id)
             conn.commit()
+
+    @staticmethod
+    def _request_event(conn, request_id):
+        conn.execute('INSERT INTO request_events(request_id,state,event_at,task_id,stage,reached_device) '
+                     'SELECT request_id,state,?,task_id,stage,reached_device FROM requests WHERE request_id=?',
+                     (time.time(),request_id))
+
+    def flush_request_events(self, append):
+        # At least once: a crash between append and commit may repeat the same event_id,
+        # but cannot lose a committed transition. Never discard a failed append.
+        while True:
+            with self._conn() as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                rows = conn.execute('SELECT * FROM request_events ORDER BY event_id LIMIT 128').fetchall()
+                if not rows:
+                    conn.commit()
+                    return
+                for row in rows:
+                    if not append(dict(row)):
+                        conn.commit()
+                        return
+                    conn.execute('DELETE FROM request_events WHERE event_id=?',(row['event_id'],))
+                conn.commit()
 
     def gc_requests(self, cutoff):
         with self._conn() as conn:
@@ -268,7 +309,7 @@ class StateStore:
     # ── 任务 ─────────────────────────────────────────────
     def record_task(self, **fields: Any) -> None:
         fields = dict(fields)
-        request_id = fields.pop("request_id", None)
+        request_id = fields.get("request_id")
         fields["case_ids"] = json.dumps(fields["case_ids"])
         columns = ", ".join(fields)
         with self._conn() as conn:
@@ -278,7 +319,18 @@ class StateStore:
             if request_id:
                 conn.execute("UPDATE requests SET state='starting',task_id=? WHERE request_id=?",
                              (fields['task_id'],request_id))
+                self._request_event(conn,request_id)
             conn.commit()
+
+    def protected_request_tasks(self):
+        with self._conn() as conn:
+            return {r[0] for r in conn.execute("SELECT task_id FROM requests WHERE task_id IS NOT NULL "
+                    "AND (not_after>=? OR state IN ('received','starting'))",(time.time(),))}
+
+    def task_request(self, task_id):
+        with self._conn() as conn:
+            row = conn.execute('SELECT request_id FROM tasks WHERE task_id=?',(task_id,)).fetchone()
+            return row[0] if row else None
 
     def task(self, task_id: str) -> dict[str, Any] | None:
         with self._conn() as conn:
