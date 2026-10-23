@@ -297,3 +297,18 @@ def test_device_setup_failures_keep_truthful_contact_fields(fake_env, monkeypatc
         assert out['ok'] and not out['ready'] and out['stage'] == 'precheck'
     else:
         assert not out['ok'] and out['stage'] == ('probe' if tool == 'bed_topology' else 'initialization')
+
+
+def test_tool_advertisements_explain_the_request_protocol_and_ownership():
+    from gateway.tools import TOOL_SPECS
+    specs = {spec['name']: spec for spec in TOOL_SPECS}
+    submit = specs['case_submit']
+    for word in ['request_id', 'not_after', 'UTC', 'request_record', 'stage', 'reached_device', 'module', 'journal_id']:
+        assert word in submit['description']
+    deadline = submit['input_schema']['properties']['not_after']
+    assert deadline['format'] == 'date-time' and 'UTC' in deadline['description']
+    for word in ['found', 'gateway_time', 'gc_before', 'journal_id', 'journal_since', 'subject']:
+        assert word in specs['case_request']['description']
+    results = specs['case_results']['description']
+    assert 'request_id' in results and 'ownership' in results and 'ownership_reason' in results
+    assert 'marked stale' not in results

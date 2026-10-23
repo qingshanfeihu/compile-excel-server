@@ -91,20 +91,27 @@ TOOL_SPECS: list[dict[str, Any]] = [
                                                "cases were compiled for; must equal this bed's."}},
                              ["lease_id", "token"])},
     {"name": "case_submit", "scope": "jumphost:run", "read_only": False,
-     "description": "Run a compiled case workbook on the bed. The workbook is frozen, checked "
-                    "(zip/size limits, Excel contract, destructive commands, framework credential "
-                    "literals, devices the bed does not have) and staged read-only; the staged sha "
-                    "must equal the frozen sha. Returns task_id, submit_autoid (the staging folder "
-                    "name: the workbook's first case) and module; poll case_status, then read "
-                    "case_results.",
+     "description": "Run a frozen, checked workbook on the leased bed. Pair request_id with not_after "
+                    "(UTC deadline); omit both for legacy calls with request_record=none. Same request_id "
+                    "and workbook bytes plus resolved module replay the stored receipt; conflicts refuse "
+                    "at admission. Recorded replies have request_record=recorded, request_id, journal_id, "
+                    "journal_since and subject; collected history has request_record=collected. Refusals "
+                    "carry stage and reached_device. Interrupted recovery may return state=not_started "
+                    "without a task_id. Successful launch returns task_id, submit_autoid and module. "
+                    "Poll case_status then case_results; never resubmit an uncertain dispatch.",
      "input_schema": _schema({**LEASE_PROPS,
-                              "request_id": {"type": "string", "maxLength": 128, "pattern": "^[A-Za-z0-9:._-]+$"},
-            "not_after": {"type": "string"},
+                              "request_id": {"type": "string", "maxLength": 128, "pattern": "^[A-Za-z0-9:._-]+$", "description": "Unique dispatch attempt; must be paired with not_after, never reused for changed work."},
+            "not_after": {"type": "string", "format": "date-time", "description": "UTC admission deadline (Z or +00:00); pair with request_id and retain the original value for reconciliation."},
             "xlsx_b64": {"type": "string", "description": "Workbook bytes, base64."},
                               "module": {"type": "string", "description": "Staging module; defaults to the gateway's configured module."}},
                              ["lease_id", "token", "xlsx_b64"])},
     {"name":"case_request","scope":"jumphost:run","read_only":True,
-     "description":"Read a submission request by request_id without a lease or device operation.",
+     "description":"Read request_id without a lease or device operation. Every answer includes found, "
+                   "gateway_time, gc_before, journal_id, journal_since and resolved subject. Before dispatch "
+                   "freeze journal_id and subject; not found proves non-execution only for the same journal_id "
+                   "and submit subject with gateway_time > original not_after > gc_before >= journal_since. "
+                   "Found answers include state/stage/reached_device; pending contact is null and must be polled. "
+                   "task_id appears only after confirmed runner start.",
      "input_schema":_schema({"request_id":{"type":"string"}},["request_id"])},
     {"name": "case_status", "scope": "jumphost:run", "read_only": True,
      "description": "State of a submitted run (running/done/lost) with the last lines of its log. "
@@ -112,14 +119,13 @@ TOOL_SPECS: list[dict[str, Any]] = [
                     "operator kill); nothing more will come from that run.",
      "input_schema": _schema({"task_id": {"type": "string"}}, ["task_id"])},
     {"name": "case_results", "scope": "jumphost:run", "read_only": True,
-     "description": "Per-case results of a finished run from the framework result database, with "
-                    "each case's framework log. Logs older than the delivery time are marked stale "
-                    "and must not be read as this run's evidence. Every case that is not a pass "
-                    "also carries sessions: the tail of each device CLI session (apv_<ip>.txt) and "
-                    "trigger-host session of that case in this run. rc is the framework process's "
-                    "exit status; run_dir / report_dir / submit_autoid / module say where the run "
-                    "lives on the jump host. channel=runner_lost means the run died before "
-                    "finishing and has no verdicts; resubmit it.",
+     "description": "Per-case results, owned logs and sessions for this task_id only; echoes request_id. "
+                    "ownership=staging_directory means a unique delivery directory was verified, not a time "
+                    "window. ownership=none and ownership_reason disclose legacy_layout, no_report or "
+                    "ambiguous_reports; inspect this dispatch evidence rather than repeatedly reading. "
+                    "Missing or overwritten database rows remain missing, never borrowed from another run. "
+                    "channel identifies ready, missing_after_done, query_error, not_completed or runner_lost. "
+                    "rc is the process exit code and does not itself establish a case verdict.",
      "input_schema": _schema({"task_id": {"type": "string"}}, ["task_id"])},
     {"name": "probe_show", "scope": "jumphost:run", "read_only": True,
      "description": "Run one read-only show/get command on a device and return its output. "
