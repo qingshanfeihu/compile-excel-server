@@ -120,27 +120,27 @@ def run(cfg: GatewayConfig, days: float, *, apply: bool) -> dict[str, Any]:
         raise PruneError("bed busy: a run or device operation is in progress; run gc later")
     try:
         plan = collect(cfg, days)
-        _delete(store, plan)
+        _delete(store, plan, cfg)
     finally:
         os.close(fd)
     return plan
 
 
-def _delete(store: StateStore, plan: dict[str, Any]) -> None:
+def _delete(store: StateStore, plan: dict[str, Any], cfg: GatewayConfig) -> None:
     for path in plan["task_files"]:
         path.unlink(missing_ok=True)
     store.delete_tasks(plan["tasks"])
     plan["requests_deleted"] = store.gc_requests(plan["cutoff"])
     for path in plan["staging"] + plan["reports"]:
         shutil.rmtree(path)
-    # 空了的上层一并删：落位的 ist_staging_<模块>；报告的 <模块> 与 <run>
-    for path in plan["staging"]:
-        if _rmdir_if_empty(path.parent):
-            _rmdir_if_empty(path.parent.parent)
-    for path in plan["reports"]:
-        if _rmdir_if_empty(path.parent):
-            if _rmdir_if_empty(path.parent.parent):
-                _rmdir_if_empty(path.parent.parent.parent)
+    # Follow each layout only as far as its explicit ownership root, never delete the root itself.
+    for key, root in [('staging', cfg.staging_parent), ('reports', cfg.apv_src / 'report')]:
+        for path in plan[key]:
+            parent = path.parent
+            while parent != root and parent.is_relative_to(root):
+                if not _rmdir_if_empty(parent):
+                    break
+                parent = parent.parent
 
 
 def _rmdir_if_empty(path: Path) -> bool:

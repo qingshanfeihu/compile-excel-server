@@ -63,7 +63,7 @@ def test_request_clock_floor_survives_rollback_and_restart(fake_env, monkeypatch
 
 def test_collected_request_cannot_be_recreated_as_a_new_rejection(fake_env):
     gw = fake_env['gateway']
-    row, _ = gw.state.reserve_request('collected', ALICE.subject, 'synthetic', time.time() - 1)
+    row, _ = gw.state.reserve_request('collected', ALICE.subject, 'synthetic', float(int(time.time()) - 1))
     gw.state.update_request('collected', state='started', reached_device=1)
     assert gw.state.gc_requests(time.time() + 1) == 1
     reply = gw.call(ALICE, 'case_submit', args(request_id='collected', not_after=datetime.fromtimestamp(row['not_after'], timezone.utc).isoformat()))
@@ -224,3 +224,23 @@ def test_missing_report_ownership_has_a_concrete_reason_and_useful_exit(fake_env
     assert answer['cases'][0]['result'] is None
     assert 'Read case_results again' not in answer['next_action']
     assert 'inspect' in answer['next_action'].lower()
+
+
+@pytest.mark.parametrize('delivery', [False, True])
+def test_gc_never_removes_the_staging_or_report_root(fake_env, delivery):
+    from gateway import prune
+    from test_gc import _age
+    gw = fake_env['gateway']; task = 'cex_' + 'd' * 32
+    stage_rel = (task + '/' if delivery else '') + 'ist_staging_synthetic/case'
+    report_rel = 'old-run/synthetic/' + (task + '/' if delivery else '') + 'ist_staging_synthetic'
+    stage = gw.cfg.staging_parent / stage_rel
+    report_root = gw.cfg.apv_src / 'report'
+    report = report_root / report_rel
+    stage.mkdir(parents=True); report.mkdir(parents=True)
+    # Legacy reports are owned only when the matching legacy staging parent exists.
+    if not delivery: assert stage.parent.exists()
+    _age(gw.cfg.staging_parent); _age(report_root)
+    plan = prune.run(gw.cfg, 30, apply=True)
+    assert plan['staging'] and plan['reports']
+    assert not stage.exists() and not report.exists()
+    assert gw.cfg.staging_parent.is_dir() and report_root.is_dir()
