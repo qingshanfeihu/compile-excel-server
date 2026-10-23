@@ -55,9 +55,12 @@ def test_duplicate_conflicts_expiry_and_gc(fake_env, monkeypatch):
     first = gw.call(ALICE,'case_submit',values)
     assert gw.call(ALICE,'case_submit',values) == first
     assert calls == [1]
-    assert not gw.call(ALICE,'case_submit',args(xlsx_b64=base64.b64encode(b'changed').decode()))['ok']
+    conflict = gw.call(ALICE,'case_submit',args(xlsx_b64=base64.b64encode(b'changed').decode()))
+    assert not conflict['ok'] and conflict['stage'] == 'admission' and conflict['reached_device'] is False
     bob = Caller('bob', ALICE.scopes)
-    assert not gw.call(bob,'case_submit',values)['ok']
+    other = gw.call(bob,'case_submit',values)
+    assert not other['ok'] and other['stage'] == 'admission' and other['reached_device'] is False
+    assert other['error'] == conflict['error']
     assert gw.call(ALICE,'case_submit',values) == first
     expired = args(request_id='expired',not_after='2001-01-01T00:00:00Z')
     reply = gw.call(ALICE,'case_submit',expired)
@@ -66,7 +69,7 @@ def test_duplicate_conflicts_expiry_and_gc(fake_env, monkeypatch):
     assert gw.state.gc_requests(time.time()+1) == 1
     assert gw.state.request_snapshot('intent:1','alice')[0] is not None
     assert gw.state.request_snapshot('expired','alice')[0] is None
-    assert StateStore(gw.cfg.state_dir).request_snapshot('expired','alice')[2] > 0
+    assert StateStore(gw.cfg.state_dir).request_snapshot('expired','alice')[2] == max(datetime.fromisoformat(expired['not_after'].replace('Z', '+00:00')).timestamp(), reply['journal_since'])
     assert calls == [1]
 
 
@@ -192,7 +195,7 @@ def test_readonly_request_query_and_retention_bounds(fake_env):
     assert set(other)==set(missing) and other['found'] is False
     gw.state.gc_requests(__import__('time').time()+1)
     deleted=gw.call(ALICE,'case_request',{'request_id':'intent:1'})
-    assert not deleted['found'] and deleted['gc_before']>0
+    assert not deleted['found'] and deleted['gc_before'] == max(row['not_after'], deleted['journal_since'])
 
 
 def test_query_clock_after_lock_prevents_late_launch(fake_env,monkeypatch):

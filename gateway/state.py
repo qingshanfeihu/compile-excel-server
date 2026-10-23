@@ -185,13 +185,24 @@ class StateStore:
                     conn.execute('DELETE FROM request_events WHERE event_id=?',(row['event_id'],))
                 conn.commit()
 
+    @staticmethod
+    def _gc_request_rows(conn, cutoff, now):
+        return conn.execute("SELECT request_id,not_after FROM requests WHERE received_at<? "
+                            "AND not_after<? AND state IN ('rejected','started','not_started')",
+                            (cutoff,now)).fetchall()
+
+    def count_gc_requests(self, cutoff):
+        with self._conn() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            rows = self._gc_request_rows(conn, cutoff, self._request_now(conn))
+            conn.commit()
+            return len(rows)
+
     def gc_requests(self, cutoff):
         with self._conn() as conn:
             conn.execute('BEGIN IMMEDIATE')
             now = self._request_now(conn)
-            rows = conn.execute("SELECT request_id,not_after FROM requests WHERE received_at<? "
-                                "AND not_after<? AND state IN ('rejected','started','not_started')",
-                                (cutoff,now)).fetchall()
+            rows = self._gc_request_rows(conn, cutoff, now)
             if rows:
                 floor = max(r['not_after'] for r in rows)
                 conn.execute("INSERT INTO request_meta(name,value) VALUES('gc_before',?) "

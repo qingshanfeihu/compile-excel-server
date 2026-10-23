@@ -107,7 +107,7 @@ def collect(cfg: GatewayConfig, days: float, now: float | None = None) -> dict[s
                 trees["staging" if "staging" in key else "reports"].append(path)
                 size += bytes_
     return {"days": days, "cutoff": int(cutoff), "tasks": tasks, "task_files": files,
-            **trees, "bytes": size}
+            **trees, "bytes": size, "requests_deleted": store.count_gc_requests(int(cutoff))}
 
 
 def run(cfg: GatewayConfig, days: float, *, apply: bool) -> dict[str, Any]:

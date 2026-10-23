@@ -312,3 +312,23 @@ def test_tool_advertisements_explain_the_request_protocol_and_ownership():
     results = specs['case_results']['description']
     assert 'request_id' in results and 'ownership' in results and 'ownership_reason' in results
     assert 'marked stale' not in results
+
+
+def test_gc_dry_run_counts_requests_and_respects_future_deadlines(fake_env, monkeypatch):
+    from gateway import prune, state
+    gw = fake_env['gateway']; now = time.time(); expired = float(int(now) + 10) + 0.75
+    for rid, deadline in [('expired-count', expired), ('future-count', now + 86400)]:
+        gw.state.reserve_request(rid, ALICE.subject, 'synthetic', deadline)
+        gw.state.update_request(rid, state='started', received_at=now - 40 * 86400)
+    # The public cutoff is integer seconds: dry run and apply must use that same boundary.
+    gw.state.reserve_request('cutoff-boundary', ALICE.subject, 'synthetic', expired)
+    gw.state.update_request('cutoff-boundary', state='started', received_at=int(expired + 1 - 30 * 86400) + 0.5)
+    monkeypatch.setattr(state.time, 'time', lambda: expired + 1)
+    dry = prune.report(prune.run(gw.cfg, 30, apply=False), False)
+    assert dry['requests_deleted'] == 1
+    assert gw.state.request_snapshot('expired-count', ALICE.subject)[0] is not None
+    applied = prune.report(prune.run(gw.cfg, 30, apply=True), True)
+    assert applied['requests_deleted'] == dry['requests_deleted']
+    assert gw.state.request_snapshot('expired-count', ALICE.subject)[0] is None
+    assert gw.state.request_snapshot('future-count', ALICE.subject)[0]['state'] == 'started'
+    assert gw.state.request_snapshot('expired-count', ALICE.subject)[2] == expired
