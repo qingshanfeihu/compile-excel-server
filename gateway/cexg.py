@@ -72,7 +72,9 @@ def cmd_serve(config: Path) -> int:
     except ConfigError as exc:
         print(f"配置错误：{exc}", file=sys.stderr)
         return 2
-    httpd = build_server(Gateway(cfg))
+    gateway = Gateway(cfg)
+    gateway.flush_request_audit()
+    httpd = build_server(gateway)
     scheme = "https" if cfg.tls_cert else "http"
     print(f"cexg 监听 {scheme}://{cfg.host}:{cfg.port}/mcp", file=sys.stderr)
     try:

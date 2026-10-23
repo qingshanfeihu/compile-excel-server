@@ -123,3 +123,18 @@ def test_probe_setup_failure_is_probe_before_contact(fake_env, monkeypatch):
     monkeypatch.setattr(framework, 'probe', fail)
     out = gw.call(ALICE, 'probe_show', {**lease, 'command': 'show version'})
     assert not out['ok'] and out['stage'] == 'probe' and out['reached_device'] is False
+
+
+def test_constructing_a_checker_does_not_flush_or_break_service_audit(fake_env):
+    from gateway.audit_chain import verify
+    gw = fake_env['gateway']
+    gw.audit('synthetic_before')
+    gw.state.reserve_request('audit-intent', ALICE.subject, 'synthetic', time.time() + 60)
+    before = gw.audit_path.read_bytes()
+    Gateway(gw.cfg)  # The same constructor used by cexg check.
+    assert gw.audit_path.read_bytes() == before
+    gw.flush_request_audit()
+    gw.audit('synthetic_after')
+    assert verify(gw.audit_path)['ok']
+    records = [json.loads(line) for line in gw.audit_path.read_text().splitlines()]
+    assert any(r.get('request_id') == 'audit-intent' for r in records)

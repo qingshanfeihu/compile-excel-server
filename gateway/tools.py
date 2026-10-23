@@ -173,7 +173,6 @@ class Gateway:
         self.audit_path = cfg.state_dir / "audit.log"
         self._audit = AuditChain(self.audit_path)
         self._audit_delivery_lock = threading.Lock()
-        self.flush_request_audit()
         self.handlers: dict[str, Callable[[Caller, dict[str, Any]], dict[str, Any]]] = {
             "lease_acquire": self.lease_acquire, "lease_heartbeat": self.lease_heartbeat,
             "lease_release": self.lease_release, "lease_status": self.lease_status,
