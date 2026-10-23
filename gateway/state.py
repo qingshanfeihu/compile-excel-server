@@ -104,6 +104,14 @@ class StateStore:
         with self._conn() as conn:
             return dict(conn.execute("SELECT name,value FROM request_meta WHERE name IN ('journal_id','journal_since')"))
 
+    @staticmethod
+    def _request_now(conn):
+        floor = conn.execute("SELECT max(value) FROM request_meta WHERE name IN ('clock_floor','journal_since')").fetchone()[0]
+        now = max(time.time(), floor or 0.0)
+        conn.execute("INSERT INTO request_meta(name,value) VALUES('clock_floor',?) "
+                     "ON CONFLICT(name) DO UPDATE SET value=max(value,excluded.value)", (now,))
+        return now
+
     def request_lock_path(self, request_id):
         # Fixed stripes avoid retaining a lock inode forever for every expired request.
         return self.dir / ('request-' + hashlib.sha256(request_id.encode()).hexdigest()[:2] + '.lock')
@@ -121,7 +129,7 @@ class StateStore:
     def reserve_request(self, request_id, holder, sha256, not_after):
         with self._conn() as conn:
             conn.execute('BEGIN IMMEDIATE')
-            now = time.time()
+            now = self._request_now(conn)
             row = conn.execute('SELECT * FROM requests WHERE request_id=?', (request_id,)).fetchone()
             if row:
                 conn.commit()
@@ -148,7 +156,7 @@ class StateStore:
     def _request_event(conn, request_id):
         conn.execute('INSERT INTO request_events(request_id,state,event_at,task_id,stage,reached_device) '
                      'SELECT request_id,state,?,task_id,stage,reached_device FROM requests WHERE request_id=?',
-                     (time.time(),request_id))
+                     (StateStore._request_now(conn),request_id))
 
     def flush_request_events(self, append):
         # At least once: a crash between append and commit may repeat the same event_id,
@@ -170,7 +178,7 @@ class StateStore:
     def gc_requests(self, cutoff):
         with self._conn() as conn:
             conn.execute('BEGIN IMMEDIATE')
-            now = time.time()
+            now = self._request_now(conn)
             rows = conn.execute("SELECT request_id,not_after FROM requests WHERE received_at<? "
                                 "AND not_after<? AND state IN ('rejected','started','not_started')",
                                 (cutoff,now)).fetchall()
@@ -185,7 +193,7 @@ class StateStore:
     def request_snapshot(self, request_id, holder):
         with self._conn() as conn:
             conn.execute('BEGIN IMMEDIATE')
-            now = time.time()
+            now = self._request_now(conn)
             row = conn.execute('SELECT * FROM requests WHERE request_id=? AND holder=?',
                                (request_id,holder)).fetchone()
             floor = conn.execute("SELECT value FROM request_meta WHERE name='gc_before'").fetchone()

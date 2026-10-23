@@ -41,3 +41,21 @@ def test_journal_identity_and_lower_bound_survive_restart_but_not_reset(fake_env
     assert not fresh['found'] and fresh['journal_id'] != answer['journal_id']
     assert before <= fresh['journal_since'] <= fresh['gateway_time']
     assert StateStore(reset.cfg.state_dir).request_snapshot('missing', ALICE.subject)[2] == fresh['journal_since']
+
+
+def test_request_clock_floor_survives_rollback_and_restart(fake_env, monkeypatch):
+    from gateway import state
+    gw = fake_env['gateway']
+    deadline = time.time() + 10
+    clock = [deadline + 1]
+    monkeypatch.setattr(state.time, 'time', lambda: clock[0])
+    first = gw.call(ALICE, 'case_request', {'request_id': 'clock-intent'})
+    clock[0] = deadline - 5
+    restarted = Gateway(gw.cfg)
+    launches = []
+    monkeypatch.setitem(restarted.handlers, 'case_submit', lambda *_: launches.append(1) or {})
+    out = restarted.call(ALICE, 'case_submit', args(request_id='clock-intent', not_after=datetime.fromtimestamp(deadline, timezone.utc).isoformat()))
+    assert not out['ok'] and out['stage'] == 'admission' and not launches
+    snapshot = restarted.state.request_snapshot('clock-intent', ALICE.subject)
+    assert snapshot[1] >= first['gateway_time']
+    assert snapshot[0]['received_at'] >= first['gateway_time']
