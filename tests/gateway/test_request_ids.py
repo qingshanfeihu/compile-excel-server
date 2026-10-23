@@ -167,3 +167,40 @@ def test_console_failure_retains_login_fact(monkeypatch,logged_in):
     out=console.init_one(0,console_argv=['fake'],tty='synthetic',hostname='synthetic',
                          user='fake',passwd='fake',commands=[],long_commands={},step_timeout=1,login_timeout=1)
     assert out.status=='error' and out.as_dict()['reached_device'] is logged_in
+
+
+def test_readonly_request_query_and_retention_bounds(fake_env):
+    from gateway.tools import TOOL_SPECS
+    gw=fake_env['gateway']
+    spec=next(s for s in TOOL_SPECS if s['name']=='case_request')
+    assert spec['read_only'] and spec['scope']=='jumphost:run'
+    missing=gw.call(ALICE,'case_request',{'request_id':'missing'})
+    assert missing['found'] is False and missing['gateway_time'] > missing['gc_before']
+    reply=gw.call(ALICE,'case_submit',args(not_after='2001-01-01T00:00:00Z'))
+    row=gw.call(ALICE,'case_request',{'request_id':'intent:1'})
+    assert row['found'] and row['state']=='rejected' and row['stage']=='admission'
+    assert row['reached_device'] is False and 'task_id' not in row
+    other=gw.call(Caller('bob',ALICE.scopes),'case_request',{'request_id':'intent:1'})
+    assert set(other)==set(missing) and other['found'] is False
+    gw.state.gc_requests(__import__('time').time()+1)
+    deleted=gw.call(ALICE,'case_request',{'request_id':'intent:1'})
+    assert not deleted['found'] and deleted['gc_before']>0
+
+
+def test_query_clock_after_lock_prevents_late_launch(fake_env,monkeypatch):
+    import sqlite3,time,threading
+    gw=fake_env['gateway']; launches=[]
+    monkeypatch.setitem(gw.handlers,'case_submit',lambda *_:launches.append(1) or {'task_id':'fake'})
+    blocker=sqlite3.connect(gw.state.db_path,isolation_level=None)
+    blocker.execute('BEGIN IMMEDIATE')
+    deadline=time.time()+0.15
+    values=args(not_after=datetime.fromtimestamp(deadline,timezone.utc).isoformat())
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+        submit=pool.submit(gw.call,ALICE,'case_submit',values)
+        query=pool.submit(gw.call,ALICE,'case_request',{'request_id':'intent:1'})
+        time.sleep(0.2)
+        blocker.commit();blocker.close()
+        answer=submit.result(); observed=query.result()
+    assert not answer['ok'] and answer['stage']=='admission' and launches==[]
+    assert observed['gateway_time']>deadline
+    assert not observed['found'] or observed['state'] in ('received','rejected')

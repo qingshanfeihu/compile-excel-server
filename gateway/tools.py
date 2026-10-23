@@ -103,6 +103,9 @@ TOOL_SPECS: list[dict[str, Any]] = [
             "xlsx_b64": {"type": "string", "description": "Workbook bytes, base64."},
                               "module": {"type": "string", "description": "Staging module; defaults to the gateway's configured module."}},
                              ["lease_id", "token", "xlsx_b64"])},
+    {"name":"case_request","scope":"jumphost:run","read_only":True,
+     "description":"Read a submission request by request_id without a lease or device operation.",
+     "input_schema":_schema({"request_id":{"type":"string"}},["request_id"])},
     {"name": "case_status", "scope": "jumphost:run", "read_only": True,
      "description": "State of a submitted run (running/done/lost) with the last lines of its log. "
                     "lost means the runner died without recording an end (gateway restart, OOM, "
@@ -173,7 +176,7 @@ class Gateway:
             "lease_acquire": self.lease_acquire, "lease_heartbeat": self.lease_heartbeat,
             "lease_release": self.lease_release, "lease_status": self.lease_status,
             "env_prepare": self.env_prepare, "case_submit": self.case_submit,
-            "case_status": self.case_status, "case_results": self.case_results,
+            "case_request": self.case_request, "case_status": self.case_status, "case_results": self.case_results,
             "probe_show": self.probe_show, "bed_topology": self.bed_topology,
             "init_device": self.init_device,
         }
@@ -240,6 +243,26 @@ class Gateway:
             return {**row,'state':state,'reached_device':int(reached),'reason':reason}
         finally:
             os.close(fd)
+
+    def case_request(self, caller, args):
+        rid = args.get('request_id')
+        if not isinstance(rid,str) or not re.fullmatch(r'[A-Za-z0-9:._-]{1,128}',rid):
+            raise ToolError('invalid request_id; supply the id from the submit receipt')
+        self.reconcile_request(rid,caller.subject)
+        row,now,floor = self.state.request_snapshot(rid,caller.subject)
+        result = {'found':bool(row),'gateway_time':now,'gc_before':floor}
+        if row:
+            result.update(request_id=rid,state=row['state'],stage=row['stage'],
+                          reached_device=bool(row['reached_device']),
+                          xlsx_sha256=row['xlsx_sha256'] or None,received_at=row['received_at'],
+                          not_after=row['not_after'])
+            if row['reached_device'] and row['task_id']:
+                result['task_id'] = row['task_id']
+            if row['state'] in ('received','starting'):
+                result['next_action'] = 'admission or runner launch is active; poll case_request with this request_id'
+            elif row['state'] == 'not_started':
+                result['reason'] = 'gateway stopped before runner start; submit a new request_id'
+        return result
 
     def _request_submit(self, caller, args):
         try:
