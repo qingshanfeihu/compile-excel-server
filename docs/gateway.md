@@ -76,8 +76,9 @@ sudo systemctl daemon-reload && sudo systemctl enable --now cexg
 |---|---|---|
 | `lease_acquire` / `lease_heartbeat` / `lease_release` / `lease_status` | `jumphost:run` | 单床租约，带防并发令牌；会碰设备的工具都要带着当前租约 |
 | `env_prepare` | `jumphost:run` | 检查框架文件、conf、设备可达、设备自述的构建与网关构建一致、规则与凭据字面量可用。客户端带上用例编译时的构建号，与本床不符直接拒绝；不带时照常检查，结果里 `build_checked: false`。`device_count` 是 conf `[comm] ssh_ips` 列出的设备台数（用例只能用 `APV_0` 到 `APV_<台数-1>`）。结果另带 `conf.device_ips`：这些设备的管理地址，按 conf `[comm] ssh_ips` 的原顺序（hub 结果解析按它把 runner 日志行归到 `APV_<序号>`）；conf `[comm] marks` 给了设备名时另有同序的 `conf.device_names`。conf 读不到时没有 `conf` 字段（不拿空数组冒充），`framework_conf` 检查 `ok=false` |
-| `case_submit` | `jumphost:run` | 冻结工作簿 → 上机前检查（压缩包与体积、Excel 契约、自毁命令、框架凭据字面量、床上没有的设备：E 列 `APV_k` / `Segk_tmp` 的 k 不小于设备台数就拒收；框架连不上第 k 台时整卷一个案都不跑）→ 只读落位、哈希对账 → 开始运行。回执带 `submit_autoid`（落位目录名，即卷里第一个案）和 `module` |
-| `case_status` / `case_results` | `jumphost:run` | 状态与结果。结果来自框架结果库，只认本次运行报告目录下的行（同一构建表里别的床、上一轮留下的行不算，条数记在 `ignored_rows`）；早于投递时间的日志标为过期。没过的案另带 `sessions`：本次运行里该案每个设备的命令行会话（`apv_<ip>.txt`）与触发机会话的尾部（每份最多 12000 字符、最多 8 份）。回执带 `rc`（框架进程退出码）、`run_dir`、`report_dir`、`submit_autoid`、`module`。运行进程没写完成状态就消失了（网关重启、内存不足、被人杀掉）时报 `lost`，`case_results` 回 `channel: runner_lost`（没有判定，需要重投） |
+| `case_submit` | `jumphost:run` | 冻结工作簿 → 上机前检查（压缩包与体积、Excel 契约、自毁命令、框架凭据字面量、床上没有的设备：E 列 `APV_k` / `Segk_tmp` 的 k 不小于设备台数就拒收；框架连不上第 k 台时整卷一个案都不跑）→ 只读落位、哈希对账 → 开始运行。回执带 `task_id`、`request_id`（传入时）、`submit_autoid`（最后一级落位目录名，即卷里第一个案）和 `module`；0.4.0 起可同时传 `request_id`、`not_after`，在租约检查前记账并去重 |
+| `case_request` | `jumphost:run` | 按 `request_id` 只读查询，无需租约、不碰设备，`readOnlyHint: true`。只有本调用主体能看到自己的记录；不存在和别人的记录回答同形 |
+| `case_status` / `case_results` | `jumphost:run` | 状态与结果。结果来自框架结果库，只认本次运行报告目录下的行（同一构建表里别的床、上一轮留下的行不算，条数记在 `ignored_rows`）；0.4.0 起新投递按带 `task_id` 的完整落位目录取结果、日志和会话，不再靠时间窗；目录外的同名报告不算。没过的案另带 `sessions`：本次运行里该案每个设备的命令行会话（`apv_<ip>.txt`）与触发机会话的尾部（每份最多 12000 字符、最多 8 份）。回执带 `rc`（框架进程退出码）、`run_dir`、`report_dir`、`submit_autoid`、`module`。运行进程没写完成状态就消失了（网关重启、内存不足、被人杀掉）时报 `lost`，`case_results` 回 `channel: runner_lost`（没有判定，需要重投） |
 | `probe_show` | `jumphost:run` | 单条只读命令：一行最多 200 字符，参数只许字母、数字、空格和 `_ . , : / @ % + = * " ' -`；等不到设备提示符时回 `truncated: true` |
 | `bed_topology` | `jumphost:run` | 本床拓扑（`network_topology.json`）：跳板机网卡与邻居、conf 里各台主机的接口地址（用框架自己的凭据登录，主机密钥首次见到即钉住）、可达被测设备的 `show ip address`。要租约，缓存到下次 `refresh`。另带 `services`：`gateway.toml` 里 `[[bed.services]]` 列的常驻服务（没配就是空列表） |
 | `init_device` | `jumphost:admin` | 串口重置，分两步：`prepare` 给出计划和一次性确认码，`confirm` 带着确认码执行；每一步都核对配置模式提示符。显式给 `device_count` 时必须 ≥ 1 |
@@ -86,7 +87,13 @@ sudo systemctl daemon-reload && sudo systemctl enable --now cexg
 
 ## 运维要点
 
-- **清理**：`cexg gc --config … [--days 30] [--apply]` 列出（加 `--apply` 才删，要求床空闲）N 天前已结束任务的记录、落位目录，以及框架报告里网关落位跑出来的目录。N 必须比 `run_max_s` 多一小时以上。
+- **请求协议（0.4.0 起）**：`case_submit` 的 `request_id` 只收 ASCII 字母、数字、`:._-`，长度 1–128；`not_after` 为带 UTC 时区的 ISO 8601（`Z` 或 `+00:00`），两者必须同时给或同时省略。省略时仍可运行，但 `request_record: none`，没有按请求 id 去重或查账的保证。有效的一对参数在核租约前记下主体（含 `X-Circle-Hub-Actor`）、工作簿 SHA-256、截止时间和收到时刻；查重、截止判断和插入共享同一 `BEGIN IMMEDIATE`，时钟在拿到写锁后读取。坏 base64 仍记拒收，查询的 `xlsx_sha256: null` 明确表示没有可算摘要的工作簿；id 或截止参数本身不合法时只回受理阶段拒绝和审计，没有有效的请求记录。
+- **去重**：同 id、同主体和同工作簿摘要返回保存的原回答，即使租约已过期也不重查、不重跑；主体或摘要不符只回冲突，不泄露、修改原记录。调用方不能为原 id 改换内容或在清理后复用它，新的尝试使用新的 id。不同 id 即使字节相同也是不同派发。请求处理用固定 256 个 `flock` 条带串行化，内核在网关退出时释放，不按请求数永久积累锁文件。
+- **请求状态**：`received` → `rejected`（带阶段），或 `received` → `starting` → `started`；中断且确认没启动的为 `not_started`。任务与请求的 `starting/task_id` 在同一事务里先记，之后才起 runner。runner 的第一步写 `<task_id>.started`，之后才进入 pytest；父进程在 fork 前持有并传递 `.alive` 锁。查询和重复提交会对账：开始标记存在就是 `started/reached_device: true`；没有标记、请求处理锁和存活锁都已释放才记 `not_started`。正在处理或正在起进程时保持过渡状态，给出继续 `case_request` 的动作；原来的处理/runner 会继续，查询不会重发提交。状态变化在同一 SQLite 事务里留审计事件，随后追加到审计链；重启补写未追加的事件。写链后、确认前中断可能重复追加同一个 `event_id`，但不会漏掉已提交的状态变化。
+- **拒绝阶段**：回答和 `tool_refused` 审计带 `stage`、`reached_device`。提交依次为 `admission`、`lease`、`precheck`、`bed_busy`、`staging`、`launch`，拒绝一律 `false`；runner 已起以后回任务状态，不伪装成拒绝。探测用 `probe`，初始化用 `initialization`；代理在 SSH 登录后明确回传标记，响应丢失时用本地登录标记补回事实；初始化也保留登录状态，登录后失败不会报成未上机。
+- **查账与保留边界**：`case_request` 找到时给 `request_id/state/stage/reached_device/xlsx_sha256/received_at/not_after`，确认 runner 已启动时再给 `task_id`。找不到只给 `found: false/gateway_time/gc_before`（外加工具通用 `ok`）；所有时间字段均是 UTC Unix 秒。只有 `gateway_time > 调用方原 not_after > gc_before` 才能用缺记录证明未执行。查询的快照和当前时刻也在 SQLite 写锁里取，晚到提交不能穿过该截止保证。`gc_before` 为已删记录的最大截止时间，持久、只增；尚未过截止或仍在恢复的请求不清理，相关任务和目录也保留。初始值为 0，不能据此推断旧版不支持此协议的调用；先核对 `initialize.serverInfo.version`。
+- **派发目录与兼容边界**：0.4.0 新目录是 `<staging_parent>/<task_id>/ist_staging_<module>/<首案编号>`，紧邻父目录仍给模块、最后一级仍给首案编号。假框架按这两级取名字，并在报告路径中保留 task_id；查询只认完整路径，结果库旧行被覆盖时保留“该派发缺结果行”的发现，不借新派发的行。若没有或出现多份对应报告，不选择最新一份冒充；返回缺结果及继续读取/检查本次日志的动作。回执回显请求 id，结果各通道回显请求 id、task_id 和 `ownership: staging_directory`。**真实框架对此目录布局尚未核对**：本次只跑合成夹具；集成者须先只读核对真实收集路径、报告 URL 和结果库保留规则，再为该版本认证。升级前任务不具有新目录归属保证。
+- **清理**：`cexg gc --config … [--days 30] [--apply]` 列出（加 `--apply` 才删，要求床空闲）N 天前已结束任务的记录、落位目录，以及框架报告里网关落位跑出来的目录。N 必须比 `run_max_s` 多一小时以上。新落位和报告按带 task_id 的目录形状清理，保留无对应网关落位的旧形状报告；请求删除数为 `requests_deleted`，删后查账仍带持久保留边界。
 - **审计**：`cexg audit-verify --config …` 复核网关的审计日志哈希链。
 - **互斥**：床锁 `<状态目录>/bed.lock` 用 `flock`，锁随测试进程组继承，进程结束时内核自动释放；不写进程号、不删锁文件。运行进程另继承 `<状态目录>/tasks/<任务>.alive` 锁，进程号记在 `<任务>.runner.json`。
 - **连接**：证书握手在连接线程里做（10 秒超时），空闲连接 60 秒后断开。

@@ -369,3 +369,9 @@ def test_legacy_report_without_delivery_id_is_not_owned(fake_env):
     report=gw.cfg.apv_src/'report'/'legacy-run'/'sdns'/'ist_staging_sdns'/'202610230000000001'/'test_xlsx'/'case.xlsx'
     report.mkdir(parents=True)
     assert framework.delivery_report_base(gw.cfg,str(stage)) is None
+
+
+def test_request_protocol_version_is_advertised():
+    from ces_version import __version__
+    from gateway.service import SERVER_INFO
+    assert __version__=='0.4.0' and SERVER_INFO['version']==__version__
