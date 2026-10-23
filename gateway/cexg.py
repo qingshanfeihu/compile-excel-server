@@ -25,6 +25,7 @@ if __package__ in (None, ""):
 
 import gateway  # noqa: E402
 from gateway.config import ConfigError, load  # noqa: E402
+from gateway.state import JournalError  # noqa: E402
 
 # 按包的位置找样例：源码运行与 PyInstaller 打包后（数据文件在 _internal/gateway/）都对
 SAMPLE = Path(gateway.__file__).resolve().parent / "gateway.example.toml"
@@ -41,8 +42,15 @@ def cmd_check(config: Path) -> int:
         return 2
     from gateway.auth import check_secret_file
 
-    gateway = Gateway(cfg)
-    checks = []
+    try:
+        gateway = Gateway(cfg)
+    except JournalError as exc:
+        journal = cfg.state_dir.with_name(cfg.state_dir.name + '.request-journal') / 'requests.db'
+        print(json.dumps({"ok": False, "error": str(exc), "checks": [
+            {"check": "request_journal", "ok": False, "path": str(journal), "error": str(exc)}
+        ]}, ensure_ascii=False))
+        return 2
+    checks = [{"check": "request_journal", "ok": True, "path": str(gateway.state.request_db_path)}]
     checks.append({"check": "hub_secret", **check_secret_file(cfg.hub_secret_file)})
     if cfg.hub_admin_secret_file:
         checks.append({"check": "hub_admin_secret", **check_secret_file(cfg.hub_admin_secret_file)})
@@ -69,10 +77,13 @@ def cmd_serve(config: Path) -> int:
 
     try:
         cfg = load(config)
+        gateway = Gateway(cfg)
     except ConfigError as exc:
         print(f"配置错误：{exc}", file=sys.stderr)
         return 2
-    gateway = Gateway(cfg)
+    except JournalError as exc:
+        print(f"请求日志错误：{exc}", file=sys.stderr)
+        return 2
     gateway.flush_request_audit()
     httpd = build_server(gateway)
     scheme = "https" if cfg.tls_cert else "http"
@@ -104,7 +115,7 @@ def cmd_gc(config: Path, days: float, apply: bool) -> int:
 
     try:
         plan = prune.run(load(config), days, apply=apply)
-    except (ConfigError, prune.PruneError, OSError) as exc:
+    except (ConfigError, JournalError, prune.PruneError, OSError) as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
         return 2
     print(json.dumps(prune.report(plan, applied=apply), ensure_ascii=False, indent=1))
