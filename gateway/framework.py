@@ -169,15 +169,16 @@ def ports(parser: configparser.ConfigParser) -> list[str]:
 
 
 # ── 用例落位与运行 ──────────────────────────────────────────────────────
-def staging_dir(cfg: GatewayConfig, module: str, autoid: str) -> Path:
-    return cfg.staging_parent / f"ist_staging_{safe(module, 'module')}" / safe(autoid, 'autoid')
+def staging_dir(cfg: GatewayConfig, module: str, autoid: str, task_id: str | None = None) -> Path:
+    parent = cfg.staging_parent / safe(task_id,'task_id') if task_id else cfg.staging_parent
+    return parent / f"ist_staging_{safe(module, 'module')}" / safe(autoid, 'autoid')
 
 
 def stage_case(cfg: GatewayConfig, module: str, autoid: str, data: bytes,
-               expected_sha256: str) -> dict[str, Any]:
+               expected_sha256: str, task_id: str | None = None) -> dict[str, Any]:
     import hashlib
 
-    stg = staging_dir(cfg, module, autoid)
+    stg = staging_dir(cfg, module, autoid, task_id)
     stg.mkdir(parents=True, exist_ok=True)
     final = stg / "case.xlsx"
     tmp = stg / f".case.xlsx.{os.getpid()}.tmp"
@@ -203,7 +204,7 @@ def stage_case(cfg: GatewayConfig, module: str, autoid: str, data: bytes,
 
 # 每个任务在 <state>/tasks/ 下的文件（cexg gc 按同一张表认领）
 TASK_FILES = (("runner", ".sh"), ("log", ".log"), ("status", ".status.json"), ("junit", ".xml"),
-              ("alive", ".alive"), ("process", ".runner.json"))
+              ("start", ".started"), ("alive", ".alive"), ("process", ".runner.json"))
 
 
 def task_paths(cfg: GatewayConfig, task_id: str) -> dict[str, Path]:
@@ -215,7 +216,7 @@ def task_paths(cfg: GatewayConfig, task_id: str) -> dict[str, Path]:
 def launch_run(cfg: GatewayConfig, task_id: str, module: str, autoid: str, build: str,
                bed_lock_fd: int) -> None:
     """起 runner。床锁 fd 继承给 runner 进程组；本函数返回后调用方关闭自己的那份 fd。"""
-    stg = staging_dir(cfg, module, autoid)
+    stg = staging_dir(cfg, module, autoid, task_id)
     node = stg / "test_xlsx.py"
     if not node.exists():
         node = stg
@@ -225,6 +226,7 @@ def launch_run(cfg: GatewayConfig, task_id: str, module: str, autoid: str, build
     done_json = ('{"task_id": "%s", "state": "done", "rc": %%d, "finished_at": %%d}' % task_id)
     script = "\n".join([
         "#!/bin/bash",
+        f"printf started > {q(str(paths['start']))} || exit 98",
         f"cd {q(str(cfg.apv_src))} || exit 97",
         f"timeout --kill-after=30 {int(cfg.run_max_s)} {q(str(cfg.py38))} -m pytest -s "
         f"{q(str(node))} --build {q(build)} --junitxml {q(str(paths['junit']))} "
@@ -319,6 +321,39 @@ def _report_bases(cfg: GatewayConfig, module: str, autoid: str) -> list[Path]:
     return sorted(cfg.apv_src.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
+def delivery_report_lookup(cfg: GatewayConfig, staging: str) -> dict[str, Any]:
+    try:
+        relative = Path(staging).relative_to(cfg.staging_parent)
+    except ValueError:
+        return {'base': None, 'reason': 'outside_staging_root'}
+    if len(relative.parts) != 3 or not relative.parts[0].startswith('cex_'):
+        return {'base': None, 'reason': 'legacy_layout'}
+    pattern = '*/*/' + relative.as_posix() + '/test_xlsx/case.xlsx'
+    bases = sorted((cfg.apv_src / 'report').glob(pattern))
+    if not bases:
+        return {'base': None, 'reason': 'no_report'}
+    if len(bases) != 1:
+        return {'base': None, 'reason': 'ambiguous_reports'}
+    base = bases[0]
+    if not base.resolve().is_relative_to((cfg.apv_src / 'report').resolve()):
+        return {'base': None, 'reason': 'outside_report_root'}
+    return {'base': base, 'reason': None}
+
+
+def delivery_report_base(cfg: GatewayConfig, staging: str) -> Path | None:
+    return delivery_report_lookup(cfg, staging)['base']
+
+
+def delivery_logs(base: Path, max_chars: int = 20000):
+    out = {}
+    for case_dir in sorted(base.iterdir()):
+        log = case_dir / (case_dir.name + '.txt')
+        if case_dir.is_dir() and log.is_file():
+            out[case_dir.name] = {'stale':False,'log':scrub_text(tail_lines(
+                log.read_text(encoding='utf-8',errors='replace'),max_chars))}
+    return out
+
+
 def report_run_dir(cfg: GatewayConfig, module: str, autoid: str, min_epoch: float,
                    max_epoch: float | None = None) -> str | None:
     """本次任务那一次框架运行的报告目录名（report/<名>/…），投递前或任务结束后的都不算。"""
@@ -411,12 +446,12 @@ def agent_call(cfg: GatewayConfig, request: dict[str, Any], timeout: float = 120
 
 
 def query_results(cfg: GatewayConfig, build: str, case_ids: list[str], *,
-                  run_dir: str) -> dict[str, Any]:
+                  run_dir: str, report_path: str | None = None) -> dict[str, Any]:
     """结果库按"构建表 + case_id"存，一案可能有多行（别的床、上一轮）；只取本次运行报告目录下那行。"""
     parser = read_conf(cfg)
     request: dict[str, Any] = {"op": "results", "mysql_ip": mysql_ip(parser), "build": build,
                                "case_ids": list(case_ids), "apv_src": str(cfg.apv_src),
-                               "run_dir": run_dir}
+                               "run_dir": run_dir, "report_path": report_path}
     if cfg.mysql_password_file:
         request.update({"mysql_password": cfg.mysql_password_file.read_text(encoding="utf-8").strip(),
                         "mysql_user": cfg.mysql_user, "mysql_db": cfg.mysql_db})
@@ -438,8 +473,16 @@ def probe(cfg: GatewayConfig, command: str, build: str, device_index: int) -> di
     if not 0 <= device_index < len(ips):
         raise FrameworkError(f"device_index {device_index} is not in the framework conf")
     creds = device_credentials(parser, build)
-    result = agent_call(cfg, {"op": "probe", "ip": ips[device_index], "user": creds["user"],
-                              "passwd": creds["passwd"], "command": command}, timeout=90)
+    # Preserve the device fact even if the proxy loses its JSON reply after login.
+    import uuid
+    marker = cfg.state_dir / ('probe-' + uuid.uuid4().hex + '.login')
+    try:
+        result = agent_call(cfg, {"op": "probe", "ip": ips[device_index], "user": creds["user"],
+                                  "passwd": creds["passwd"], "command": command,
+                                  "login_marker": str(marker)}, timeout=90)
+        result['reached_device'] = bool(result.get('reached_device')) or marker.exists()
+    finally:
+        marker.unlink(missing_ok=True)
     if "output" in result:
         result["output"] = scrub_text(result["output"])
     return result

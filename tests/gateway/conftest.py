@@ -65,14 +65,16 @@ def test_case(request):
             if a.isdigit() and len(a) >= 12 and a != "999999999999999" and a not in ids:
                 ids.append(a)
     module = here.parent.name[len("ist_staging_"):]
-    # 与真框架一致：每次运行一个报告目录，结果库一行一案，url 指向本次运行的报告目录
+    # 默认模拟一案一行覆盖；指定 append 模式额外验证保留历史时仍不借用别次派发。
     run = "run-%d-%s" % (time.time_ns(), build)
     rows = json.loads((root / "fake_results.json").read_text()) \\
         if (root / "fake_results.json").exists() else []
     for cid in ids:
         if cid in verdicts.get("skip", []):
             continue
-        rel = "report/%s/%s/ist_staging_%s/%s/test_xlsx/case.xlsx/%s" % (run, module, module, here.name, cid)
+        delivery = here.parent.parent.name
+        prefix = delivery + "/" if delivery.startswith("cex_") else ""
+        rel = "report/%s/%s/%sist_staging_%s/%s/test_xlsx/case.xlsx/%s" % (run, module, prefix, module, here.name, cid)
         (root / rel).mkdir(parents=True, exist_ok=True)
         result = str(verdicts.get(cid, "PASS")).upper()
         # 与真框架一样收尾：计数、PASS/FAIL 横幅，紧跟 end case（unfinished 里的案模拟停在案里）
@@ -82,9 +84,11 @@ def test_case(request):
             "######################      %s      ####################\\n#######   end case: %s\\n"
             % (0 if result == "PASS" else 1, 1 if result == "PASS" else 0, result, cid))
         (root / rel / (cid + ".txt")).write_text("ran %s on %s in %s\\n%s" % (cid, build, run, close))
-        (root / rel / "apv_192.0.2.10.txt").write_text("APV(config)#show sdns node\\nnode1 %s\\n" % cid)
+        (root / rel / "apv_192.0.2.10.txt").write_text("APV(config)#show sdns node\\nnode1 %s %s\\n" % (cid, delivery))
         sub = "ist_staging_" + module
-        rows = [r for r in rows if not (r["table"] == build and r["case_id"] == cid and r["sub_module"] == sub)]
+        retention = (root / "fake_result_retention").read_text().strip()
+        if retention == "overwrite":
+            rows = [r for r in rows if not (r["table"] == build and r["case_id"] == cid and r["sub_module"] == sub)]
         rows.append({"table": build, "case_id": cid, "sub_module": sub,
                      "result": verdicts.get(cid, "PASS"),
                      "url": "http://jumphost/test/fw/" + rel + "/" + cid + "/"})
@@ -150,7 +154,7 @@ def write_secret_digest(path: Path, secret: str) -> Path:
 
 
 @pytest.fixture()
-def fake_env(tmp_path, monkeypatch):
+def fake_env(tmp_path, monkeypatch, request):
     apv = tmp_path / "apv_src"
     (apv / "lib").mkdir(parents=True)
     (apv / "conf").mkdir()
@@ -227,8 +231,11 @@ def fake_env(tmp_path, monkeypatch):
     from gateway.config import load
     from gateway.tools import Gateway
 
+    retention = getattr(request, 'param', 'overwrite')
+    assert retention in ('overwrite', 'append')
+    (apv / 'fake_result_retention').write_text(retention)
     gateway = Gateway(load(config))
-    return {"gateway": gateway, "apv": apv, "config": config, "tmp": tmp_path,
+    return {"gateway": gateway, "result_retention": retention, "apv": apv, "config": config, "tmp": tmp_path,
             "secret_file": secret, "admin_secret_file": admin_secret}
 
 

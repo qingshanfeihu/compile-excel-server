@@ -13,6 +13,10 @@
 [hub]
 # 密钥摘要文件（SHA-256 十六进制）；权限必须 600
 secret_sha256_file = "/home/test/.config/cexg/hub.secret.sha256"
+# 可选：上一把运行钥匙的摘要路径。文件存在时与当前钥匙同时生效，仅授予运行权限；
+# 不存在表示已撤下，每次鉴权检查，无须重启。换钥前先在此放旧摘要，换当前摘要，
+# Hub 更新完成且旧会话退出后删此文件。格式和权限与当前摘要相同；不填则禁用重叠。
+previous_secret_sha256_file = ""
 # 可选：另一把密钥，带 jumphost:admin（init_device 用）；hub 只在设备初始化时拿它调用。留空 = 不开
 admin_secret_sha256_file = ""
 # 审计里的调用方名字；hub 可带 X-Circle-Hub-Actor 头说明替谁执行，只进审计和租约持有人

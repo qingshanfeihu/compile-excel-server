@@ -3,6 +3,8 @@
 
 - 密钥摘要文件只放密钥的 SHA-256（64 位十六进制一行），权限 0600；换密钥就是换文件内容，按 mtime 重读，
   不用重启网关。
+- 可选的上一把运行密钥来自 previous_secret_sha256_file；与当前钥匙重叠，删除文件即撤下，
+  每次请求检查，不用重启；不因此授予管理权限。
 - 可选的管理密钥另外带 jumphost:admin（init_device 用）；hub 只在设备初始化时拿它来调用。
 - 调用方可以带 X-Circle-Hub-Actor 头说明替谁执行：它只进审计和租约持有人，不参与授权——授权是 hub 的事。
 """
@@ -47,23 +49,35 @@ def secret_digest(secret: str) -> str:
 class SecretFile:
     """按 mtime 缓存的密钥摘要文件。"""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, optional: bool = False):
         self.path = Path(path)
-        self._cached: tuple[tuple[int, int], str] | None = None
+        self.optional = optional
+        self._cached: tuple[tuple[int, int, int, int], str] | None = None
         self._lock = threading.Lock()
 
-    def digest(self) -> str:
+    def digest(self) -> str | None:
         try:
             info = self.path.stat()
+        except FileNotFoundError:
+            if self.optional:
+                return None  # Explicit removal revokes a cached previous key immediately.
+            raise AuthError(f"密钥摘要文件不存在：{self.path}") from None
         except OSError:
             raise AuthError(f"密钥摘要文件不存在：{self.path}") from None
         if info.st_mode & 0o077:
             raise AuthError(f"密钥摘要文件权限必须是 0600：{self.path}")
-        key = (info.st_mtime_ns, info.st_size)
+        key = (info.st_ino, info.st_ctime_ns, info.st_mtime_ns, info.st_size)
         with self._lock:
             if self._cached and self._cached[0] == key:
                 return self._cached[1]
-            text = self.path.read_text(encoding="utf-8").strip().lower()
+            try:
+                text = self.path.read_text(encoding="utf-8").strip().lower()
+            except FileNotFoundError:
+                if self.optional:
+                    return None
+                raise AuthError(f"密钥摘要文件不存在：{self.path}") from None
+            except (OSError, UnicodeError):
+                raise AuthError(f"密钥摘要文件不可读：{self.path}") from None
             if not _HEX64.match(text):
                 raise AuthError(f"密钥摘要文件内容必须是 64 位十六进制的 SHA-256：{self.path}")
             self._cached = (key, text)
@@ -80,24 +94,34 @@ def check_secret_file(path: Path) -> dict[str, Any]:
 
 
 class StaticSecretAuth:
-    def __init__(self, subject: str, secret_file: Path, admin_secret_file: Path | None = None):
+    def __init__(self, subject: str, secret_file: Path, admin_secret_file: Path | None = None,
+                 previous_secret_file: Path | None = None):
         self.subject = subject
         self._run = SecretFile(secret_file)
+        self._previous = SecretFile(previous_secret_file, optional=True) if previous_secret_file else None
         self._admin = SecretFile(admin_secret_file) if admin_secret_file else None
 
     @classmethod
     def from_config(cls, cfg: GatewayConfig) -> StaticSecretAuth:
-        return cls(cfg.hub_subject, cfg.hub_secret_file, cfg.hub_admin_secret_file)
+        return cls(cfg.hub_subject, cfg.hub_secret_file, cfg.hub_admin_secret_file,
+                   cfg.hub_previous_secret_file)
 
     def caller(self, bearer: str | None, actor: str | None = None) -> Caller | None:
         """Bearer 对得上就是 hub；对不上回 None（401）。两把密钥都比，不因第一把对上就省掉第二把。"""
         if not bearer:
             return None
         presented = secret_digest(bearer)
-        scopes = None
-        if hmac.compare_digest(presented, self._run.digest()):
-            scopes = RUN_SCOPES
-        if self._admin is not None and hmac.compare_digest(presented, self._admin.digest()):
+        current = self._run.digest()
+        previous = self._previous.digest() if self._previous else None
+        admin = self._admin.digest() if self._admin else None
+        # Always compare every fixed-size candidate, even after a match. Missing slots
+        # use a dummy digest whose comparison cannot grant a scope.
+        current_match = hmac.compare_digest(presented, current)
+        previous_match = hmac.compare_digest(presented, previous or '0' * 64)
+        admin_match = hmac.compare_digest(presented, admin or '0' * 64)
+        run_match = current_match | (previous_match & (previous is not None))
+        scopes = RUN_SCOPES if run_match else None
+        if admin_match & (admin is not None):
             scopes = ADMIN_SCOPES
         if scopes is None:
             return None

@@ -26,6 +26,7 @@ class GatewayConfig:
     build: str
     # 调用方只有 circle-hub 的 worker：本地比对静态密钥的 SHA-256，不回调任何服务端
     hub_secret_file: Path
+    hub_previous_secret_file: Path | None = None
     hub_admin_secret_file: Path | None = None
     hub_subject: str = "circle-hub"
     # 自毁规则等文法：跳板机本地文件，由运维随 hub 的规则资产更新；不配就是 <state.dir>/domain_grammar.json
@@ -162,6 +163,8 @@ def load(path: Path) -> GatewayConfig:
     cfg = GatewayConfig(
         build=_safe(hub.get("build"), "hub.build"),
         hub_secret_file=_path(hub.get("secret_sha256_file"), "hub.secret_sha256_file"),
+        hub_previous_secret_file=_path(hub.get("previous_secret_sha256_file"),
+                                       "hub.previous_secret_sha256_file", required=False),
         hub_admin_secret_file=_path(hub.get("admin_secret_sha256_file"),
                                     "hub.admin_secret_sha256_file", required=False),
         hub_subject=_safe(hub.get("subject") or "circle-hub", "hub.subject"),

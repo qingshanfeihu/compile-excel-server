@@ -65,6 +65,7 @@ def collect(cfg: GatewayConfig, days: float, now: float | None = None) -> dict[s
                          f"({cfg.run_max_s}s)")
     cutoff = (time.time() if now is None else now) - days * DAY_S
     store = StateStore(cfg.state_dir, cfg.lease_ttl_s)
+    protected = store.protected_request_tasks()
     groups: dict[str, list[Path]] = {}
     tasks_dir = cfg.state_dir / "tasks"
     if tasks_dir.is_dir():
@@ -76,6 +77,8 @@ def collect(cfg: GatewayConfig, days: float, now: float | None = None) -> dict[s
     files: list[Path] = []
     size = 0
     for task_id in sorted(set(groups) | set(store.tasks_created_before(cutoff))):
+        if task_id in protected:
+            continue
         paths = groups.get(task_id, [])
         scans = [_scan(path) for path in paths]
         if any(newest >= cutoff for newest, _ in scans):
@@ -89,16 +92,22 @@ def collect(cfg: GatewayConfig, days: float, now: float | None = None) -> dict[s
         size += sum(bytes_ for _, bytes_ in scans)
     trees: dict[str, list[Path]] = {"staging": [], "reports": []}
     for key, root, pattern in (("staging", cfg.staging_parent, "ist_staging_*/*"),
+                               ("delivery_staging", cfg.staging_parent, "cex_*/ist_staging_*/*"),
+                               ("delivery_reports", cfg.apv_src / "report", "*/*/cex_*/ist_staging_*"),
                                ("reports", cfg.apv_src / "report", "*/*/ist_staging_*")):
         for path in sorted(root.glob(pattern)) if root.is_dir() else []:
+            if any(part in protected for part in path.parts):
+                continue
             if not _inside(path, root):
+                continue
+            if key == 'reports' and not (cfg.staging_parent / path.name).exists():
                 continue
             newest, bytes_ = _scan(path)
             if newest < cutoff:
-                trees[key].append(path)
+                trees["staging" if "staging" in key else "reports"].append(path)
                 size += bytes_
     return {"days": days, "cutoff": int(cutoff), "tasks": tasks, "task_files": files,
-            **trees, "bytes": size}
+            **trees, "bytes": size, "requests_deleted": store.count_gc_requests(int(cutoff))}
 
 
 def run(cfg: GatewayConfig, days: float, *, apply: bool) -> dict[str, Any]:
@@ -111,24 +120,27 @@ def run(cfg: GatewayConfig, days: float, *, apply: bool) -> dict[str, Any]:
         raise PruneError("bed busy: a run or device operation is in progress; run gc later")
     try:
         plan = collect(cfg, days)
-        _delete(store, plan)
+        _delete(store, plan, cfg)
     finally:
         os.close(fd)
     return plan
 
 
-def _delete(store: StateStore, plan: dict[str, Any]) -> None:
+def _delete(store: StateStore, plan: dict[str, Any], cfg: GatewayConfig) -> None:
     for path in plan["task_files"]:
         path.unlink(missing_ok=True)
     store.delete_tasks(plan["tasks"])
+    plan["requests_deleted"] = store.gc_requests(plan["cutoff"])
     for path in plan["staging"] + plan["reports"]:
         shutil.rmtree(path)
-    # 空了的上层一并删：落位的 ist_staging_<模块>；报告的 <模块> 与 <run>
-    for path in plan["staging"]:
-        _rmdir_if_empty(path.parent)
-    for path in plan["reports"]:
-        if _rmdir_if_empty(path.parent):
-            _rmdir_if_empty(path.parent.parent)
+    # Follow each layout only as far as its explicit ownership root, never delete the root itself.
+    for key, root in [('staging', cfg.staging_parent), ('reports', cfg.apv_src / 'report')]:
+        for path in plan[key]:
+            parent = path.parent
+            while parent != root and parent.is_relative_to(root):
+                if not _rmdir_if_empty(parent):
+                    break
+                parent = parent.parent
 
 
 def _rmdir_if_empty(path: Path) -> bool:
@@ -142,5 +154,6 @@ def _rmdir_if_empty(path: Path) -> bool:
 def report(plan: dict[str, Any], applied: bool) -> dict[str, Any]:
     return {"ok": True, "applied": applied, "days": plan["days"],
             "cutoff": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(plan["cutoff"])),
+            "requests_deleted": plan.get("requests_deleted", 0),
             "tasks": plan["tasks"], "staging": [str(p) for p in plan["staging"]],
             "reports": [str(p) for p in plan["reports"]], "bytes": plan["bytes"]}

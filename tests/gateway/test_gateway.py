@@ -140,7 +140,7 @@ def test_submit_status_results_end_to_end(fake_env, tmp_path):
     submitted = gw.call(ALICE, "case_submit", {**lease, "xlsx_b64": base64.b64encode(data).decode()})
     assert submitted["ok"], submitted
     assert submitted["case_ids"] == ["202609240000000011", "202609240000000012"]
-    staged = apv / "smoke_test" / "sdns" / "ist_staging_sdns" / "202609240000000011" / "case.xlsx"
+    staged = apv / "smoke_test" / "sdns" / submitted["task_id"] / "ist_staging_sdns" / "202609240000000011" / "case.xlsx"
     assert stat.S_IMODE(staged.stat().st_mode) == 0o444
     assert (staged.parent / "test_xlsx.py").is_symlink()
 
@@ -295,8 +295,12 @@ def test_results_come_from_this_run_not_other_beds_or_rounds(fake_env, tmp_path)
     assert {c["case_id"]: c["result"] for c in second["cases"]} == {a: "PASS", b: None}
     assert second["channel"] == "missing_after_done"
 
-    # 紧接着又跑了一轮，再取第一轮的结果：报告目录与日志仍是第一轮自己的。结果库每案只留
-    # 最新一行——a 的行已被第二轮覆盖，第一轮的 a 就是缺失，不拿第二轮的 PASS 顶替
+    # Simulate a result store retaining only the latest row for a. Missing old rows must
+    # stay missing, never be replaced by the second dispatch's PASS.
+    db = apv / 'fake_results.json'
+    rows = json.loads(db.read_text())
+    db.write_text(json.dumps([r for r in rows if not (r['case_id'] == a and
+                            ('/report/' + first['run_dir'] + '/') in r['url'])]))
     again = gw.call(ALICE, "case_results", {"task_id": first["task_id"]})
     assert first["run_dir"] != second["run_dir"]
     assert again["run_dir"] == first["run_dir"]
@@ -493,5 +497,5 @@ def test_results_name_the_run_and_carry_sessions_of_cases_that_did_not_pass(fake
     assert out["report_dir"].endswith(f"ist_staging_sdns/{a}/test_xlsx/case.xlsx")
     cases = {c["case_id"]: c for c in out["cases"]}
     assert "sessions" not in cases[a], "a pass carries no session dumps"
-    assert cases[b]["sessions"] == {"apv_192.0.2.10.txt": f"APV(config)#show sdns node\nnode1 {b}\n"}
+    assert cases[b]["sessions"] == {"apv_192.0.2.10.txt": f"APV(config)#show sdns node\nnode1 {b} {submitted['task_id']}\n"}
     assert "######################      FAIL      ####################" in cases[b]["log"]
