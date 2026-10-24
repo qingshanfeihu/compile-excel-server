@@ -298,7 +298,7 @@ class Gateway:
     def _task_receipt(self, task):
         return {'task_id':task['task_id'],'sha256':task['xlsx_sha256'],
                 'bytes':(Path(task['staging_dir']) / 'case.xlsx').stat().st_size,
-                'case_ids':task['case_ids'],'deliver_epoch':int(task['deliver_epoch']),
+                'case_ids':task['case_ids'],'deliver_epoch':round(task['deliver_epoch'], 6),
                 'submit_autoid':task['autoid'],'module':task['module']}
 
     def _recover_request_row(self, row):
@@ -604,7 +604,7 @@ class Gateway:
         self.audit("case_submitted", subject=caller.subject, task_id=task_id,
                    sha256=frozen.sha256, cases=len(frozen.autoids))
         return {"task_id": task_id, "sha256": frozen.sha256, "bytes": frozen.size,
-                "case_ids": list(frozen.autoids), "deliver_epoch": int(deliver_epoch),
+                "case_ids": list(frozen.autoids), "deliver_epoch": round(deliver_epoch, 6),
                 "submit_autoid": submit, "module": module}
 
     def _own_task(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
@@ -627,7 +627,7 @@ class Gateway:
         task = self._own_task(caller, args)
         identity = {'task_id':task['task_id'],'request_id':self.state.task_request(task['task_id']),
                     'ownership':'none', 'complete':False, 'xlsx_sha256':task['xlsx_sha256'],
-                    'submitted_at':datetime.fromtimestamp(task['deliver_epoch'], timezone.utc).isoformat()}
+                    'submitted_at':datetime.fromtimestamp(round(task['deliver_epoch'], 6), timezone.utc).isoformat(timespec='microseconds')}
         status = framework.read_status(self.cfg, task["task_id"])
         if status.get("state") == "lost":
             return {**identity, "channel": "runner_lost", "state": "lost",

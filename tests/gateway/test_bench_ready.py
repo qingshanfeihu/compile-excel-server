@@ -151,3 +151,21 @@ def test_fake_runner_results_expose_hub_fields_without_turning_failure_into_inco
     assert answer['ownership']=='staging_directory' and answer['ownership_reason'] is None
     assert datetime.fromisoformat(answer['submitted_at']).timestamp() >= receipt['deliver_epoch']
     assert answer['xlsx_sha256']==receipt['sha256']
+
+
+def test_receipt_recovery_and_result_share_microsecond_submission_time(result_task, monkeypatch):
+    from decimal import Decimal
+    from datetime import timezone
+    gw, receipt, task = result_task
+    recovered = gw._task_receipt(task)
+    monkeypatch.setattr(framework, 'read_status', lambda *_: {'state':'running'})
+    result = gw.call(ALICE,'case_results',{'task_id':task['task_id']})
+    assert isinstance(receipt['deliver_epoch'],float)
+    assert Decimal(str(receipt['deliver_epoch'])).as_tuple().exponent >= -6
+    assert recovered['deliver_epoch'] == receipt['deliver_epoch']
+    stamp = datetime.fromisoformat(result['submitted_at'])
+    epoch = datetime(1970,1,1,tzinfo=timezone.utc)
+    delta = stamp-epoch
+    iso_us = (delta.days*86400+delta.seconds)*1_000_000+delta.microseconds
+    assert Decimal(str(receipt['deliver_epoch']))*1_000_000 == iso_us
+    assert receipt['deliver_epoch'] == round(task['deliver_epoch'],6)
