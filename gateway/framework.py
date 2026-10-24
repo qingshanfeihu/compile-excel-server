@@ -346,7 +346,8 @@ def case_sessions(base: Path, case_id: str, max_files: int = SESSION_MAX_FILES,
                    if p.is_file() and p.suffix == ".txt" and p.name != f"{case_id}.txt"
                    and _SAFE.match(p.name))
     for name in names[:max_files]:
-        text = (case_dir / name).read_text(encoding="utf-8", errors="replace")
+        # text 模式会做 universal-newline 转换，导致正则取证丢失 CR。
+        text = (case_dir / name).read_bytes().decode("utf-8", errors="replace")
         out[name] = scrub_text(tail_lines(text, max_chars))
     return out
 
@@ -371,7 +372,7 @@ def batch_logs(cfg: GatewayConfig, module: str, autoid: str, min_epoch: float,
             continue
         mtime = log.stat().st_mtime
         stale = min_epoch > 0 and 0 < mtime < min_epoch
-        text = "" if stale else tail_lines(log.read_text(encoding="utf-8", errors="replace"),
+        text = "" if stale else tail_lines(log.read_bytes().decode("utf-8", errors="replace"),
                                            max_chars)
         out[case_dir.name] = {"mtime": int(mtime), "stale": stale, "log": scrub_text(text)}
     return out
