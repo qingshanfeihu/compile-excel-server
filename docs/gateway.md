@@ -167,3 +167,40 @@ sudo systemctl daemon-reload && sudo systemctl enable --now cexg
 
 凭据字面量刷新失败时保留上次成功集合和旧时间戳，下一次读取继续尝试刷新；不把失败缓存成空集合。
 若尚无成功扫描，设备文本整份扣留，回答 ok:false、stage:redaction 与修复框架源码后重读的动作。
+
+
+## 0.4.1：运行钥匙重叠与 Hub 结果字段
+
+`[hub].previous_secret_sha256_file` 可配置上一把运行钥匙的摘要文件路径。
+与 `secret_sha256_file` 一样只放一行 SHA-256、权限 0600；不存在表示已撤下。
+先配置该路径并部署版本（第一次配置需重新加载网关）；后续轮换不重启：
+
+1. 将当前旧摘要原子写入 previous 路径，保持服务账号可读、权限 0600。
+2. 原子替换 current 摘要为新值；两把钥匙都只给 `jumphost:run`，主体不变。
+3. Hub 的执行器引用 `${secret:GATEWAY_RUN_KEY}`；集成者经标准输入执行
+   `circle-hub secret set --name GATEWAY_RUN_KEY --reason '轮换网关运行密钥'`。
+4. 验证新钥匙、等待旧会话/请求不再使用旧值，再删除 previous 文件。
+   删除下一次鉴权即生效；旧钥匙 401，新钥匙 200。不存在的可选槽不阻断当前钥匙；
+   已存在但格式/权限坏的摘要会导致 503，不能当成撤销成功。
+
+每次鉴权对 current、previous、admin 的固定长度摘要都做 `hmac.compare_digest`，
+不因 current 已匹配而跳过其他槽；日志不打印钥匙或摘要。previous 不借用 admin 槽。
+运维必须显式删除 previous，不能把重叠当成自动过期；清理动作和时间由集成者负责。
+
+`case_results` 的已归属任务回答新增：
+
+| 字段 | 类型 | 含义 / Hub 执行器定义 |
+|---|---|---|
+| `complete` | JSON boolean | 指向 `result.complete: "/complete"`；只有 runner 已完成、唯一归属报告存在、预期案全部有 PASS/FAIL 结果及非空且未过期日志、查询未报错时为 true。FAIL 本身不使结果不完整。运行中、lost、缺行/报告/日志、查询错误及未知判词为 false。`ok` 只是工具调用成功，不能代替它 |
+| `submitted_at` | 带 UTC 时区 ISO 8601 字符串 | 指向 `result.submitted_at: "/submitted_at"`；从 task 原始 `deliver_epoch` 转换，保留微秒，不取结果查询时刻；不配置 `submitted_at_scale_ms` |
+| `xlsx_sha256` | SHA-256 字符串 | 所有已归属任务通道（含 lost/运行中）均带原投递摘要；指向 `result.sha256: "/xlsx_sha256"` |
+
+其余身份不改：提交回执摘要 `/sha256`、条目 `/case_ids`；结果 `/request_id`、`/task_id`、
+`/cases`，逐案 `/case_id`、`/result`、`/log`、`/log_stale`、`/sessions`；
+结果归属 `/ownership` 的唯一肯定值为 `staging_directory`，`/ownership_reason` 无冲突。
+Hub 已有这些指针声明及消费逻辑，网关不需要修改 Hub 源码。部署侧需把这两个新增指针登记到
+完整执行器定义，协议/前提认证版本改为 **0.4.1** 并补真实证据，不能沿用 0.4.0 认证。
+
+`complete` 不是设备判决：Hub 仍独立核请求号、任务号、摘要、认证版本、每案收尾标记、
+同租约的设备身份和连续性。日志是否收尾由执行器声明的标记校验；网关不把工具成功冒充设备通过。
+真实收集器完整路径和保留规则仍须在安装前只读核对，假框架测试不替代实机证据。

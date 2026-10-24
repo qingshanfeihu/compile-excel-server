@@ -52,6 +52,10 @@ def cmd_check(config: Path) -> int:
         return 2
     checks = [{"check": "request_journal", "ok": True, "path": str(gateway.state.request_db_path)}]
     checks.append({"check": "hub_secret", **check_secret_file(cfg.hub_secret_file)})
+    if cfg.hub_previous_secret_file:
+        checks.append({"check": "hub_previous_secret", **(
+            check_secret_file(cfg.hub_previous_secret_file) if cfg.hub_previous_secret_file.exists()
+            else {"ok": True, "active": False})})
     if cfg.hub_admin_secret_file:
         checks.append({"check": "hub_admin_secret", **check_secret_file(cfg.hub_admin_secret_file)})
     checks.append({"check": "py38", "ok": cfg.py38.is_file()})

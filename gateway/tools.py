@@ -626,7 +626,8 @@ class Gateway:
     def case_results(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
         task = self._own_task(caller, args)
         identity = {'task_id':task['task_id'],'request_id':self.state.task_request(task['task_id']),
-                    'ownership':'none'}
+                    'ownership':'none', 'complete':False, 'xlsx_sha256':task['xlsx_sha256'],
+                    'submitted_at':datetime.fromtimestamp(task['deliver_epoch'], timezone.utc).isoformat()}
         status = framework.read_status(self.cfg, task["task_id"])
         if status.get("state") == "lost":
             return {**identity, "channel": "runner_lost", "state": "lost",
@@ -660,7 +661,11 @@ class Gateway:
             channel = "missing_after_done"
         else:
             channel = "ready"
-        return {"task_id": task["task_id"], "request_id":self.state.task_request(task["task_id"]),
+        complete = (channel == 'ready' and base is not None and bool(cases)
+                    and len(cases) == len(set(task['case_ids']))
+                    and all(str(c['result']).upper() in ('PASS', 'FAIL')
+                            and c['log'] and not c['log_stale'] for c in cases))
+        return {**identity, "complete":bool(complete),
                 "ownership":"staging_directory" if base is not None else "none", "ownership_reason":ownership['reason'], "channel": channel, "rc": status.get("rc"),
                 "xlsx_sha256": task["xlsx_sha256"], "cases": cases, "run_dir": run_dir,
                 "submit_autoid": task["autoid"], "module": task["module"],
