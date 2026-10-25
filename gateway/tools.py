@@ -95,17 +95,19 @@ TOOL_SPECS: list[dict[str, Any]] = [
                                                "cases were compiled for; must equal this bed's."}},
                              ["lease_id", "token"])},
     {"name": "case_submit", "scope": "jumphost:run", "read_only": False,
-     "description": "Run a frozen, checked workbook on the leased bed. Pair request_id with not_after "
-                    "(UTC deadline); omit both for legacy calls with request_record=none. Same request_id "
-                    "and workbook bytes plus resolved module replay the stored receipt; conflicts refuse "
+     "description": "Run a frozen, checked workbook on the leased bed. Pair request_id with dispatch_sequence and sequence_scope. "
+                    "The issuer checks its own deadline before sending. Legacy not_after is recorded but ignored. Same request_id "
+                    "is refused without another launch; conflicts refuse "
                     "at admission. Recorded replies have request_record=recorded, request_id, journal_id, "
                     "journal_since and subject; collected history has request_record=collected. Refusals "
                     "carry stage and reached_device. Interrupted recovery may return state=not_started "
                     "without a task_id. Successful launch returns task_id, submit_autoid and module. "
                     "Poll case_status then case_results; never resubmit an uncertain dispatch.",
      "input_schema": _schema({**LEASE_PROPS,
-                              "request_id": {"type": "string", "maxLength": 128, "pattern": "^[A-Za-z0-9:._-]+$", "description": "Unique dispatch attempt; must be paired with not_after, never reused for changed work."},
-            "not_after": {"type": "string", "format": "date-time", "description": "UTC admission deadline (Z or +00:00); pair with request_id and retain the original value for reconciliation."},
+                              "request_id": {"type": "string", "maxLength": 128, "pattern": "^[A-Za-z0-9:._-]+$", "description": "Unique dispatch attempt; never reuse. Pair with a signed dispatch_sequence and sequence_scope."},
+            "not_after": {"type": "string", "description": "Legacy record only; ignored for every decision."},
+            "dispatch_sequence": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+            "sequence_scope": {"type": "string", "minLength": 1, "maxLength": 128},
             "xlsx_b64": {"type": "string", "description": "Workbook bytes, base64."},
                               "module": {"type": "string", "description": "Staging module; defaults to the gateway's configured module."}},
                              ["lease_id", "token", "xlsx_b64"])},
@@ -113,10 +115,10 @@ TOOL_SPECS: list[dict[str, Any]] = [
      "description":"Read request_id without a lease or device operation. Every answer includes found, "
                    "gateway_time, gc_before, journal_id, journal_since and resolved subject. Before dispatch "
                    "freeze journal_id and subject; not found proves non-execution only for the same journal_id "
-                   "and submit subject with gateway_time > original not_after > gc_before >= journal_since. "
+                   "and submit subject. Timestamps are recording only; absence never proves non-execution. "
                    "Found answers include state/stage/reached_device; pending contact is null and must be polled. "
                    "task_id appears only after confirmed runner start.",
-     "input_schema":_schema({"request_id":{"type":"string"}},["request_id"])},
+     "input_schema":_schema({"request_id":{"type":"string"},"sequence_scope":{"type":"string"}},["request_id"])},
     {"name": "case_status", "scope": "jumphost:run", "read_only": True,
      "description": "State of a submitted run (running/done/lost) with the last lines of its log. "
                     "lost means the runner died without recording an end (gateway restart, OOM, "
@@ -223,10 +225,12 @@ class Gateway:
             return {"ok": False, "error": f"your token lacks the {spec['scope']} scope", "stage":"admission", "reached_device":False}
         if not isinstance(args, dict):
             return {"ok": False, "error": "arguments must be an object", "stage":"admission", "reached_device":False}
-        if name == "case_submit" and ("request_id" in args or "not_after" in args):
+        if name == "case_submit" and any(field in args for field in ("request_id", "not_after", "dispatch_sequence", "sequence_scope")):
             result = self._request_submit(caller, args)
         else:
             result = self._invoke(caller, name, args)
+        if name == 'case_submit' and 'not_after' in args:
+            result = {**result,'not_after_ignored':True,'not_after':args['not_after']}
         if name in ('case_submit', 'case_request'):
             result.update(self.state.journal_identity(), subject=caller.subject)
         return result
@@ -328,12 +332,12 @@ class Gateway:
             raise ToolError('invalid request_id; supply the id from the submit receipt')
         self.reconcile_request(rid,caller.subject)
         row,now,floor = self.state.request_snapshot(rid,caller.subject)
-        result = {'found':bool(row),'gateway_time':now,'gc_before':floor,'subject':caller.subject}
+        result = {'found':bool(row),'gateway_time':now,'gc_before':floor,'subject':caller.subject, 'sequence_floor':self.state.sequence_floor(caller.subject,args.get('sequence_scope',caller.subject))}
         if row:
             result.update(request_id=rid,state=row['state'],stage=row['stage'],
                           reached_device=(None if row['state'] in ('received','starting') else bool(row['reached_device'])),
                           xlsx_sha256=row['xlsx_sha256'] or None,received_at=row['received_at'],
-                          not_after=row['not_after'])
+                          not_after=row['not_after'], not_after_ignored=True, dispatch_sequence=row.get('dispatch_sequence'), sequence_scope=row.get('sequence_scope'))
             if row['reached_device'] and row['task_id']:
                 result['task_id'] = row['task_id']
             if row['state'] in ('received','starting'):
@@ -345,14 +349,15 @@ class Gateway:
     def _request_submit(self, caller, args):
         try:
             rid = args.get('request_id')
-            if 'request_id' not in args or 'not_after' not in args:
-                raise ToolError('request_id and not_after must be supplied together')
+            if 'request_id' not in args:
+                raise ToolError('request_id is required with the dispatch sequence')
             if not isinstance(rid,str) or not re.fullmatch(r'[A-Za-z0-9:._-]{1,128}',rid):
                 raise ToolError('request_id must contain 1 to 128 ASCII letters, digits or :._-')
-            stamp = datetime.fromisoformat(str(args['not_after']).replace('Z','+00:00'))
-            if stamp.tzinfo is None or stamp.utcoffset().total_seconds() != 0:
-                raise ValueError('not UTC')
-            deadline = stamp.timestamp()
+            sequence = args.get('dispatch_sequence')
+            scope = args.get('sequence_scope')
+            if type(sequence) is not int or not 1 <= sequence <= 9007199254740991 or not isinstance(scope,str) or not 1 <= len(scope) <= 128:
+                raise ToolError('dispatch_sequence and sequence_scope are required together with request_id')
+            deadline = args.get('not_after')  # Preserve old bytes; never compare an external timestamp.
         except (ToolError,ValueError,binascii.Error) as exc:
             return self._admission_refusal(caller,args,str(exc))
         module_error = None
@@ -368,33 +373,26 @@ class Gateway:
             digest = ''  # No workbook bytes exist; never present this as a workbook hash.
             decode_error = 'xlsx_b64 is not valid base64; fix the encoding and use a new request_id'
         with self.state.request_lock(rid):
-            row, fresh = self.state.reserve_request(rid, caller.subject, digest, deadline, admission_error=decode_error or module_error, module=module)
+            row, fresh = self.state.reserve_request(rid, caller.subject, digest, deadline, admission_error=decode_error or module_error, module=module, dispatch_sequence=sequence, sequence_scope=scope)
             if row.get('collected'):
-                return {**self._admission_refusal(caller, args, 'request falls within collected history; inspect the original dispatch before using a new request_id'), 'request_record': 'collected'}
+                return {**self._admission_refusal(caller, args, 'request falls within collected history; inspect the original dispatch before using a new request_id'), 'request_record': 'collected', 'stage':'collected', 'reached_device':None}
             if row['holder'] != caller.subject or row['xlsx_sha256'] != digest or row['module'] != module:
                 return self._admission_refusal(caller,args,
                     'request_id conflicts with an existing request; use a new request_id')
             if not fresh:
-                if row['state'] in ('received','starting') and not row['reply']:
-                    row = self._recover_request_row(row)
-                if row['reply']:
-                    return json.loads(row['reply'])
-                return {'ok':True,'request_id':rid,'state':row['state'],'reached_device':None if row['state'] in ('received','starting') else bool(row['reached_device'])}
+                return {**self._admission_refusal(caller,args,'request_id already recorded; query case_request, never submit it again'), 'request_record':'recorded', 'replayed':True, 'request_id':rid, 'stage':'duplicate', 'reached_device':None if row['state'] in ('received','starting') else bool(row['reached_device'])}
             self.flush_request_audit()
             if row['reply']:
                 reply = json.loads(row['reply'])
             elif decode_error:
                 reply = {'ok':False,'error':decode_error,'stage':'admission','reached_device':False}
-            elif row['expired']:
-                reply = {'ok':False,'error':'request expired before admission; use a new request_id and deadline',
-                         'stage':'admission','reached_device':False}
             else:
                 reply = self._invoke(caller,'case_submit',args)
             if not reply['ok'] and reply.get('stage') == 'admission':
                 self.audit('tool_refused',tool='case_submit',subject=caller.subject,
                            request_id=rid,stage='admission',reached_device=False,
                            reason=reply['error'])
-            reply.update(request_id=rid,request_record='recorded')
+            reply.update(request_id=rid,request_record='recorded', dispatch_sequence=sequence, sequence_scope=scope, **({'not_after_ignored':True,'not_after':deadline} if 'not_after' in args else {}))
             marked = (reply['ok'] and reply.get('task_id') and
                       framework.task_paths(self.cfg,reply['task_id'])['start'].exists())
             state = ('started' if marked else 'starting') if reply['ok'] else 'rejected'

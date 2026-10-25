@@ -1,15 +1,17 @@
+from itertools import count
 import base64
 import concurrent.futures
 from datetime import datetime, timezone, timedelta
 
 from gateway.tools import Caller
 
+_sequences = count(1)
 ALICE = Caller('alice', frozenset({'jumphost:run'}))
 
 
 def args(**kw):
     return {'xlsx_b64': base64.b64encode(b'synthetic workbook').decode(),
-            'request_id': 'intent:1',
+            'request_id': 'intent:1', 'dispatch_sequence': next(_sequences), 'sequence_scope': 'synthetic-executor',
             'not_after': (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(), **kw}
 
 
@@ -26,16 +28,17 @@ def test_request_is_recorded_before_lease_and_duplicate_is_serialized(fake_env, 
         replies = list(pool.map(lambda _: gw.call(ALICE, 'case_submit', values), range(2)))
     assert len(seen) == 1
     assert seen[0]['state'] == 'received'
-    assert replies[0] == replies[1]
+    assert sum(bool(reply.get('replayed')) for reply in replies) == 1
+    assert all(not reply['ok'] for reply in replies)
     assert replies[0]['request_id'] == 'intent:1'
 
 
 def test_request_parameters_are_paired(fake_env):
-    for key in ('request_id', 'not_after'):
+    for key in ('request_id', 'dispatch_sequence', 'sequence_scope'):
         values = args()
         values.pop(key)
         reply = fake_env['gateway'].call(ALICE, 'case_submit', values)
-        assert not reply['ok'] and 'together' in reply['error']
+        assert not reply['ok'] and ('together' in reply['error'] or 'required' in reply['error'])
 
 
 def test_legacy_has_explicit_no_request_record(fake_env, monkeypatch):
@@ -53,7 +56,7 @@ def test_duplicate_conflicts_expiry_and_gc(fake_env, monkeypatch):
     monkeypatch.setitem(gw.handlers, 'case_submit', lambda *_: calls.append(1) or {'task_id':'synthetic'})
     values = args()
     first = gw.call(ALICE,'case_submit',values)
-    assert gw.call(ALICE,'case_submit',values) == first
+    assert gw.call(ALICE,'case_submit',values)['replayed']
     assert calls == [1]
     conflict = gw.call(ALICE,'case_submit',args(xlsx_b64=base64.b64encode(b'changed').decode()))
     assert not conflict['ok'] and conflict['stage'] == 'admission' and conflict['reached_device'] is False
@@ -61,16 +64,16 @@ def test_duplicate_conflicts_expiry_and_gc(fake_env, monkeypatch):
     other = gw.call(bob,'case_submit',values)
     assert not other['ok'] and other['stage'] == 'admission' and other['reached_device'] is False
     assert other['error'] == conflict['error']
-    assert gw.call(ALICE,'case_submit',values) == first
+    assert gw.call(ALICE,'case_submit',values)['replayed']
     expired = args(request_id='expired',not_after='2001-01-01T00:00:00Z')
     reply = gw.call(ALICE,'case_submit',expired)
-    assert not reply['ok'] and reply['stage'] == 'admission'
-    assert gw.call(ALICE,'case_submit',expired) == reply
-    assert gw.state.gc_requests(time.time()+1) == 1
-    assert gw.state.request_snapshot('intent:1','alice')[0] is not None
-    assert gw.state.request_snapshot('expired','alice')[0] is None
-    assert StateStore(gw.cfg.state_dir).request_snapshot('expired','alice')[2] == max(datetime.fromisoformat(expired['not_after'].replace('Z', '+00:00')).timestamp(), reply['journal_since'])
-    assert calls == [1]
+    assert reply['ok'] and reply['not_after_ignored']
+    assert gw.call(ALICE,'case_submit',expired)['replayed']
+    gw.state.update_request('expired', state='started')
+    gw.state.update_request('intent:1', state='started')
+    assert gw.state.gc_requests(expired['dispatch_sequence'],ALICE.subject,expired['sequence_scope']) == 2
+    assert StateStore(gw.cfg.state_dir).sequence_floor(ALICE.subject,expired['sequence_scope']) == expired['dispatch_sequence']
+    assert calls == [1,1]
 
 
 def submission(fake_env,tmp_path):
@@ -103,7 +106,7 @@ def test_reconcile_crashes_before_and_after_runner(fake_env,tmp_path,monkeypatch
         framework.task_paths(cfg,task_id)['start'].write_text('started')
         raise Crash()
     monkeypatch.setattr(framework,'launch_run',started)
-    values['request_id']='intent:2'
+    values['request_id']='intent:2'; values['dispatch_sequence'] += 1
     with pytest.raises(Crash): restarted.call(ALICE,'case_submit',values)
     again=Gateway(gw.cfg)
     row=again.reconcile_request('intent:2',ALICE.subject)
@@ -187,18 +190,19 @@ def test_readonly_request_query_and_retention_bounds(fake_env):
     assert spec['read_only'] and spec['scope']=='jumphost:run'
     missing=gw.call(ALICE,'case_request',{'request_id':'missing'})
     assert missing['found'] is False and missing['gateway_time'] > missing['gc_before']
-    reply=gw.call(ALICE,'case_submit',args(not_after='2001-01-01T00:00:00Z'))
+    values=args(not_after='2001-01-01T00:00:00Z')
+    reply=gw.call(ALICE,'case_submit',values)
     row=gw.call(ALICE,'case_request',{'request_id':'intent:1'})
-    assert row['found'] and row['state']=='rejected' and row['stage']=='admission'
+    assert row['found'] and row['state']=='rejected' and row['stage']=='lease'
     assert row['reached_device'] is False and 'task_id' not in row
     other=gw.call(Caller('bob',ALICE.scopes),'case_request',{'request_id':'intent:1'})
     assert set(other)==set(missing) and other['found'] is False
-    gw.state.gc_requests(__import__('time').time()+1)
+    gw.state.gc_requests(values['dispatch_sequence'], ALICE.subject, values['sequence_scope'])
     deleted=gw.call(ALICE,'case_request',{'request_id':'intent:1'})
-    assert not deleted['found'] and deleted['gc_before'] == max(row['not_after'], deleted['journal_since'])
+    assert not deleted['found'] and deleted['sequence_floor'] == 0
 
 
-def test_query_clock_after_lock_prevents_late_launch(fake_env,monkeypatch):
+def test_waiting_for_a_journal_lock_never_invents_external_deadline_enforcement(fake_env,monkeypatch):
     import sqlite3,time,threading
     gw=fake_env['gateway']; launches=[]
     monkeypatch.setitem(gw.handlers,'case_submit',lambda *_:launches.append(1) or {'task_id':'fake'})
@@ -212,9 +216,9 @@ def test_query_clock_after_lock_prevents_late_launch(fake_env,monkeypatch):
         time.sleep(0.2)
         blocker.commit();blocker.close()
         answer=submit.result(); observed=query.result()
-    assert not answer['ok'] and answer['stage']=='admission' and launches==[]
+    assert answer['ok'] and answer['not_after_ignored'] and launches==[1]
     assert observed['gateway_time']>deadline
-    assert not observed['found'] or observed['state'] in ('received','rejected')
+    assert not observed['found'] or observed['state'] in ('received','starting','started','not_started')
 
 
 @pytest.mark.parametrize('fake_env', ['overwrite', 'append'], indirect=True)
@@ -232,7 +236,7 @@ def test_deliveries_own_results_logs_sessions_and_gc(fake_env,tmp_path):
     _wait_done(gw,ALICE,one['task_id'])
     first=gw.call(ALICE,'case_results',{'task_id':one['task_id']})
     verdicts.write_text(json.dumps({cid:'ERROR'}))
-    two=gw.call(ALICE,'case_submit',{**values,'request_id':'intent:2'})
+    two=gw.call(ALICE,'case_submit',{**values,'request_id':'intent:2','dispatch_sequence':values['dispatch_sequence']+1})
     assert two['ok'],two
     _wait_done(gw,ALICE,two['task_id'])
     assert two['deliver_epoch']-one['deliver_epoch']<60
@@ -265,8 +269,8 @@ def test_deliveries_own_results_logs_sessions_and_gc(fake_env,tmp_path):
     with gw.state._conn() as conn: conn.execute('UPDATE tasks SET created_at=?',(old,))
     protected=prune.run(gw.cfg,30,apply=False)
     assert not protected['tasks'] and not protected['staging']
-    # Expired records can now be removed, together with their owned trees.
-    with gw.state._request_conn() as conn: conn.execute('UPDATE requests SET not_after=?,received_at=?',(old,old))
+    # Only explicit sequence collection releases their owned trees to artifact pruning.
+    assert gw.state.gc_requests(values['dispatch_sequence']+1, ALICE.subject, values['sequence_scope']) == 2
     plan=prune.run(gw.cfg,30,apply=False)
     assert len(plan['staging'])==2 and len(plan['tasks'])==2
     prune.run(gw.cfg,30,apply=True)
@@ -287,7 +291,7 @@ def test_duplicate_runs_runner_once_even_after_lease_expires(fake_env,tmp_path,m
     assert first['ok'],first
     _wait_done(gw,ALICE,first['task_id'])
     gw.state.expire_now_for_tests()
-    assert gw.call(ALICE,'case_submit',{**values,'token':-1})==first
+    assert gw.call(ALICE,'case_submit',{**values,'token':-1})['replayed']
     assert calls==[1]
     row=gw.call(ALICE,'case_request',{'request_id':values['request_id']})
     assert row['state']=='started' and row['reached_device'] and row['task_id']==first['task_id']
@@ -305,7 +309,7 @@ def test_lost_launch_return_is_not_a_refusal(fake_env,tmp_path,monkeypatch):
     reply=gw.call(ALICE,'case_submit',values)
     assert reply['ok'] and reply['task_id']
     _wait_done(gw,ALICE,reply['task_id'])
-    assert gw.call(ALICE,'case_submit',values)==reply
+    assert gw.call(ALICE,'case_submit',values)['replayed']
 
 
 def test_active_starting_is_not_reconciled_to_not_started(fake_env,tmp_path,monkeypatch):

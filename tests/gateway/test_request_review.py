@@ -55,7 +55,7 @@ def test_request_clock_floor_survives_rollback_and_restart(fake_env, monkeypatch
     launches = []
     monkeypatch.setitem(restarted.handlers, 'case_submit', lambda *_: launches.append(1) or {})
     out = restarted.call(ALICE, 'case_submit', args(request_id='clock-intent', not_after=datetime.fromtimestamp(deadline, timezone.utc).isoformat()))
-    assert not out['ok'] and out['stage'] == 'admission' and not launches
+    assert out['ok'] and out['not_after_ignored'] and launches == [1]
     snapshot = restarted.state.request_snapshot('clock-intent', ALICE.subject)
     assert snapshot[1] >= first['gateway_time']
     assert snapshot[0]['received_at'] >= first['gateway_time']
@@ -63,14 +63,14 @@ def test_request_clock_floor_survives_rollback_and_restart(fake_env, monkeypatch
 
 def test_collected_request_cannot_be_recreated_as_a_new_rejection(fake_env):
     gw = fake_env['gateway']
-    row, _ = gw.state.reserve_request('collected', ALICE.subject, 'synthetic', float(int(time.time()) - 1))
+    row, _ = gw.state.reserve_request('collected', ALICE.subject, 'synthetic', float(int(time.time()) - 1),dispatch_sequence=1,sequence_scope='synthetic-executor')
     gw.state.update_request('collected', state='started', reached_device=1)
-    assert gw.state.gc_requests(time.time() + 1) == 1
+    assert gw.state.gc_requests(1,ALICE.subject,'synthetic-executor') == 1
     reply = gw.call(ALICE, 'case_submit', args(request_id='collected', not_after=datetime.fromtimestamp(row['not_after'], timezone.utc).isoformat()))
-    assert not reply['ok'] and reply['stage'] == 'admission'
+    assert not reply['ok'] and reply['stage'] == 'collected' and reply['reached_device'] is None
     assert reply['request_record'] == 'collected'
     observed = gw.call(ALICE, 'case_request', {'request_id': 'collected'})
-    assert not observed['found'] and observed['gc_before'] >= row['not_after']
+    assert not observed['found'] and gw.state.sequence_floor(ALICE.subject,'synthetic-executor') == 1
 
 
 def test_busy_request_stripe_still_reports_positive_runner_marker(fake_env, tmp_path, monkeypatch):
@@ -140,7 +140,7 @@ def test_constructing_a_checker_does_not_flush_or_break_service_audit(fake_env):
     assert any(r.get('request_id') == 'audit-intent' for r in records)
 
 
-@pytest.mark.parametrize('values', [args(not_after='2001-01-01T00:00:00Z'), args(xlsx_b64='!')])
+@pytest.mark.parametrize('values', [args(module='../invalid'), args(xlsx_b64='!')])
 def test_admission_rejection_is_atomic_with_request_reservation(fake_env, monkeypatch, values):
     gw = fake_env['gateway']; reserve = gw.state.reserve_request
     class Crash(BaseException): pass
@@ -153,7 +153,7 @@ def test_admission_rejection_is_atomic_with_request_reservation(fake_env, monkey
     query = restarted.call(ALICE, 'case_request', {'request_id': values['request_id']})
     duplicate = restarted.call(ALICE, 'case_submit', values)
     assert query['state'] == 'rejected' and query['stage'] == 'admission'
-    assert duplicate['stage'] == query['stage'] and duplicate['reached_device'] is False
+    assert duplicate['stage'] == 'duplicate' and duplicate['replayed'] and duplicate['reached_device'] is False
 
 
 def test_interruption_retains_phase_and_query_agrees_with_duplicate(fake_env, tmp_path, monkeypatch):
@@ -167,10 +167,11 @@ def test_interruption_retains_phase_and_query_agrees_with_duplicate(fake_env, tm
     restarted = Gateway(gw.cfg)
     query = restarted.call(ALICE, 'case_request', {'request_id': values['request_id']})
     duplicate = restarted.call(ALICE, 'case_submit', values)
-    assert query['state'] == duplicate['state'] == 'not_started'
-    assert query['stage'] == duplicate['stage'] == 'interrupted'
-    assert duplicate['interrupted_stage'] == 'precheck'
-    assert duplicate['ok'] and duplicate['reached_device'] is False
+    assert query['state'] == 'not_started'
+    assert duplicate['replayed'] and not duplicate['ok']
+    assert query['stage'] == 'interrupted'
+    assert gw.state.request_snapshot(values['request_id'],ALICE.subject)[0]['stage'] == 'interrupted'
+    assert duplicate['reached_device'] is False
 
 
 def test_duplicate_request_binds_the_resolved_module(fake_env, monkeypatch):
@@ -181,7 +182,7 @@ def test_duplicate_request_binds_the_resolved_module(fake_env, monkeypatch):
     changed = gw.call(ALICE, 'case_submit', {**values, 'module': 'synthetic_beta'})
     assert not changed['ok'] and changed['stage'] == 'admission' and changed['reached_device'] is False
     assert 'conflicts' in changed['error'] and calls == [1]
-    assert gw.call(ALICE, 'case_submit', values) == first
+    assert gw.call(ALICE, 'case_submit', values)['replayed']
     assert gw.state.request_snapshot(values['request_id'], ALICE.subject)[0]['module'] == 'synthetic_alpha'
 
 
@@ -303,10 +304,10 @@ def test_tool_advertisements_explain_the_request_protocol_and_ownership():
     from gateway.tools import TOOL_SPECS
     specs = {spec['name']: spec for spec in TOOL_SPECS}
     submit = specs['case_submit']
-    for word in ['request_id', 'not_after', 'UTC', 'request_record', 'stage', 'reached_device', 'module', 'journal_id']:
+    for word in ['request_id', 'not_after', 'dispatch_sequence', 'sequence_scope', 'request_record', 'stage', 'reached_device', 'module', 'journal_id']:
         assert word in submit['description']
     deadline = submit['input_schema']['properties']['not_after']
-    assert deadline['format'] == 'date-time' and 'UTC' in deadline['description']
+    assert 'format' not in deadline and 'ignored' in deadline['description']
     for word in ['found', 'gateway_time', 'gc_before', 'journal_id', 'journal_since', 'subject']:
         assert word in specs['case_request']['description']
     results = specs['case_results']['description']
@@ -314,7 +315,7 @@ def test_tool_advertisements_explain_the_request_protocol_and_ownership():
     assert 'marked stale' not in results
 
 
-def test_gc_dry_run_counts_requests_and_respects_future_deadlines(fake_env, monkeypatch):
+def test_time_based_gc_preserves_every_request_regardless_of_deadline(fake_env, monkeypatch):
     from gateway import prune, state
     gw = fake_env['gateway']; now = time.time(); expired = float(int(now) + 10) + 0.75
     for rid, deadline in [('expired-count', expired), ('future-count', now + 86400)]:
@@ -325,20 +326,20 @@ def test_gc_dry_run_counts_requests_and_respects_future_deadlines(fake_env, monk
     gw.state.update_request('cutoff-boundary', state='started', received_at=int(expired + 1 - 30 * 86400) + 0.5)
     monkeypatch.setattr(state.time, 'time', lambda: expired + 1)
     dry = prune.report(prune.run(gw.cfg, 30, apply=False), False)
-    assert dry['requests_deleted'] == 1
+    assert dry['requests_deleted'] == 0
     assert gw.state.request_snapshot('expired-count', ALICE.subject)[0] is not None
     applied = prune.report(prune.run(gw.cfg, 30, apply=True), True)
     assert applied['requests_deleted'] == dry['requests_deleted']
-    assert gw.state.request_snapshot('expired-count', ALICE.subject)[0] is None
+    assert gw.state.request_snapshot('expired-count', ALICE.subject)[0] is not None
     assert gw.state.request_snapshot('future-count', ALICE.subject)[0]['state'] == 'started'
-    assert gw.state.request_snapshot('expired-count', ALICE.subject)[2] == expired
+    assert gw.state.sequence_floor(ALICE.subject,'synthetic-executor') == 0
 
 
 def test_default_fake_result_store_overwrites_a_case_row(fake_env, tmp_path):
     from test_gateway import _wait_done
     gw = fake_env['gateway']; values = submission(fake_env, tmp_path)
-    for rid in ['retention-one', 'retention-two']:
-        result = gw.call(ALICE, 'case_submit', {**values, 'request_id': rid})
+    for index,rid in enumerate(['retention-one', 'retention-two']):
+        result = gw.call(ALICE, 'case_submit', {**values, 'request_id': rid,'dispatch_sequence':values['dispatch_sequence']+index})
         assert result['ok'], result
         _wait_done(gw, ALICE, result['task_id'])
     rows = json.loads((fake_env['apv'] / 'fake_results.json').read_text())

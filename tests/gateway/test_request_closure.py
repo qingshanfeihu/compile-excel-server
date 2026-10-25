@@ -1,4 +1,6 @@
 """Convergence regressions over the fake framework and synthetic state only."""
+import base64
+import hashlib
 import json
 import shutil
 import time
@@ -11,11 +13,13 @@ from gateway.tools import Gateway
 from test_request_ids import ALICE, args, submission
 
 
-def proof_of_absence(answer, original, frozen):
-    deadline = datetime.fromisoformat(original['not_after'].replace('Z', '+00:00')).timestamp()
-    return (answer['ok'] and not answer['found'] and answer['journal_id'] == frozen['journal_id']
-            and answer['subject'] == frozen['subject']
-            and answer['gateway_time'] > deadline > answer['gc_before'] >= answer['journal_since'])
+def proof_of_nonexecution(answer, original, frozen):
+    # Only an explicit bound no-start record can prove nonexecution; timestamps never can.
+    return (answer.get('ok') is True and answer.get('found') is True
+            and answer.get('state') == 'not_started' and answer.get('reached_device') is False
+            and answer.get('journal_id') == frozen.get('journal_id') and answer.get('subject') == frozen.get('subject')
+            and answer.get('request_id') == original['request_id']
+            and answer.get('xlsx_sha256') == hashlib.sha256(base64.b64decode(original['xlsx_b64'])).hexdigest())
 
 
 def test_restoring_old_state_db_cannot_hide_a_started_request(fake_env, tmp_path, monkeypatch):
@@ -37,10 +41,10 @@ def test_restoring_old_state_db_cannot_hide_a_started_request(fake_env, tmp_path
     monkeypatch.setattr(state.time, 'time', lambda: deadline + 1)
     restored = Gateway(gw.cfg)
     query = restored.call(ALICE, 'case_request', {'request_id': values['request_id']})
-    assert not proof_of_absence(query, values, frozen), query
+    assert not proof_of_nonexecution(query, values, frozen), query
     assert query['found'] and query['state'] == 'started' and query['reached_device'] is True
     assert query['task_id'] == receipt['task_id']
-    assert restored.call(ALICE, 'case_submit', values) == receipt
+    assert restored.call(ALICE, 'case_submit', values)['replayed']
     assert calls == [receipt['task_id']]
 
 
@@ -63,7 +67,7 @@ def test_interrupted_launch_survives_state_restore(fake_env, tmp_path, monkeypat
     assert query['found'] and query['reached_device'] is True
     assert query['task_id'] == calls[0]
     replay = restored.call(ALICE, 'case_submit', values)
-    assert replay['ok'] and replay['task_id'] == calls[0]
+    assert not replay['ok'] and replay['replayed']
     assert restored.state.task(calls[0])['holder'] == ALICE.subject
     assert restored.state.task_request(calls[0]) == values['request_id']
     assert len(calls) == 1
@@ -158,20 +162,20 @@ def test_collected_id_cannot_launch_again_with_a_future_deadline(fake_env, tmp_p
     first = gw.call(ALICE, 'case_submit', values)
     assert first['ok'] and len(calls) == 1
     monkeypatch.setattr(state.time, 'time', lambda: start + 10)
-    assert gw.state.gc_requests(start + 11) == 1
+    assert gw.state.gc_requests(values['dispatch_sequence'],ALICE.subject,values['sequence_scope']) == 1
     if rotate_epoch:
         gw.state.reset_journal_identity('synthetic complete backup restore')
     restored = Gateway(gw.cfg)
     absent = restored.call(ALICE, 'case_request', {'request_id': values['request_id']})
     assert absent['ok'] and absent['found'] is False
-    assert absent['gc_before'] >= datetime.fromisoformat(values['not_after']).timestamp()
-    assert not proof_of_absence(absent, values, first)
+    assert restored.state.sequence_floor(ALICE.subject,values['sequence_scope']) == values['dispatch_sequence']
+    assert not proof_of_nonexecution(absent, values, first)
     future = {**values, 'not_after': datetime.fromtimestamp(start + 100, timezone.utc).isoformat()}
     refused = restored.call(ALICE, 'case_submit', future)
-    assert refused['ok'] is False and refused['stage'] == 'admission'
-    assert refused['request_record'] == 'collected' and refused['reached_device'] is False
+    assert refused['ok'] is False and refused['stage'] == 'collected'
+    assert refused['request_record'] == 'collected' and refused['reached_device'] is None
     assert len(calls) == 1
     assert restored.call(ALICE, 'case_request', {'request_id': values['request_id']})['found'] is False
     # Collection bars this ID, rather than all new dispatches with the same bytes.
-    fresh = restored.call(ALICE, 'case_submit', {**future, 'request_id': 'intent:fresh'})
+    fresh = restored.call(ALICE, 'case_submit', {**future, 'request_id': 'intent:fresh', 'dispatch_sequence': future['dispatch_sequence']+1})
     assert fresh['ok'] and fresh['task_id'] != first['task_id'] and len(calls) == 2

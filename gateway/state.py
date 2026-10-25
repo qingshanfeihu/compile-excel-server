@@ -17,6 +17,7 @@ import os
 import secrets
 import sqlite3
 import time
+import subprocess
 from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -76,6 +77,20 @@ CREATE TABLE IF NOT EXISTS init_challenges (
 BED = "bed"
 
 
+def _clock_epoch():
+    """OS boot identity makes persisted monotonic deadlines unusable after a reboot."""
+    try:
+        return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    except OSError:
+        try:
+            return subprocess.check_output(['sysctl', '-n', 'kern.bootsessionuuid'], stderr=subprocess.DEVNULL, timeout=2).decode().strip() or secrets.token_hex(32)
+        except (OSError, subprocess.SubprocessError):
+            return secrets.token_hex(32)  # Fail closed across processes on unsupported systems.
+
+
+_CLOCK_EPOCH = _clock_epoch()
+
+
 class LeaseError(RuntimeError):
     """租约不成立：没有、过期、被别人持有、token 过时。消息给模型看，用英文。"""
 
@@ -92,6 +107,7 @@ class StateStore:
         self.lock_path = self.dir / "bed.lock"
         self.db_path = self.dir / "state.db"
         self.lease_ttl_s = lease_ttl_s
+        self.clock_epoch = _CLOCK_EPOCH
         with self._conn() as conn:
             conn.executescript('BEGIN IMMEDIATE;\n' + _SCHEMA)
             conn.execute("INSERT OR IGNORE INTO request_meta(name,value) VALUES('journal_since',?)", (time.time(),))
@@ -101,9 +117,22 @@ class StateStore:
             if 'module' not in {r[1] for r in conn.execute('PRAGMA table_info(requests)')}:
                 conn.execute('ALTER TABLE requests ADD COLUMN module TEXT')
                 conn.execute('UPDATE requests SET module=(SELECT module FROM tasks WHERE tasks.task_id=requests.task_id)')
+            columns = {row[1] for row in conn.execute('PRAGMA table_info(lease)')}
+            for name, kind in [('monotonic_deadline', 'REAL'), ('clock_epoch', 'TEXT')]:
+                if name not in columns:
+                    conn.execute(f'ALTER TABLE lease ADD COLUMN {name} {kind}')
             conn.commit()
         self.request_db_path = self.dir.with_name(self.dir.name + '.request-journal') / 'requests.db'
         self._init_request_journal()
+        with self._request_conn() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            columns = {row[1] for row in conn.execute('PRAGMA table_info(requests)')}
+            for name, kind in [('dispatch_sequence', 'INTEGER'), ('sequence_scope', 'TEXT')]:
+                if name not in columns:
+                    conn.execute(f'ALTER TABLE requests ADD COLUMN {name} {kind}')
+            conn.execute('CREATE TABLE IF NOT EXISTS sequence_floors (holder TEXT NOT NULL, scope TEXT NOT NULL, floor INTEGER NOT NULL, PRIMARY KEY(holder,scope))')
+            conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS request_sequence ON requests(holder,sequence_scope,dispatch_sequence) WHERE dispatch_sequence IS NOT NULL')
+            conn.commit()
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -212,7 +241,7 @@ class StateStore:
         finally:
             os.close(fd)
 
-    def reserve_request(self, request_id, holder, sha256, not_after, admission_error=None, module=None):
+    def reserve_request(self, request_id, holder, sha256, not_after=None, admission_error=None, module=None, dispatch_sequence=None, sequence_scope=None):
         with self._request_conn() as conn:
             conn.execute('BEGIN IMMEDIATE')
             now = self._request_now(conn)
@@ -220,19 +249,20 @@ class StateStore:
             if row:
                 conn.commit()
                 return dict(row), False
-            floor = conn.execute("SELECT value FROM request_meta WHERE name='gc_before'").fetchone()
+            floor = conn.execute('SELECT floor FROM sequence_floors WHERE holder=? AND scope=?', (holder, sequence_scope)).fetchone()
             collected = conn.execute('SELECT 1 FROM request_tombstones WHERE request_id=?', (request_id,)).fetchone()
-            if collected or (floor and not_after <= floor[0]):
+            used = conn.execute('SELECT 1 FROM requests WHERE holder=? AND sequence_scope=? AND dispatch_sequence=?', (holder,sequence_scope,dispatch_sequence)).fetchone() if dispatch_sequence is not None else None
+            if collected or used or (floor and dispatch_sequence is not None and dispatch_sequence <= floor[0]):
                 conn.commit()
                 return {'collected': True}, False
-            error = admission_error or ('request expired before admission; use a new request_id and deadline' if not_after <= now else None)
+            error = admission_error
             reply = json.dumps({'ok': False, 'error': error, 'stage': 'admission', 'reached_device': False,
                                 'request_id': request_id, 'request_record': 'recorded'}) if error else None
             conn.execute('INSERT INTO requests(request_id,holder,xlsx_sha256,not_after,received_at,state,stage,reply,module) '
-                         'VALUES(?,?,?,?,?,?,?,?,?)', (request_id,holder,sha256,not_after,now,'rejected' if error else 'received','admission',reply,module))
+                         'VALUES(?,?,?,?,?,?,?,?,?)', (request_id,holder,sha256,not_after if not_after is not None else '',now,'rejected' if error else 'received','admission',reply,module))
+            conn.execute('UPDATE requests SET dispatch_sequence=?,sequence_scope=? WHERE request_id=?', (dispatch_sequence,sequence_scope,request_id))
             row = dict(conn.execute('SELECT * FROM requests WHERE request_id=?', (request_id,)).fetchone())
             self._request_event(conn,request_id)
-            row['expired'] = not_after <= now
             conn.commit()
             return row, True
 
@@ -269,35 +299,34 @@ class StateStore:
                     conn.execute('DELETE FROM request_events WHERE event_id=?',(row['event_id'],))
                 conn.commit()
 
-    @staticmethod
-    def _gc_request_rows(conn, cutoff, now):
-        return conn.execute("SELECT request_id,not_after FROM requests WHERE received_at<? "
-                            "AND not_after<? AND state IN ('rejected','started','not_started')",
-                            (cutoff,now)).fetchall()
+    def count_gc_requests(self, through_sequence=None, holder=None, sequence_scope=None):
+        if through_sequence is None or holder is None or sequence_scope is None:
+            return 0  # Time-based artifact pruning must never collect request history.
+        if type(through_sequence) is not int or not 0 <= through_sequence <= 9007199254740991:
+            raise JournalError('through_sequence must be a nonnegative safe integer')
+        with self._request_conn() as conn:
+            return conn.execute("SELECT count(*) FROM requests WHERE holder=? AND sequence_scope=? AND dispatch_sequence<=? AND state IN ('rejected','started','not_started')", (holder,sequence_scope,through_sequence)).fetchone()[0]
 
-    def count_gc_requests(self, cutoff):
+    def gc_requests(self, through_sequence=None, holder=None, sequence_scope=None):
+        if through_sequence is None or holder is None or sequence_scope is None:
+            return 0
+        if type(through_sequence) is not int or not 0 <= through_sequence <= 9007199254740991:
+            raise JournalError('through_sequence must be a nonnegative safe integer')
         with self._request_conn() as conn:
             conn.execute('BEGIN IMMEDIATE')
-            rows = self._gc_request_rows(conn, cutoff, self._request_now(conn))
+            if conn.execute("SELECT 1 FROM requests WHERE holder=? AND sequence_scope=? AND dispatch_sequence<=? AND state NOT IN ('rejected','started','not_started')", (holder,sequence_scope,through_sequence)).fetchone():
+                raise JournalError('pending request in sequence range; reconcile before collection')
+            rows = conn.execute('SELECT request_id,not_after FROM requests WHERE holder=? AND sequence_scope=? AND dispatch_sequence<=?', (holder,sequence_scope,through_sequence)).fetchall()
+            conn.execute('INSERT INTO sequence_floors VALUES(?,?,?) ON CONFLICT(holder,scope) DO UPDATE SET floor=max(floor,excluded.floor)', (holder,sequence_scope,through_sequence))
+            conn.executemany('INSERT OR IGNORE INTO request_tombstones(request_id,not_after) VALUES(?,?)', [(row['request_id'],row['not_after']) for row in rows])
+            conn.executemany('DELETE FROM requests WHERE request_id=?', [(row['request_id'],) for row in rows])
             conn.commit()
             return len(rows)
 
-    def gc_requests(self, cutoff):
+    def sequence_floor(self, holder, sequence_scope):
         with self._request_conn() as conn:
-            conn.execute('BEGIN IMMEDIATE')
-            now = self._request_now(conn)
-            rows = self._gc_request_rows(conn, cutoff, now)
-            if rows:
-                floor = max(r['not_after'] for r in rows)
-                conn.execute("INSERT INTO request_meta(name,value) VALUES('gc_before',?) "
-                             "ON CONFLICT(name) DO UPDATE SET value=max(value,excluded.value)",(floor,))
-                # Tombstones are permanent and committed atomically with collection.
-                # A caller-supplied new deadline cannot turn an old ID into a new attempt.
-                conn.executemany('INSERT INTO request_tombstones(request_id,not_after) VALUES(?,?)',
-                                 [(r['request_id'], r['not_after']) for r in rows])
-                conn.executemany('DELETE FROM requests WHERE request_id=?',[(r['request_id'],) for r in rows])
-            conn.commit()
-            return len(rows)
+            row = conn.execute('SELECT floor FROM sequence_floors WHERE holder=? AND scope=?', (holder,sequence_scope)).fetchone()
+            return int(row[0]) if row else 0
 
     def request_snapshot(self, request_id, holder):
         with self._request_conn() as conn:
@@ -345,15 +374,14 @@ class StateStore:
 
     def _current(self, conn: sqlite3.Connection) -> sqlite3.Row | None:
         row = conn.execute("SELECT * FROM lease WHERE bed=?", (BED,)).fetchone()
-        if row is None or row["released"] or row["expires_at"] < time.time():
+        if row is None or row["released"] or row["clock_epoch"] != self.clock_epoch or row["monotonic_deadline"] is None or row["monotonic_deadline"] <= time.monotonic():
             return None
         return row
 
-    @staticmethod
-    def _public(row: sqlite3.Row) -> dict[str, Any]:
+    def _public(self, row: sqlite3.Row) -> dict[str, Any]:
         return {"lease_id": row["lease_id"], "holder": row["holder"], "token": row["token"],
                 "expires_at": int(row["expires_at"]),
-                "expires_in_s": max(0, int(row["expires_at"] - time.time()))}
+                "expires_in_s": max(0, int(row["monotonic_deadline"] - time.monotonic()))}
 
     def acquire(self, holder: str) -> dict[str, Any]:
         now = time.time()
@@ -365,10 +393,10 @@ class StateStore:
                     conn.execute("COMMIT")
                     raise LeaseError(
                         f"bed is leased by {current['holder']} for another "
-                        f"{int(current['expires_at'] - now)}s")
+                        f"{int(current['monotonic_deadline'] - time.monotonic())}s")
                 if current is not None:
-                    conn.execute("UPDATE lease SET expires_at=? WHERE bed=?",
-                                 (now + self.lease_ttl_s, BED))
+                    conn.execute("UPDATE lease SET expires_at=?,monotonic_deadline=?,clock_epoch=? WHERE bed=?",
+                                 (now + self.lease_ttl_s, time.monotonic()+self.lease_ttl_s, self.clock_epoch, BED))
                     row = conn.execute("SELECT * FROM lease WHERE bed=?", (BED,)).fetchone()
                     conn.execute("COMMIT")
                     return {**self._public(row), "renewed": True}
@@ -376,10 +404,10 @@ class StateStore:
                 lease_id = "lease-" + secrets.token_hex(8)
                 conn.execute(
                     "INSERT INTO lease(bed, lease_id, holder, token, acquired_at, expires_at,"
-                    " released) VALUES (?, ?, ?, ?, ?, ?, 0) ON CONFLICT(bed) DO UPDATE SET"
+                    " released,monotonic_deadline,clock_epoch) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?) ON CONFLICT(bed) DO UPDATE SET"
                     " lease_id=excluded.lease_id, holder=excluded.holder, token=excluded.token,"
                     " acquired_at=excluded.acquired_at, expires_at=excluded.expires_at,"
-                    " released=0", (BED, lease_id, holder, token, now, now + self.lease_ttl_s))
+                    " released=0,monotonic_deadline=excluded.monotonic_deadline,clock_epoch=excluded.clock_epoch", (BED, lease_id, holder, token, now, now + self.lease_ttl_s, time.monotonic()+self.lease_ttl_s,self.clock_epoch))
                 row = conn.execute("SELECT * FROM lease WHERE bed=?", (BED,)).fetchone()
                 conn.execute("COMMIT")
             except LeaseError:
@@ -407,8 +435,8 @@ class StateStore:
     def heartbeat(self, holder: str, lease_id: str, token: Any) -> dict[str, Any]:
         self.check(holder, lease_id, token)
         with self._conn() as conn:
-            conn.execute("UPDATE lease SET expires_at=? WHERE bed=? AND lease_id=?",
-                         (time.time() + self.lease_ttl_s, BED, lease_id))
+            conn.execute("UPDATE lease SET expires_at=?,monotonic_deadline=? WHERE bed=? AND lease_id=?",
+                         (time.time() + self.lease_ttl_s, time.monotonic()+self.lease_ttl_s, BED, lease_id))
             row = conn.execute("SELECT * FROM lease WHERE bed=?", (BED,)).fetchone()
         return self._public(row)
 
@@ -427,7 +455,7 @@ class StateStore:
 
     def expire_now_for_tests(self) -> None:
         with self._conn() as conn:
-            conn.execute("UPDATE lease SET expires_at=0 WHERE bed=?", (BED,))
+            conn.execute("UPDATE lease SET monotonic_deadline=0 WHERE bed=?", (BED,))
 
     # ── 任务 ─────────────────────────────────────────────
     def record_task(self, **fields: Any) -> None:
@@ -448,7 +476,7 @@ class StateStore:
     def protected_request_tasks(self):
         with self._request_conn() as conn:
             return {r[0] for r in conn.execute("SELECT task_id FROM requests WHERE task_id IS NOT NULL "
-                    "AND (not_after>=? OR state IN ('received','starting'))",(time.time(),))}
+                    "",())}
 
     def task_request(self, task_id):
         with self._conn() as conn:

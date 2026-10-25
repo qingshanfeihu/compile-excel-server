@@ -138,14 +138,35 @@ def cmd_journal_reset(config: Path, reason: str) -> int:
     return 0
 
 
+def cmd_journal_gc(config: Path, holder: str, scope: str, through: int, apply: bool) -> int:
+    from gateway.state import StateStore, JournalError
+    try:
+        cfg = load(config)
+        store = StateStore(cfg.state_dir, cfg.lease_ttl_s)
+        with store.bed_lock() as idle:
+            if not idle:
+                raise JournalError('bed busy; reconcile before sequence collection')
+            count = store.gc_requests(through, holder, scope) if apply else store.count_gc_requests(through, holder, scope)
+        print(json.dumps({'ok':True,'requests':count,'through_sequence':through,'applied':apply}))
+        return 0
+    except (ConfigError, JournalError, OSError) as exc:
+        print(json.dumps({'ok':False,'error':str(exc)}))
+        return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="cexg", description="compile-excel 跳板机网关")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("serve", "check", "audit-verify", "gc", "journal-reset"):
+    for name in ("serve", "check", "audit-verify", "gc", "journal-reset", "journal-gc"):
         p = sub.add_parser(name)
         p.add_argument("--config", required=True)
         if name == "journal-reset":
             p.add_argument("--reason", required=True)
+        if name == 'journal-gc':
+            p.add_argument('--holder', required=True)
+            p.add_argument('--sequence-scope', required=True)
+            p.add_argument('--through-sequence', required=True, type=int)
+            p.add_argument('--apply', action='store_true')
         if name == "gc":
             p.add_argument("--days", type=float, default=30,
                            help="只清最近一次写入早于这么多天前的（默认 30）")
@@ -156,6 +177,8 @@ def main(argv: list[str] | None = None) -> int:
         print(SAMPLE.read_text(encoding="utf-8"))
         return 0
     config = Path(args.config).expanduser()
+    if args.command == 'journal-gc':
+        return cmd_journal_gc(config,args.holder,args.sequence_scope,args.through_sequence,args.apply)
     if args.command == "journal-reset":
         return cmd_journal_reset(config, args.reason)
     if args.command == "audit-verify":
