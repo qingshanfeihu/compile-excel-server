@@ -1,5 +1,9 @@
 # 更新记录
 
+## 0.4.6
+
+- `build_install` 的请求可带 `attempt`（1 到 1000）：同一份字节签发方只派发一次，同一构建装失败后再装一次就是带 attempt 的新请求；回执回显它。
+
 ## 0.4.5
 
 - `build_install` 先放镜像：配了 `[upgrade] image_source`（构建库里镜像所在目录）时，runner 在升级用例之前把镜像放到床内文件服务器（`[upgrade] stage_host`/`stage_dir`，缺省 InfoTest 的 server231 与 /var/www/html），同 InfoTest 的调度：文件已在且非空就不动，否则在跳板机上从构建库下载，经框架自己的主机登录写成临时名再换名。床内文件服务器连不上构建库、InfoTest 的镜像库又没有被测构建时，升级用例原先只会下到 0 字节。

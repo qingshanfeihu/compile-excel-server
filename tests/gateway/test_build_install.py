@@ -119,7 +119,9 @@ def test_an_inconsistent_install_request_is_refused_at_admission_without_touchin
         (_request(image="brandOS-Beta_SYN-K_1_2_0_8.click"), "installs Beta.SYN-K.1.2.0.8"),
         (_request(image="Beta_SYN-K_1_2_0_7.iso"), "image must be an image file name"),
         (_request(image="../brandOS-Beta_SYN-K_1_2_0_7.click"), "image must be an image file name"),
-        (_request(extra=True), "exactly"),
+        (_request(extra=True), "optional attempt"),
+        (_request(attempt=0), "attempt is which try"),
+        (_request(attempt="2"), "attempt is which try"),
         (base64.b64encode(b"not json").decode(), "not base64 of a UTF-8 JSON request"),
     ):
         refused = _install(gw, lease, payload)
@@ -222,3 +224,10 @@ def test_a_build_repository_without_the_image_host_in_the_conf_is_refused_before
     refused = _install(gw, _lease(gw), _request())
     assert not refused["ok"] and "no address for the image host server231" in refused["error"], refused
     assert refused["stage"] == "precheck" and refused["reached_device"] is False
+
+
+def test_an_attempt_makes_another_try_of_the_same_build_a_new_request(fake_env):
+    gw = fake_env["gateway"]
+    _upgrade_cases(fake_env["apv"])
+    submitted = _install(gw, _lease(gw), _request(attempt=2))
+    assert submitted["ok"] and submitted["attempt"] == 2, submitted

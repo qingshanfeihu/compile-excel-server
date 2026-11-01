@@ -124,7 +124,7 @@ TOOL_SPECS: list[dict[str, Any]] = [
                     "image): a device that already shows the target version is skipped; otherwise the case fetches "
                     "the image to the bed's file server if missing, updates the device, waits for its reboot and "
                     "checks show version. install_b64 is base64 of a JSON request {schema: 'bed-install@1', build, "
-                    "image}; image is the build repository's image file name (letters, digits and . _ -, ending .click "
+                    "image, attempt?}; attempt (1-1000) marks another try of the same build; image is the build repository's image file name (letters, digits and . _ -, ending .click "
                     "or .array) and must name build the way the upgrade case derives it (text after the first '-' up "
                     "to the last '.', '_' read as '.'). Request protocol, refusals and recovery are exactly "
                     "case_submit's. Successful launch returns task_id, case_ids, image and target_version; poll "
@@ -666,8 +666,13 @@ class Gateway:
             request = json.loads(data.decode("utf-8"))
         except (binascii.Error, ValueError, UnicodeDecodeError):
             raise ToolError("install_b64 is not base64 of a UTF-8 JSON request") from None
-        if not isinstance(request, dict) or request.get("schema") != INSTALL_SCHEMA or set(request) != {"schema", "build", "image"}:
-            raise ToolError(f"the install request is exactly {{schema: '{INSTALL_SCHEMA}', build, image}}")
+        if not isinstance(request, dict) or request.get("schema") != INSTALL_SCHEMA \
+                or not {"schema", "build", "image"} <= set(request) <= {"schema", "build", "image", "attempt"}:
+            raise ToolError(f"the install request is {{schema: '{INSTALL_SCHEMA}', build, image}} and an optional attempt")
+        # The issuer dispatches the same bytes once; another try of the same build is a new request with its attempt.
+        attempt = request.get("attempt")
+        if attempt is not None and (type(attempt) is not int or not 1 <= attempt <= 1000):
+            raise ToolError("attempt is which try this is: a whole number from 1 to 1000")
         build = framework.safe(request["build"], "build")
         image = str(request["image"])
         target = framework.image_version(image)
@@ -709,6 +714,7 @@ class Gateway:
         return {"task_id": task_id, "sha256": digest, "bytes": len(data), "case_ids": case_ids,
                 "deliver_epoch": round(deliver_epoch, 6), "submit_autoid": case_ids[0], "module": INSTALL_MODULE,
                 "build": build, "image": image, "target_version": target, "cases": staged["cases"],
+                **({"attempt": attempt} if attempt is not None else {}),
                 "image_staging": ({"host": stage["host"], "dir": stage["dir"], "source": stage["source"]}
                                   if stage is not None else None)}
 
