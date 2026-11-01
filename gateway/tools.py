@@ -43,6 +43,13 @@ class ToolError(RuntimeError):
     pass
 
 
+# The tools that start a runner and share the request protocol, with the argument that carries their bytes.
+SUBMIT_TOOLS = {"case_submit": "xlsx_b64", "build_install": "install_b64"}
+# The request journal's module of an install task (a workbook's is its staging module).
+INSTALL_MODULE = "install"
+INSTALL_SCHEMA = "bed-install@1"
+
+
 class RedactionUnavailable(ToolError):
     """No successful framework literal scan exists; no device text may escape."""
 
@@ -111,6 +118,24 @@ TOOL_SPECS: list[dict[str, Any]] = [
             "xlsx_b64": {"type": "string", "description": "Workbook bytes, base64."},
                               "module": {"type": "string", "description": "Staging module; defaults to the gateway's configured module."}},
                              ["lease_id", "token", "xlsx_b64"])},
+    {"name": "build_install", "scope": "jumphost:run", "read_only": False,
+     "description": "Install a build on every device of the leased bed with the framework's own upgrade cases "
+                    "(InfoTest smoke_test/system/upgrade, one case per conf device, run with test_build set to the "
+                    "image): a device that already shows the target version is skipped; otherwise the case fetches "
+                    "the image to the bed's file server if missing, updates the device, waits for its reboot and "
+                    "checks show version. install_b64 is base64 of a JSON request {schema: 'bed-install@1', build, "
+                    "image}; image is the build repository's image file name (letters, digits and . _ -, ending .click "
+                    "or .array) and must name build the way the upgrade case derives it (text after the first '-' up "
+                    "to the last '.', '_' read as '.'). Request protocol, refusals and recovery are exactly "
+                    "case_submit's. Successful launch returns task_id, case_ids, image and target_version; poll "
+                    "case_status then case_results, which report each device's upgrade case like a workbook case.",
+     "input_schema": _schema({**LEASE_PROPS,
+                              "request_id": {"type": "string", "maxLength": 128, "pattern": "^[A-Za-z0-9:._-]+$", "description": "Unique dispatch attempt; never reuse. Pair with a signed dispatch_sequence and sequence_scope."},
+                              "not_after": {"type": "string", "description": "Legacy record only; ignored for every decision."},
+                              "dispatch_sequence": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+                              "sequence_scope": {"type": "string", "minLength": 1, "maxLength": 128},
+                              "install_b64": {"type": "string", "description": "Install request bytes (JSON), base64."}},
+                             ["lease_id", "token", "install_b64"])},
     {"name":"case_request","scope":"jumphost:run","read_only":True,
      "description":"Read request_id without a lease or device operation. Every answer includes found, "
                    "gateway_time, gc_before, journal_id, journal_since and resolved subject. Before dispatch "
@@ -183,13 +208,15 @@ class Gateway:
         self._grammar_lock = threading.Lock()
         self._grammar: tuple[tuple[int, int], dict[str, Any]] | None = None
         self._literals: tuple[float, frozenset[str]] | None = None
+        # The build env_prepare saw the devices report, by lease: the runner's --build (its result table) follows it.
+        self._observed_builds: dict[str, str] = {}
         self.audit_path = cfg.state_dir / "audit.log"
         self._audit = AuditChain(self.audit_path)
         self._audit_delivery_lock = threading.Lock()
         self.handlers: dict[str, Callable[[Caller, dict[str, Any]], dict[str, Any]]] = {
             "lease_acquire": self.lease_acquire, "lease_heartbeat": self.lease_heartbeat,
             "lease_release": self.lease_release, "lease_status": self.lease_status,
-            "env_prepare": self.env_prepare, "case_submit": self.case_submit,
+            "env_prepare": self.env_prepare, "case_submit": self.case_submit, "build_install": self.build_install,
             "case_request": self.case_request, "case_status": self.case_status, "case_results": self.case_results,
             "probe_show": self.probe_show, "bed_topology": self.bed_topology,
             "init_device": self.init_device,
@@ -225,20 +252,20 @@ class Gateway:
             return {"ok": False, "error": f"your token lacks the {spec['scope']} scope", "stage":"admission", "reached_device":False}
         if not isinstance(args, dict):
             return {"ok": False, "error": "arguments must be an object", "stage":"admission", "reached_device":False}
-        if name == "case_submit" and any(field in args for field in ("request_id", "not_after", "dispatch_sequence", "sequence_scope")):
-            result = self._request_submit(caller, args)
+        if name in SUBMIT_TOOLS and any(field in args for field in ("request_id", "not_after", "dispatch_sequence", "sequence_scope")):
+            result = self._request_submit(caller, args, name)
         else:
             result = self._invoke(caller, name, args)
-        if name == 'case_submit' and 'not_after' in args:
+        if name in SUBMIT_TOOLS and 'not_after' in args:
             result = {**result,'not_after_ignored':True,'not_after':args['not_after']}
-        if name in ('case_submit', 'case_request'):
+        if name in SUBMIT_TOOLS or name == 'case_request':
             result.update(self.state.journal_identity(), subject=caller.subject)
         return result
 
-    def _admission_refusal(self, caller, args, message):
+    def _admission_refusal(self, caller, args, message, tool='case_submit'):
         reply = framework.redact({'ok':False,'error':message,'stage':'admission',
                                   'reached_device':False},self.secrets())
-        self.audit('tool_refused',tool='case_submit',subject=caller.subject,
+        self.audit('tool_refused',tool=tool,subject=caller.subject,
                    request_id=args.get('request_id'),stage='admission',reached_device=False,
                    reason=reply['error'])
         return reply
@@ -250,12 +277,12 @@ class Gateway:
             self.state.update_request(rid, stage=stage)
 
     def _invoke(self, caller, name, args):
-        self._progress.request_id = args.get('request_id') if name == 'case_submit' else None
+        self._progress.request_id = args.get('request_id') if name in SUBMIT_TOOLS else None
         self._progress.stage, self._progress.reached = "admission", False
         try:
             result = self.handlers[name](caller, args)
         except (LeaseError, ToolError, gates.GateError, framework.FrameworkError, OSError, ValueError) as exc:
-            if name == 'case_submit' and args.get('request_id'):
+            if name in SUBMIT_TOOLS and args.get('request_id'):
                 row, _, _ = self.state.request_snapshot(args['request_id'],caller.subject)
                 if row and row['task_id']:
                     paths = framework.task_paths(self.cfg,row['task_id'])
@@ -270,12 +297,12 @@ class Gateway:
                        request_id=args.get("request_id"),stage=stage,reached_device=reached,
                        reason=framework.redact(str(exc)[:500], secrets))
             return framework.redact({"ok": False, "error": str(exc), "stage":stage,"reached_device":reached,
-                                     **({'request_record':'none'} if name=='case_submit' and not args.get('request_id') else {}),
+                                     **({'request_record':'none'} if name in SUBMIT_TOOLS and not args.get('request_id') else {}),
                                      **({"problems": problems} if problems else {})}, secrets)
         finally:
             self._progress.request_id = None
         # 日志尾、每案日志、探测回显、结果库报错……回给客户端的一切都过一遍已知口令
-        return framework.redact({"ok": True, **({"request_record": "none"} if name == "case_submit" else {}),
+        return framework.redact({"ok": True, **({"request_record": "none"} if name in SUBMIT_TOOLS else {}),
                                  **result}, self.secrets())
 
     def reconcile_request(self, rid, holder):
@@ -300,10 +327,17 @@ class Gateway:
             os.close(fd)
 
     def _task_receipt(self, task):
-        return {'task_id':task['task_id'],'sha256':task['xlsx_sha256'],
-                'bytes':(Path(task['staging_dir']) / 'case.xlsx').stat().st_size,
-                'case_ids':task['case_ids'],'deliver_epoch':round(task['deliver_epoch'], 6),
-                'submit_autoid':task['autoid'],'module':task['module']}
+        install = framework.is_install_staging(self.cfg, task['staging_dir'])
+        staged = Path(task['staging_dir']) / (framework.INSTALL_REQUEST if install else 'case.xlsx')
+        receipt = {'task_id':task['task_id'],'sha256':task['xlsx_sha256'],
+                   'bytes':staged.stat().st_size,
+                   'case_ids':task['case_ids'],'deliver_epoch':round(task['deliver_epoch'], 6),
+                   'submit_autoid':task['autoid'],'module':task['module']}
+        if install:
+            request = framework.install_request(task['staging_dir'])
+            image = str(request.get('image') or '')
+            receipt.update(build=request.get('build'), image=image, target_version=framework.image_version(image))
+        return receipt
 
     def _recover_request_row(self, row):
         paths = framework.task_paths(self.cfg,row['task_id']) if row['task_id'] else None
@@ -346,7 +380,8 @@ class Gateway:
                 result['reason'] = 'gateway stopped before runner start; submit a new request_id'
         return result
 
-    def _request_submit(self, caller, args):
+    def _request_submit(self, caller, args, tool='case_submit'):
+        payload = SUBMIT_TOOLS[tool]
         try:
             rid = args.get('request_id')
             if 'request_id' not in args:
@@ -359,37 +394,40 @@ class Gateway:
                 raise ToolError('dispatch_sequence and sequence_scope are required together with request_id')
             deadline = args.get('not_after')  # Preserve old bytes; never compare an external timestamp.
         except (ToolError,ValueError,binascii.Error) as exc:
-            return self._admission_refusal(caller,args,str(exc))
+            return self._admission_refusal(caller,args,str(exc),tool)
         module_error = None
-        try:
-            module = framework.safe(args.get('module') or self.cfg.default_module, 'module')
-        except framework.FrameworkError as exc:
-            module, module_error = None, str(exc)
+        if tool == 'build_install':
+            module = INSTALL_MODULE
+        else:
+            try:
+                module = framework.safe(args.get('module') or self.cfg.default_module, 'module')
+            except framework.FrameworkError as exc:
+                module, module_error = None, str(exc)
         decode_error = None
         try:
-            raw = base64.b64decode(str(args.get('xlsx_b64') or ''),validate=True)
+            raw = base64.b64decode(str(args.get(payload) or ''),validate=True)
             digest = hashlib.sha256(raw).hexdigest()
         except (ValueError,binascii.Error):
-            digest = ''  # No workbook bytes exist; never present this as a workbook hash.
-            decode_error = 'xlsx_b64 is not valid base64; fix the encoding and use a new request_id'
+            digest = ''  # No submitted bytes exist; never present this as their hash.
+            decode_error = f'{payload} is not valid base64; fix the encoding and use a new request_id'
         with self.state.request_lock(rid):
             row, fresh = self.state.reserve_request(rid, caller.subject, digest, deadline, admission_error=decode_error or module_error, module=module, dispatch_sequence=sequence, sequence_scope=scope)
             if row.get('collected'):
-                return {**self._admission_refusal(caller, args, 'request falls within collected history; inspect the original dispatch before using a new request_id'), 'request_record': 'collected', 'stage':'collected', 'reached_device':None}
+                return {**self._admission_refusal(caller, args, 'request falls within collected history; inspect the original dispatch before using a new request_id', tool), 'request_record': 'collected', 'stage':'collected', 'reached_device':None}
             if row['holder'] != caller.subject or row['xlsx_sha256'] != digest or row['module'] != module:
                 return self._admission_refusal(caller,args,
-                    'request_id conflicts with an existing request; use a new request_id')
+                    'request_id conflicts with an existing request; use a new request_id',tool)
             if not fresh:
-                return {**self._admission_refusal(caller,args,'request_id already recorded; query case_request, never submit it again'), 'request_record':'recorded', 'replayed':True, 'request_id':rid, 'stage':'duplicate', 'reached_device':None if row['state'] in ('received','starting') else bool(row['reached_device'])}
+                return {**self._admission_refusal(caller,args,'request_id already recorded; query case_request, never submit it again',tool), 'request_record':'recorded', 'replayed':True, 'request_id':rid, 'stage':'duplicate', 'reached_device':None if row['state'] in ('received','starting') else bool(row['reached_device'])}
             self.flush_request_audit()
             if row['reply']:
                 reply = json.loads(row['reply'])
             elif decode_error:
                 reply = {'ok':False,'error':decode_error,'stage':'admission','reached_device':False}
             else:
-                reply = self._invoke(caller,'case_submit',args)
+                reply = self._invoke(caller,tool,args)
             if not reply['ok'] and reply.get('stage') == 'admission':
-                self.audit('tool_refused',tool='case_submit',subject=caller.subject,
+                self.audit('tool_refused',tool=tool,subject=caller.subject,
                            request_id=rid,stage='admission',reached_device=False,
                            reason=reply['error'])
             reply.update(request_id=rid,request_record='recorded', dispatch_sequence=sequence, sequence_scope=scope, **({'not_after_ignored':True,'not_after':deadline} if 'not_after' in args else {}))
@@ -404,6 +442,11 @@ class Gateway:
     def _lease(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
         self._set_stage("lease")
         return self.state.check(caller.subject, str(args.get("lease_id") or ""), args.get("token"))
+
+    def _runner_build(self, lease: dict[str, Any]) -> str:
+        """The build the runner is started with: what env_prepare saw the devices report under this lease, else the
+        configured build (a client that never ran env_prepare, or a gateway restarted in between)."""
+        return self._observed_builds.get(lease["lease_id"], self.cfg.build)
 
     def grammar(self) -> dict[str, Any]:
         """自毁规则等文法：跳板机本地文件（hub.grammar_file），由运维随 hub 的规则资产更新，按 mtime 重读。
@@ -476,6 +519,7 @@ class Gateway:
 
     def lease_release(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
         self.state.release(caller.subject, str(args.get("lease_id") or ""), args.get("token"))
+        self._observed_builds.pop(str(args.get("lease_id") or ""), None)
         self.audit("lease_released", subject=caller.subject, lease_id=args.get("lease_id"))
         return {"released": True}
 
@@ -489,14 +533,13 @@ class Gateway:
 
     # ── 环境自检 ──────────────────────────────────────────
     def env_prepare(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
-        # 客户端按哪个构建编的用例：与本床不符就不用往下查了（老客户端不带，照查但注明没核对）
+        # 客户端按哪个构建编的用例：与设备自述的构建不符就不 ready（老客户端不带，照查但注明没核对）。床上装的构建
+        # 以设备自述为准（build_install 之后就变了）；配置的 hub.build 只定框架登录设备用哪一段凭据。
         wanted = args.get("device_build")
         build_checked = wanted not in (None, "")
-        if build_checked and mysql_safe_build(str(wanted)) != self.cfg.build:
-            raise ToolError(f"device_build {str(wanted)!r} is not this bed's build "
-                            f"{self.cfg.build!r}; compile against {self.cfg.build!r} or use the "
-                            "gateway of the bed that runs your build")
-        self._lease(caller, args)
+        if build_checked and not mysql_safe_build(str(wanted)):
+            raise ToolError(f"device_build {str(wanted)!r} is not a build name")
+        lease = self._lease(caller, args)
         self._set_stage('precheck')
         checks: list[dict[str, Any]] = []
 
@@ -536,6 +579,7 @@ class Gateway:
         except ToolError as exc:
             add("credential_literals", False, str(exc))
         probe_spec = (grammar.get("bed_probes") or {}).get("build") or {}
+        reported = None
         if ips and probe_spec.get("cmd") and probe_spec.get("extract"):
             self._set_stage('bed_busy')
             with self.state.bed_lock() as locked:
@@ -549,13 +593,23 @@ class Gateway:
                     if match is None:
                         add("device_build", False, out.get("error") or "build not found in output")
                     else:
-                        device_build = mysql_safe_build(match.group(1).strip())
-                        add("device_build", device_build == cfg.build,
-                            f"device reports {device_build}, gateway bundle is {cfg.build}")
+                        reported = mysql_safe_build(match.group(1).strip())
+                        family = framework.credential_sections(parser, reported) == \
+                            framework.credential_sections(parser, cfg.build)
+                        asked = not build_checked or mysql_safe_build(str(wanted)) == reported
+                        add("device_build", family and asked,
+                            f"device reports {reported}"
+                            + ("" if family else f", which the framework logs into with other credentials than the "
+                               f"gateway's {cfg.build}")
+                            + ("" if asked else f", not the client's {mysql_safe_build(str(wanted))}"))
+                        if family:
+                            # The runner names its result table after the build the devices run.
+                            self._observed_builds[lease["lease_id"]] = reported
         else:
             add("device_build", False, "no bed_probes.build in the bundle grammar")
         out = {"ready": all(c["ok"] for c in checks), "checks": checks,
                "build_checked": build_checked, "device_count": len(ips),
+               **({"device_build": reported} if reported else {}),
                "stage":self._progress.stage,"reached_device":self._progress.reached}
         # conf 读不到就没有 conf 字段：空数组会冒充“读到了、零台设备”
         if conf is not None:
@@ -587,16 +641,17 @@ class Gateway:
             task_id = f"cex_{random_secrets.token_hex(16)}"
             staged = framework.stage_case(self.cfg, module, submit, frozen.data, frozen.sha256, task_id)
             deliver_epoch = time.time()
+            build = self._runner_build(lease)
             self.state.record_task(
                 task_id=task_id, lease_id=lease["lease_id"], token=lease["token"],
-                holder=caller.subject, module=module, autoid=submit, build=self.cfg.build,
+                holder=caller.subject, module=module, autoid=submit, build=build,
                 case_ids=list(frozen.autoids), xlsx_sha256=frozen.sha256,
                 staging_dir=staged["staging_dir"], deliver_epoch=deliver_epoch,
                 created_at=time.time(), request_id=args.get("request_id"))
             if args.get('request_id'):
                 self.flush_request_audit()
             self._set_stage("launch")
-            framework.launch_run(self.cfg, task_id, module, submit, self.cfg.build, fd)
+            framework.launch_run(self.cfg, task_id, module, submit, build, fd)
         finally:
             os.close(fd)
         self.audit("case_submitted", subject=caller.subject, task_id=task_id,
@@ -604,6 +659,55 @@ class Gateway:
         return {"task_id": task_id, "sha256": frozen.sha256, "bytes": frozen.size,
                 "case_ids": list(frozen.autoids), "deliver_epoch": round(deliver_epoch, 6),
                 "submit_autoid": submit, "module": module}
+
+    def build_install(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
+        try:
+            data = base64.b64decode(str(args.get("install_b64") or ""), validate=True)
+            request = json.loads(data.decode("utf-8"))
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            raise ToolError("install_b64 is not base64 of a UTF-8 JSON request") from None
+        if not isinstance(request, dict) or request.get("schema") != INSTALL_SCHEMA or set(request) != {"schema", "build", "image"}:
+            raise ToolError(f"the install request is exactly {{schema: '{INSTALL_SCHEMA}', build, image}}")
+        build = framework.safe(request["build"], "build")
+        image = str(request["image"])
+        target = framework.image_version(image)
+        if target is None:
+            raise ToolError("image must be an image file name of letters, digits and . _ - ending .click or .array, "
+                            "with a '-' before the build it carries")
+        if target != build.replace("_", "."):
+            raise ToolError(f"image {image} installs {target} (as the upgrade case reads it), not build {build}")
+        digest = hashlib.sha256(data).hexdigest()
+        lease = self._lease(caller, args)
+        self._set_stage("precheck")
+        cases = framework.upgrade_case_files(self.cfg, len(framework.device_ips(framework.read_conf(self.cfg))))
+        self._set_stage("bed_busy")
+        fd = self.state.try_bed_lock()
+        if fd is None:
+            raise ToolError("bed busy: another run or device operation is in progress")
+        try:
+            lease = self._lease(caller, args)
+            self._set_stage("staging")
+            task_id = f"cex_{random_secrets.token_hex(16)}"
+            staged = framework.stage_install(self.cfg, task_id, data, digest, cases)
+            deliver_epoch = time.time()
+            case_ids = [case for case, _ in cases]
+            runner_build = self._runner_build(lease)
+            self.state.record_task(
+                task_id=task_id, lease_id=lease["lease_id"], token=lease["token"],
+                holder=caller.subject, module=INSTALL_MODULE, autoid=case_ids[0], build=runner_build,
+                case_ids=case_ids, xlsx_sha256=digest, staging_dir=staged["staging_dir"],
+                deliver_epoch=deliver_epoch, created_at=time.time(), request_id=args.get("request_id"))
+            if args.get('request_id'):
+                self.flush_request_audit()
+            self._set_stage("launch")
+            framework.launch_install(self.cfg, task_id, cases, image, runner_build, fd)
+        finally:
+            os.close(fd)
+        self.audit("build_install_submitted", subject=caller.subject, task_id=task_id, sha256=digest,
+                   image=image, cases=len(case_ids))
+        return {"task_id": task_id, "sha256": digest, "bytes": len(data), "case_ids": case_ids,
+                "deliver_epoch": round(deliver_epoch, 6), "submit_autoid": case_ids[0], "module": INSTALL_MODULE,
+                "build": build, "image": image, "target_version": target, "cases": staged["cases"]}
 
     def _own_task(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
         task = self.state.task(str(args.get("task_id") or ""))

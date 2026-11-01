@@ -78,8 +78,8 @@ def device_names(parser: configparser.ConfigParser) -> list[str]:
     return [name.strip() for name in tail.split(",") if name.strip()]
 
 
-def device_credentials(parser: configparser.ConfigParser, build: str) -> dict[str, str]:
-    """按构建名选设备段（与 InfoTest _parse_device_conn 同一规则），取 user/passwd/hostname。"""
+def credential_sections(parser: configparser.ConfigParser, build: str) -> list[str]:
+    """The conf sections device credentials are read from for this build (InfoTest _parse_device_conn's rule)."""
     prefix = ""
     if re.search(r"array", build, re.I) or re.search(r"nodebug[-_](Beta|Rel)_APV", build, re.I):
         prefix = "array"
@@ -94,8 +94,13 @@ def device_credentials(parser: configparser.ConfigParser, build: str) -> dict[st
     else:
         suffix = "_ustack"
     section = (prefix + suffix) if prefix else ""
-    sections = [section] if (section and parser.has_section(section)) else [
+    return [section] if (section and parser.has_section(section)) else [
         s for s in parser.sections() if s not in ("comm", "other", "env")]
+
+
+def device_credentials(parser: configparser.ConfigParser, build: str) -> dict[str, str]:
+    """按构建名选设备段（与 InfoTest _parse_device_conn 同一规则），取 user/passwd/hostname。"""
+    sections = credential_sections(parser, build)
     found: dict[str, str] = {}
     for name in sections:
         user = parser.get(name, "user", fallback="")
@@ -202,6 +207,82 @@ def stage_case(cfg: GatewayConfig, module: str, autoid: str, data: bytes,
             "sha256": remote}
 
 
+# ── 装构建：InfoTest 的升级用例 ─────────────────────────────────────────────
+# InfoTest 升级就是普通用例 smoke_test/system/upgrade/99999999{0,1,2}.py，一台设备一个（conf 里第 0 台是 999999990，
+# 依次类推）：镜像名取环境变量 test_build，show version 已是目标就跳过，server231 上没有镜像先下载，再 system update、
+# 等重启、升级后 show version 核对。网关不改这些用例：把框架自己的文件逐字节复制进本任务的暂存目录再跑，报告目录
+# 因此带任务号、归属唯一；结果和工作簿那一路一样从结果库和报告目录读。
+INSTALL_DIR = "ist_install"
+INSTALL_REQUEST = "install.json"
+# The case's cleanup step removes old *.click and *.array images, so those are the image files it handles.
+_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,200}\.(?:click|array)$")
+
+
+def image_version(image: str) -> str | None:
+    """The target version InfoTest's upgrade case derives from the image name (999999990.py): the text after the first
+    '-' up to the last '.', with '_' written as '.'."""
+    if not _IMAGE_RE.match(image):
+        return None
+    match = re.search(r"-(.+)\.", image)
+    return match.group(1).replace("_", ".") if match else None
+
+
+def install_dir(cfg: GatewayConfig, task_id: str) -> Path:
+    return cfg.staging_parent / safe(task_id, "task_id") / INSTALL_DIR
+
+
+def upgrade_case_files(cfg: GatewayConfig, count: int) -> list[tuple[str, Path]]:
+    """The framework's upgrade case of each of the first `count` conf devices, as declared in the gateway config."""
+    if count < 1 or count > len(cfg.upgrade_cases):
+        raise FrameworkError(f"the conf lists {count} device(s) but the gateway config declares upgrade cases for "
+                             f"{len(cfg.upgrade_cases)}; declare upgrade.cases for every conf device")
+    root = (cfg.apv_src / "smoke_test").resolve()
+    out = []
+    for case in cfg.upgrade_cases[:count]:
+        path = cfg.apv_src / "smoke_test" / cfg.upgrade_dir / f"{safe(case, 'upgrade case')}.py"
+        if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(root):
+            raise FrameworkError(f"upgrade case {case} is not a regular file under the framework's smoke_test/{cfg.upgrade_dir}")
+        out.append((case, path))
+    return out
+
+
+def stage_install(cfg: GatewayConfig, task_id: str, data: bytes, expected_sha256: str,
+                  cases: list[tuple[str, Path]]) -> dict[str, Any]:
+    import hashlib
+
+    stg = install_dir(cfg, task_id)
+    stg.mkdir(parents=True, exist_ok=True)
+    copied = [(stg / INSTALL_REQUEST, data)] + [(stg / source.name, source.read_bytes()) for _, source in cases]
+    for target, content in copied:
+        tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+        with open(tmp, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(tmp, 0o444)
+        os.replace(tmp, target)
+    if hashlib.sha256((stg / INSTALL_REQUEST).read_bytes()).hexdigest() != expected_sha256:
+        raise FrameworkError("staged install request sha does not match the frozen upload; not running")
+    return {"staging_dir": str(stg), "bytes": len(data), "sha256": expected_sha256,
+            "cases": [{"case_id": case, "sha256": hashlib.sha256((stg / source.name).read_bytes()).hexdigest()}
+                      for case, source in cases]}
+
+
+def is_install_staging(cfg: GatewayConfig, staging: str) -> bool:
+    try:
+        relative = Path(staging).relative_to(cfg.staging_parent)
+    except ValueError:
+        return False
+    return len(relative.parts) == 2 and relative.parts[0].startswith("cex_") and relative.parts[1] == INSTALL_DIR
+
+
+def install_request(staging: str) -> dict[str, Any]:
+    try:
+        return json.loads((Path(staging) / INSTALL_REQUEST).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
 # 每个任务在 <state>/tasks/ 下的文件（cexg gc 按同一张表认领）
 TASK_FILES = (("runner", ".sh"), ("log", ".log"), ("status", ".status.json"), ("junit", ".xml"),
               ("start", ".started"), ("alive", ".alive"), ("process", ".runner.json"))
@@ -220,16 +301,32 @@ def launch_run(cfg: GatewayConfig, task_id: str, module: str, autoid: str, build
     node = stg / "test_xlsx.py"
     if not node.exists():
         node = stg
+    _launch(cfg, task_id, [node], build, bed_lock_fd)
+
+
+def launch_install(cfg: GatewayConfig, task_id: str, cases: list[tuple[str, Path]], image: str, build: str,
+                   bed_lock_fd: int) -> None:
+    """Run the staged upgrade cases with test_build naming the image, as InfoTest's scheduler runs them."""
+    if image_version(image) is None:
+        raise FrameworkError("image is not an image file name the upgrade case can derive a version from")
+    stg = install_dir(cfg, task_id)
+    _launch(cfg, task_id, [stg / source.name for _, source in cases], build, bed_lock_fd, {"test_build": image})
+
+
+def _launch(cfg: GatewayConfig, task_id: str, nodes: list[Path], build: str, bed_lock_fd: int,
+            env: dict[str, str] | None = None) -> None:
     paths = task_paths(cfg, task_id)
     q = shlex.quote
     status_tmp = str(paths["status"]) + ".tmp"
     done_json = ('{"task_id": "%s", "state": "done", "rc": %%d, "finished_at": %%d}' % task_id)
+    exports = [f"export {name}={q(value)}" for name, value in (env or {}).items()]
     script = "\n".join([
         "#!/bin/bash",
         f"printf started > {q(str(paths['start']))} || exit 98",
         f"cd {q(str(cfg.apv_src))} || exit 97",
+        *exports,
         f"timeout --kill-after=30 {int(cfg.run_max_s)} {q(str(cfg.py38))} -m pytest -s "
-        f"{q(str(node))} --build {q(build)} --junitxml {q(str(paths['junit']))} "
+        f"{' '.join(q(str(node)) for node in nodes)} --build {q(build)} --junitxml {q(str(paths['junit']))} "
         f"> {q(str(paths['log']))} 2>&1",
         "RC=$?",
         f"printf {q(done_json)} \"$RC\" \"$(date +%s)\" > {q(status_tmp)} && "
@@ -326,10 +423,13 @@ def delivery_report_lookup(cfg: GatewayConfig, staging: str) -> dict[str, Any]:
         relative = Path(staging).relative_to(cfg.staging_parent)
     except ValueError:
         return {'base': None, 'reason': 'outside_staging_root'}
-    if len(relative.parts) != 3 or not relative.parts[0].startswith('cex_'):
+    if is_install_staging(cfg, staging):
+        # The framework mirrors <task_id>/ist_install under report/<session>/<module>/, one directory per case.
+        bases = sorted(path for path in (cfg.apv_src / 'report').glob('*/*/' + relative.as_posix()) if path.is_dir())
+    elif len(relative.parts) != 3 or not relative.parts[0].startswith('cex_'):
         return {'base': None, 'reason': 'legacy_layout'}
-    pattern = '*/*/' + relative.as_posix() + '/test_xlsx/case.xlsx'
-    bases = sorted((cfg.apv_src / 'report').glob(pattern))
+    else:
+        bases = sorted((cfg.apv_src / 'report').glob('*/*/' + relative.as_posix() + '/test_xlsx/case.xlsx'))
     if not bases:
         return {'base': None, 'reason': 'no_report'}
     if len(bases) != 1:

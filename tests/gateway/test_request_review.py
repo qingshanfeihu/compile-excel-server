@@ -106,7 +106,7 @@ def test_device_tool_busy_refusals_have_busy_stage(fake_env, tool):
     assert not out['ok'] and out['stage'] == 'bed_busy' and out['reached_device'] is False
 
 @pytest.mark.parametrize('tool,values', [
-    ('env_prepare', {'device_build': 'OTHER_SYNTHETIC_BUILD'}),
+    ('env_prepare', {'device_build': '!!!'}),
     ('case_submit', {'module': '../invalid', 'xlsx_b64': 'eA=='}),
     ('init_device', {'step': 'prepare', 'device_count': 0}),
     ('init_device', {'step': 'confirm', 'confirmation': ''}),

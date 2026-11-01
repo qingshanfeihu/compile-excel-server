@@ -61,6 +61,10 @@ class GatewayConfig:
     login_timeout_s: int = 10
     # 本床常驻服务（运维维护的清单，bed_topology 原样带给客户端）：{host, ip, proto, port, note}
     bed_services: tuple[dict[str, Any], ...] = ()
+    # 装构建（build_install）：框架升级用例所在目录（smoke_test 下）和 conf 里第 i 台设备的升级用例；缺省是 InfoTest 的
+    # smoke_test/system/upgrade/99999999{0,1,2}.py
+    upgrade_dir: str = "system/upgrade"
+    upgrade_cases: tuple[str, ...] = ("999999990", "999999991", "999999992")
 
     @property
     def conf_path(self) -> Path:
@@ -140,6 +144,13 @@ def load(path: Path) -> GatewayConfig:
     device = raw.get("device") or {}
     init = raw.get("init_device") or {}
     bed = raw.get("bed") or {}
+    upgrade = raw.get("upgrade") or {}
+    upgrade_dir = str(upgrade.get("dir") or "system/upgrade")
+    if not all(_SAFE.match(part) and part != ".." for part in upgrade_dir.split("/")):
+        raise ConfigError(f"upgrade.dir 只能是 smoke_test 下由字母数字与 . _ - 组成的相对路径：{upgrade_dir!r}")
+    upgrade_cases = upgrade.get("cases") or ["999999990", "999999991", "999999992"]
+    if not isinstance(upgrade_cases, list) or not upgrade_cases:
+        raise ConfigError("upgrade.cases 必须是非空的用例编号列表（第 i 个是 conf 里第 i 台设备的升级用例）")
 
     conf_name = str(fw.get("conf_name") or "")
     if not conf_name:
@@ -194,6 +205,8 @@ def load(path: Path) -> GatewayConfig:
         init_step_timeout_s=int(init.get("step_timeout_s") or 5),
         login_timeout_s=int(init.get("login_timeout_s") or 10),
         bed_services=_services(bed.get("services")),
+        upgrade_dir=upgrade_dir,
+        upgrade_cases=tuple(_safe(case, "upgrade.cases") for case in upgrade_cases),
     )
     if not cfg.is_loopback and not cfg.tls_cert and not cfg.insecure_lan:
         raise ConfigError("监听非回环地址必须配 TLS（listen.tls_cert/tls_key），"

@@ -3,8 +3,8 @@
 清理范围（别的一概不碰）：
 - 任务：<state>/tasks/<task_id>.*（runner 脚本、日志、状态、junit、存活锁、进程记录）
   与 state.db 里那一行，只清最近一次写入在 N 天前、且 runner 不再拿着存活锁的；
-- 落位目录：<staging_parent>/ist_staging_*/<autoid>/，最近一次写入在 N 天前的；
-- 框架报告里网关落位跑出来的那一截：<apv_src>/report/<run>/<模块>/ist_staging_*/，
+- 落位目录：<staging_parent>/ist_staging_*/<autoid>/ 与装构建的 <staging_parent>/cex_*/ist_install/，最近一次写入在 N 天前的；
+- 框架报告里网关落位跑出来的那一截：<apv_src>/report/<run>/<模块>/ist_staging_*/（装构建是 …/cex_*/ist_install/），
   最近一次写入在 N 天前的；删完 report/<run>/<模块> 与 report/<run> 若空了一并删；
   不在 ist_staging_* 下的报告不碰。
 N 天必须长过一轮上机的最长时长（run_max_s）再加一小时：进行中的任务不可能留下那么旧的文件。
@@ -93,7 +93,9 @@ def collect(cfg: GatewayConfig, days: float, now: float | None = None) -> dict[s
     trees: dict[str, list[Path]] = {"staging": [], "reports": []}
     for key, root, pattern in (("staging", cfg.staging_parent, "ist_staging_*/*"),
                                ("delivery_staging", cfg.staging_parent, "cex_*/ist_staging_*/*"),
+                               ("install_staging", cfg.staging_parent, f"cex_*/{framework.INSTALL_DIR}"),
                                ("delivery_reports", cfg.apv_src / "report", "*/*/cex_*/ist_staging_*"),
+                               ("install_reports", cfg.apv_src / "report", f"*/*/cex_*/{framework.INSTALL_DIR}"),
                                ("reports", cfg.apv_src / "report", "*/*/ist_staging_*")):
         for path in sorted(root.glob(pattern)) if root.is_dir() else []:
             if any(part in protected for part in path.parts):

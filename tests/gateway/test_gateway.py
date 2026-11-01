@@ -243,11 +243,21 @@ def test_env_prepare_reports_each_check(fake_env, monkeypatch):
         "output": f"Software Version : {BUILD}\n"})
     out = gw.call(ALICE, "env_prepare", lease)
     assert out["ok"] and out["ready"] is True, out
+    assert out["device_build"] == BUILD
+    # The bed runs what its devices report (build_install changes it): another build the framework logs into with the
+    # same conf credentials is ready, and the runner of this lease is named after it.
     monkeypatch.setattr(framework, "probe", lambda cfg, cmd, build, idx: {
         "output": "Software Version : OTHER_BUILD_9\n"})
     out = gw.call(ALICE, "env_prepare", lease)
+    assert out["ready"] is True and out["device_build"] == "OTHER_BUILD_9", out
+    assert gw._runner_build(lease) == "OTHER_BUILD_9"
+    # A build whose credentials sit in another conf section than the configured build's is not ready.
+    monkeypatch.setattr(framework, "credential_sections",
+                        lambda parser, build: ["other_family"] if build == "OTHER_BUILD_9" else ["array_ustack"])
+    out = gw.call(ALICE, "env_prepare", lease)
     assert out["ready"] is False
-    assert next(c for c in out["checks"] if c["check"] == "device_build")["ok"] is False
+    check = next(c for c in out["checks"] if c["check"] == "device_build")
+    assert check["ok"] is False and "other credentials" in check["detail"] and BUILD in check["detail"]
 
 
 def _row(cid: str, result: str, run: str, *, bed: str = "jumphost", sub: str = "ist_staging_sdns") -> dict:
