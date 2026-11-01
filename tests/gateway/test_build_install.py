@@ -170,3 +170,55 @@ def test_gc_claims_old_install_staging_and_reports(fake_env):
     protected = submitted["task_id"] in gw.state.protected_request_tasks()
     assert (staged in plan["staging"]) is not protected and (reports[0] in plan["reports"]) is not protected
     assert os.path.isdir(staged)
+
+
+def _with_upgrade(fake_env, upgrade: str, env_section: str | None):
+    """Rewrite the gateway config with an [upgrade] table and the conf with an [env] section, and load a new gateway."""
+    from gateway.config import load
+    from gateway.tools import Gateway
+
+    conf = fake_env["apv"] / "conf" / "bed.conf"
+    if env_section is not None:
+        conf.write_text(conf.read_text(encoding="utf-8") + env_section, encoding="utf-8")
+    config = fake_env["config"]
+    config.write_text(config.read_text(encoding="utf-8") + upgrade, encoding="utf-8")
+    return Gateway(load(config))
+
+
+def test_with_a_build_repository_the_runner_stages_the_image_before_the_upgrade_cases(fake_env):
+    gw = _with_upgrade(fake_env, '[upgrade]\nimage_source = "http://192.0.2.50/builds/"\n',
+                       "[env]\nserver231 = 127.0.0.1, files\n")
+    _upgrade_cases(fake_env["apv"])
+    submitted = _install(gw, _lease(gw), _request())
+    assert submitted["ok"], submitted
+    assert submitted["image_staging"] == {"host": "server231", "dir": "/var/www/html", "source": "http://192.0.2.50/builds/"}
+    paths = framework.task_paths(gw.cfg, submitted["task_id"])
+    stage = json.loads(paths["stage"].read_text(encoding="utf-8"))
+    assert {k: stage[k] for k in ("op", "host", "ip", "dir", "image", "source")} == {
+        "op": "stage_image", "host": "server231", "ip": "127.0.0.1", "dir": "/var/www/html", "image": IMAGE,
+        "source": "http://192.0.2.50/builds/"}
+    runner = paths["runner"].read_text(encoding="utf-8").splitlines()
+    staging = next(i for i, line in enumerate(runner) if "jumphost_agent.py" in line)
+    pytest_line = next(i for i, line in enumerate(runner) if "-m pytest" in line)
+    assert staging < pytest_line and runner[staging].endswith("|| true")
+    # Staging cannot reach this synthetic host; the cases still run and report as usual.
+    _wait_done(gw, ALICE, submitted["task_id"])
+    results = gw.call(ALICE, "case_results", {"task_id": submitted["task_id"]})
+    assert results["complete"] and [case["result"] for case in results["cases"]] == ["PASS", "PASS"], results
+    assert '"error"' in paths["log"].read_text(encoding="utf-8").splitlines()[0]
+
+
+def test_without_a_build_repository_the_runner_does_not_stage(fake_env):
+    gw = fake_env["gateway"]
+    _upgrade_cases(fake_env["apv"])
+    submitted = _install(gw, _lease(gw), _request())
+    assert submitted["ok"] and submitted["image_staging"] is None, submitted
+    assert "jumphost_agent.py" not in framework.task_paths(gw.cfg, submitted["task_id"])["runner"].read_text(encoding="utf-8")
+
+
+def test_a_build_repository_without_the_image_host_in_the_conf_is_refused_before_the_bed(fake_env):
+    gw = _with_upgrade(fake_env, '[upgrade]\nimage_source = "http://192.0.2.50/builds/"\n', None)
+    _upgrade_cases(fake_env["apv"])
+    refused = _install(gw, _lease(gw), _request())
+    assert not refused["ok"] and "no address for the image host server231" in refused["error"], refused
+    assert refused["stage"] == "precheck" and refused["reached_device"] is False

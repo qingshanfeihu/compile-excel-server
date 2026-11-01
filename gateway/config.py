@@ -65,6 +65,11 @@ class GatewayConfig:
     # smoke_test/system/upgrade/99999999{0,1,2}.py
     upgrade_dir: str = "system/upgrade"
     upgrade_cases: tuple[str, ...] = ("999999990", "999999991", "999999992")
+    # 升级用例从床内文件服务器（conf [env] 的 stage_host，目录 stage_dir）取镜像，没有才去 InfoTest 的镜像库下载；
+    # 配了构建库 image_source（镜像所在目录的 http 地址）时，runner 先像 InfoTest 的调度那样把镜像放到那里
+    upgrade_image_source: str = ""
+    upgrade_stage_host: str = "server231"
+    upgrade_stage_dir: str = "/var/www/html"
 
     @property
     def conf_path(self) -> Path:
@@ -151,6 +156,12 @@ def load(path: Path) -> GatewayConfig:
     upgrade_cases = upgrade.get("cases") or ["999999990", "999999991", "999999992"]
     if not isinstance(upgrade_cases, list) or not upgrade_cases:
         raise ConfigError("upgrade.cases 必须是非空的用例编号列表（第 i 个是 conf 里第 i 台设备的升级用例）")
+    image_source = str(upgrade.get("image_source") or "")
+    if image_source and not re.match(r"^https?://[A-Za-z0-9.:-]+(/[A-Za-z0-9._~%/-]*)?$", image_source):
+        raise ConfigError(f"upgrade.image_source 只能是构建库里镜像所在目录的 http(s) 地址：{image_source!r}")
+    stage_dir = str(upgrade.get("stage_dir") or "/var/www/html")
+    if not re.match(r"^/[A-Za-z0-9._/-]*$", stage_dir) or ".." in stage_dir:
+        raise ConfigError(f"upgrade.stage_dir 必须是绝对路径：{stage_dir!r}")
 
     conf_name = str(fw.get("conf_name") or "")
     if not conf_name:
@@ -207,6 +218,9 @@ def load(path: Path) -> GatewayConfig:
         bed_services=_services(bed.get("services")),
         upgrade_dir=upgrade_dir,
         upgrade_cases=tuple(_safe(case, "upgrade.cases") for case in upgrade_cases),
+        upgrade_image_source=image_source,
+        upgrade_stage_host=_safe(upgrade.get("stage_host") or "server231", "upgrade.stage_host"),
+        upgrade_stage_dir=stage_dir,
     )
     if not cfg.is_loopback and not cfg.tls_cert and not cfg.insecure_lan:
         raise ConfigError("监听非回环地址必须配 TLS（listen.tls_cert/tls_key），"

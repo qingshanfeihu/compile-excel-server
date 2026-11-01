@@ -285,7 +285,7 @@ def install_request(staging: str) -> dict[str, Any]:
 
 # 每个任务在 <state>/tasks/ 下的文件（cexg gc 按同一张表认领）
 TASK_FILES = (("runner", ".sh"), ("log", ".log"), ("status", ".status.json"), ("junit", ".xml"),
-              ("start", ".started"), ("alive", ".alive"), ("process", ".runner.json"))
+              ("start", ".started"), ("alive", ".alive"), ("process", ".runner.json"), ("stage", ".stage.json"))
 
 
 def task_paths(cfg: GatewayConfig, task_id: str) -> dict[str, Path]:
@@ -304,17 +304,39 @@ def launch_run(cfg: GatewayConfig, task_id: str, module: str, autoid: str, build
     _launch(cfg, task_id, [node], build, bed_lock_fd)
 
 
+def stage_request(cfg: GatewayConfig, image: str) -> dict[str, Any] | None:
+    """The agent request that puts the image on the bed's file server before the upgrade cases look for it, or None when
+    the gateway declares no build repository (the cases then download from InfoTest's own image mirror only)."""
+    if not cfg.upgrade_image_source:
+        return None
+    ip = read_conf(cfg).get("env", cfg.upgrade_stage_host, fallback="").split(",")[0].strip()
+    if not re.match(r"^[0-9a-fA-F.:]{3,45}$", ip):
+        raise FrameworkError(f"the framework conf [env] has no address for the image host {cfg.upgrade_stage_host}")
+    return {"op": "stage_image", "apv_src": str(cfg.apv_src), "host": cfg.upgrade_stage_host, "ip": ip,
+            "dir": cfg.upgrade_stage_dir, "image": image, "source": cfg.upgrade_image_source,
+            "pins": str(cfg.state_dir / "bed_host_key_pins.json")}
+
+
 def launch_install(cfg: GatewayConfig, task_id: str, cases: list[tuple[str, Path]], image: str, build: str,
-                   bed_lock_fd: int) -> None:
-    """Run the staged upgrade cases with test_build naming the image, as InfoTest's scheduler runs them."""
+                   bed_lock_fd: int, stage: dict[str, Any] | None = None) -> None:
+    """Run the staged upgrade cases with test_build naming the image, as InfoTest's scheduler runs them; with a staging
+    request (stage_request) the image is first put on the bed's file server."""
     if image_version(image) is None:
         raise FrameworkError("image is not an image file name the upgrade case can derive a version from")
     stg = install_dir(cfg, task_id)
-    _launch(cfg, task_id, [stg / source.name for _, source in cases], build, bed_lock_fd, {"test_build": image})
+    before: list[str] = []
+    if stage is not None:
+        request = task_paths(cfg, task_id)["stage"]
+        _write_json(request, stage)
+        q = shlex.quote
+        # The agent's one-line JSON answer lands in the task log; the cases run either way and report a missing image.
+        before = [f"IST_APV_SRC={q(str(cfg.apv_src))} {q(str(cfg.py38))} {q(str(AGENT))} < {q(str(request))} "
+                  f">> {q(str(task_paths(cfg, task_id)['log']))} 2>&1 || true"]
+    _launch(cfg, task_id, [stg / source.name for _, source in cases], build, bed_lock_fd, {"test_build": image}, before)
 
 
 def _launch(cfg: GatewayConfig, task_id: str, nodes: list[Path], build: str, bed_lock_fd: int,
-            env: dict[str, str] | None = None) -> None:
+            env: dict[str, str] | None = None, before: list[str] | None = None) -> None:
     paths = task_paths(cfg, task_id)
     q = shlex.quote
     status_tmp = str(paths["status"]) + ".tmp"
@@ -325,9 +347,10 @@ def _launch(cfg: GatewayConfig, task_id: str, nodes: list[Path], build: str, bed
         f"printf started > {q(str(paths['start']))} || exit 98",
         f"cd {q(str(cfg.apv_src))} || exit 97",
         *exports,
+        *(before or []),
         f"timeout --kill-after=30 {int(cfg.run_max_s)} {q(str(cfg.py38))} -m pytest -s "
         f"{' '.join(q(str(node)) for node in nodes)} --build {q(build)} --junitxml {q(str(paths['junit']))} "
-        f"> {q(str(paths['log']))} 2>&1",
+        f">> {q(str(paths['log']))} 2>&1",
         "RC=$?",
         f"printf {q(done_json)} \"$RC\" \"$(date +%s)\" > {q(status_tmp)} && "
         f"mv -f {q(status_tmp)} {q(str(paths['status']))}",

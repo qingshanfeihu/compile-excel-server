@@ -680,6 +680,7 @@ class Gateway:
         lease = self._lease(caller, args)
         self._set_stage("precheck")
         cases = framework.upgrade_case_files(self.cfg, len(framework.device_ips(framework.read_conf(self.cfg))))
+        stage = framework.stage_request(self.cfg, image)
         self._set_stage("bed_busy")
         fd = self.state.try_bed_lock()
         if fd is None:
@@ -700,14 +701,16 @@ class Gateway:
             if args.get('request_id'):
                 self.flush_request_audit()
             self._set_stage("launch")
-            framework.launch_install(self.cfg, task_id, cases, image, runner_build, fd)
+            framework.launch_install(self.cfg, task_id, cases, image, runner_build, fd, stage)
         finally:
             os.close(fd)
         self.audit("build_install_submitted", subject=caller.subject, task_id=task_id, sha256=digest,
                    image=image, cases=len(case_ids))
         return {"task_id": task_id, "sha256": digest, "bytes": len(data), "case_ids": case_ids,
                 "deliver_epoch": round(deliver_epoch, 6), "submit_autoid": case_ids[0], "module": INSTALL_MODULE,
-                "build": build, "image": image, "target_version": target, "cases": staged["cases"]}
+                "build": build, "image": image, "target_version": target, "cases": staged["cases"],
+                "image_staging": ({"host": stage["host"], "dir": stage["dir"], "source": stage["source"]}
+                                  if stage is not None else None)}
 
     def _own_task(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
         task = self.state.task(str(args.get("task_id") or ""))

@@ -383,4 +383,4 @@ def test_legacy_report_without_delivery_id_is_not_owned(fake_env):
 def test_request_protocol_version_is_advertised():
     from ces_version import __version__
     from gateway.service import SERVER_INFO
-    assert __version__=='0.4.4' and SERVER_INFO['version']==__version__
+    assert __version__=='0.4.5' and SERVER_INFO['version']==__version__

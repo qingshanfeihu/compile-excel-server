@@ -258,7 +258,74 @@ def op_hosts(req):
     return {"hosts": out}
 
 
-OPS = {"results": op_results, "probe": op_probe, "hosts": op_hosts}
+def op_stage_image(req):
+    """build_install 的镜像落位：InfoTest 的升级用例只在床内文件服务器（stage_dir）上没有镜像时才从它的镜像库下载，
+    镜像库不一定有被测构建；这里像 InfoTest 的调度一样先把构建库里的镜像放到那里。文件已在且非空就不动（同升级用例的
+    判断）；否则在跳板机上从构建库流式下载，经框架自己的主机登录写到同目录的临时名，写完再换名，半截文件从不占正名。"""
+    import hashlib
+    import os
+    import socket
+    import urllib.request
+
+    import paramiko
+
+    image, folder, url = req["image"], req["dir"].rstrip("/"), req["source"].rstrip("/") + "/" + req["image"]
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$", image) or ".." in image:
+        return {"error": "image is not a plain file name"}
+    user, password = framework_credentials(req["apv_src"])
+    pins_path = req.get("pins") or ""
+    try:
+        with open(pins_path) as fh:
+            pins = json.load(fh)
+    except (IOError, OSError, ValueError):
+        pins = {}
+    ip = req["ip"]
+    sock = socket.create_connection((ip, 22), timeout=10)
+    transport = paramiko.Transport(sock)
+    try:
+        transport.start_client(timeout=10)
+        key = transport.get_remote_server_key()
+        fingerprint = key.get_name() + ":" + hashlib.sha256(key.asbytes()).hexdigest()
+        if pins.get(ip) and pins[ip] != fingerprint:
+            return {"error": "host_key_mismatch", "host": req.get("host")}
+        transport.auth_password(user, password)
+        sftp = paramiko.SFTPClient.from_transport(transport)
+        target, partial = folder + "/" + image, folder + "/." + image + ".part"
+        try:
+            size = sftp.stat(target).st_size
+        except IOError:
+            size = None
+        if size:
+            return {"status": "present", "path": target, "bytes": size}
+        written = 0
+        digest = hashlib.sha256()
+        with urllib.request.urlopen(url, timeout=60) as response, sftp.open(partial, "wb") as out:
+            out.set_pipelined(True)
+            while True:
+                chunk = response.read(1 << 20)
+                if not chunk:
+                    break
+                out.write(chunk)
+                digest.update(chunk)
+                written += len(chunk)
+        if written == 0:
+            sftp.remove(partial)
+            return {"status": "failed", "error": "the build repository returned an empty image", "source": url}
+        if size is not None:
+            sftp.remove(target)
+        sftp.rename(partial, target)
+        sftp.chmod(target, 0o777)
+        pins.setdefault(ip, fingerprint)
+        if pins_path:
+            with open(pins_path + ".tmp", "w") as fh:
+                json.dump(pins, fh, sort_keys=True)
+            os.replace(pins_path + ".tmp", pins_path)
+        return {"status": "fetched", "path": target, "bytes": written, "sha256": digest.hexdigest(), "source": url}
+    finally:
+        transport.close()
+
+
+OPS = {"results": op_results, "probe": op_probe, "hosts": op_hosts, "stage_image": op_stage_image}
 
 
 def main():
