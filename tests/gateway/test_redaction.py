@@ -89,3 +89,47 @@ def test_log_tails_start_on_a_whole_line_so_no_half_secret_survives(fake_env):
     (base / f"{case}.txt").write_text("first line\nlogin de" + tail, encoding="utf-8")
     logs = framework.batch_logs(cfg, "sdns", case, 0, max_chars=len(tail))
     assert logs[case]["log"] == "second line\n", "半截的首行（口令的后半截）不回给客户端"
+
+
+def test_failed_literal_refresh_keeps_last_success_and_retries(fake_env, tmp_path, monkeypatch):
+    from gateway.tools import LITERALS_TTL_S
+    from test_request_ids import submission
+    gw = fake_env['gateway']
+    values = submission(fake_env, tmp_path)
+    receipt = gw.call(ALICE, 'case_submit', values)
+    assert receipt['ok']
+    _wait_done(gw, ALICE, receipt['task_id'])
+    for log in fake_env['apv'].glob('report/**/*.txt'):
+        log.write_text(log.read_text() + f'\nuser add tester {CRED_LITERAL}\n')
+    successful = gw._literals
+    assert successful and CRED_LITERAL in successful[1]
+    gw._literals = (successful[0] - LITERALS_TTL_S - 1, successful[1])
+    broken = fake_env['apv'] / 'lib' / 'synthetic_broken.py'
+    broken.write_text('def broken(:\n')
+    answer = gw.call(ALICE, 'case_results', {'task_id': receipt['task_id']})
+    assert answer['ok'] and CRED_LITERAL not in repr(answer)
+    assert CRED_LITERAL in gw._literals[1]
+    assert gw._literals[0] == successful[0] - LITERALS_TTL_S - 1
+    broken.unlink()
+    calls = []
+    original = gw.credential_literals
+    def refreshed():
+        calls.append(1)
+        return original()
+    monkeypatch.setattr(gw, 'credential_literals', refreshed)
+    gw.call(ALICE, 'case_results', {'task_id': receipt['task_id']})
+    assert calls and gw._literals[0] > successful[0] - LITERALS_TTL_S - 1
+
+
+def test_device_text_is_withheld_until_a_successful_literal_scan(fake_env, monkeypatch):
+    gw = fake_env['gateway']; lease = _lease(gw)
+    gw._literals = None
+    broken = fake_env['apv'] / 'lib' / 'synthetic_broken.py'
+    broken.write_text('def broken(:\n')
+    monkeypatch.setattr(framework, 'probe', lambda *_: {'output': f'user add tester {CRED_LITERAL}', 'reached_device': True})
+    answer = gw.call(ALICE, 'probe_show', {**lease, 'command': 'show version'})
+    assert answer['ok'] is False and answer['stage'] == 'redaction'
+    assert answer['reached_device'] is True
+    assert CRED_LITERAL not in repr(answer) and 'output' not in answer
+    assert gw._literals is None
+    assert 'framework' in answer['next_action']

@@ -142,11 +142,12 @@ class InitResult:
     tty: str
     status: str = "error"
     failed_step: str = ""
+    reached_device: bool = False
     log: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {"device": self.device, "tty": self.tty, "status": self.status,
-                "failed_step": self.failed_step, "log": self.log}
+                "failed_step": self.failed_step, "log": self.log, "reached_device":self.reached_device}
 
 
 def _login(con: Console, hostname: str, user: str, passwd: str, timeout: float) -> bool:
@@ -158,6 +159,9 @@ def _login(con: Console, hostname: str, user: str, passwd: str, timeout: float) 
         rf"(config\)#)|(\$ )|(\# )|({host}>)", timeout)
     if not ok:
         return False
+
+    if re.search(r'(?:#|>|\$)\s*$',out):
+        con.reached_device = True
 
     def enable_if_needed(text: str) -> bool:
         if re.search(r">\s*$", text.rstrip()) or re.search(rf"{host}>", text):
@@ -182,11 +186,15 @@ def _login(con: Console, hostname: str, user: str, passwd: str, timeout: float) 
             return False
         con.send(passwd + "\n")
         ok, out = con.read_until(r"(#)|(>)", timeout)
+        if ok:
+            con.reached_device = True
         if not ok or not enable_if_needed(out):
             return False
     elif "assword:" in out:
         con.send(passwd + "\n")
         ok, out = con.read_until(r"(#)|(>)", timeout)
+        if ok:
+            con.reached_device = True
         if not ok or not enable_if_needed(out):
             return False
     elif re.search(r"\$ |\# ", out):
@@ -220,6 +228,7 @@ def init_one(idx: int, *, console_argv: list[str], tty: str, hostname: str, user
         if not _login(con, hostname, user, passwd, login_timeout):
             result.failed_step = "login"
             return result
+        result.reached_device = True
         result.log.append("login ok")
         con.send("conf ter\n")
         ok, out = con.read_until(r"#", step_timeout)
@@ -240,8 +249,17 @@ def init_one(idx: int, *, console_argv: list[str], tty: str, hostname: str, user
             result.log.append(f"ok: {command}")
         result.status = "ok"
         return result
+    except (OSError, ConsoleError) as exc:
+        result.failed_step = "device operation"
+        result.log.append(type(exc).__name__ + ": " + str(exc))
+        return result
     finally:
-        con.close()
+        result.reached_device |= getattr(con,'reached_device',False)
+        try:
+            con.close()
+        except OSError as exc:
+            result.log.append('console cleanup failed: ' + type(exc).__name__)
+
 
 
 def render_commands(template: list[str], idx: int, port_names: list[str]) -> list[str]:

@@ -546,16 +546,14 @@ def test_link_host_sets_the_address_and_adds_it_to_the_certificate(tmp_path, cfg
     assert _ces(cfg_env, "link", "--host", "bad host!").returncode == 64
 
 
-def test_gateway_url_must_not_carry_the_connection_string(tmp_path):
+def test_gateway_rejects_retired_callback_configuration(tmp_path):
     from gateway.config import ConfigError, load
 
     sample = (REPO_ROOT / "gateway" / "gateway.example.toml").read_text(encoding="utf-8")
-    secret = _text(tmp_path / "client.secret", "x\n")
-    text = (sample.replace("/home/test/.config/cexg/client.secret", str(secret))
-            .replace('url = "https://ces.example.test:8900"',
-                     f'url = "https://ces.example.test:8900#ca={"a" * 64}"'))
+    # Inject the retired section explicitly: a replace against an absent old URL silently did nothing.
+    text = sample + '\n[server]\nurl = "https://192.0.2.1:8900#ca=' + "a" * 64 + '"\n'
     (tmp_path / "gw.toml").write_text(text, encoding="utf-8")
-    with pytest.raises(ConfigError, match="ca_file"):
+    with pytest.raises(ConfigError, match=r"\[server\].*已废弃"):
         load(tmp_path / "gw.toml")
 
 

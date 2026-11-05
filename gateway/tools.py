@@ -10,6 +10,10 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import hashlib
+import fcntl
+import secrets as random_secrets
+from datetime import datetime, timezone
 import os
 import re
 import threading
@@ -37,6 +41,17 @@ _PROBE_MAX = 200
 
 class ToolError(RuntimeError):
     pass
+
+
+# The tools that start a runner and share the request protocol, with the argument that carries their bytes.
+SUBMIT_TOOLS = {"case_submit": "xlsx_b64", "build_install": "install_b64"}
+# The request journal's module of an install task (a workbook's is its staging module).
+INSTALL_MODULE = "install"
+INSTALL_SCHEMA = "bed-install@1"
+
+
+class RedactionUnavailable(ToolError):
+    """No successful framework literal scan exists; no device text may escape."""
 
 
 def mysql_safe_build(raw: str) -> str:
@@ -87,30 +102,62 @@ TOOL_SPECS: list[dict[str, Any]] = [
                                                "cases were compiled for; must equal this bed's."}},
                              ["lease_id", "token"])},
     {"name": "case_submit", "scope": "jumphost:run", "read_only": False,
-     "description": "Run a compiled case workbook on the bed. The workbook is frozen, checked "
-                    "(zip/size limits, Excel contract, destructive commands, framework credential "
-                    "literals, devices the bed does not have) and staged read-only; the staged sha "
-                    "must equal the frozen sha. Returns task_id, submit_autoid (the staging folder "
-                    "name: the workbook's first case) and module; poll case_status, then read "
-                    "case_results.",
+     "description": "Run a frozen, checked workbook on the leased bed. Pair request_id with dispatch_sequence and sequence_scope. "
+                    "The issuer checks its own deadline before sending. Legacy not_after is recorded but ignored. Same request_id "
+                    "is refused without another launch; conflicts refuse "
+                    "at admission. Recorded replies have request_record=recorded, request_id, journal_id, "
+                    "journal_since and subject; collected history has request_record=collected. Refusals "
+                    "carry stage and reached_device. Interrupted recovery may return state=not_started "
+                    "without a task_id. Successful launch returns task_id, submit_autoid and module. "
+                    "Poll case_status then case_results; never resubmit an uncertain dispatch.",
      "input_schema": _schema({**LEASE_PROPS,
-                              "xlsx_b64": {"type": "string", "description": "Workbook bytes, base64."},
+                              "request_id": {"type": "string", "maxLength": 128, "pattern": "^[A-Za-z0-9:._-]+$", "description": "Unique dispatch attempt; never reuse. Pair with a signed dispatch_sequence and sequence_scope."},
+            "not_after": {"type": "string", "description": "Legacy record only; ignored for every decision."},
+            "dispatch_sequence": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+            "sequence_scope": {"type": "string", "minLength": 1, "maxLength": 128},
+            "xlsx_b64": {"type": "string", "description": "Workbook bytes, base64."},
                               "module": {"type": "string", "description": "Staging module; defaults to the gateway's configured module."}},
                              ["lease_id", "token", "xlsx_b64"])},
+    {"name": "build_install", "scope": "jumphost:run", "read_only": False,
+     "description": "Install a build on every device of the leased bed with the framework's own upgrade cases "
+                    "(InfoTest smoke_test/system/upgrade, one case per conf device, run with test_build set to the "
+                    "image): a device that already shows the target version is skipped; otherwise the case fetches "
+                    "the image to the bed's file server if missing, updates the device, waits for its reboot and "
+                    "checks show version. install_b64 is base64 of a JSON request {schema: 'bed-install@1', build, "
+                    "image, attempt?}; attempt (1-1000) marks another try of the same build; image is the build repository's image file name (letters, digits and . _ -, ending .click "
+                    "or .array) and must name build the way the upgrade case derives it (text after the first '-' up "
+                    "to the last '.', '_' read as '.'). Request protocol, refusals and recovery are exactly "
+                    "case_submit's. Successful launch returns task_id, case_ids, image and target_version; poll "
+                    "case_status then case_results, which report each device's upgrade case like a workbook case.",
+     "input_schema": _schema({**LEASE_PROPS,
+                              "request_id": {"type": "string", "maxLength": 128, "pattern": "^[A-Za-z0-9:._-]+$", "description": "Unique dispatch attempt; never reuse. Pair with a signed dispatch_sequence and sequence_scope."},
+                              "not_after": {"type": "string", "description": "Legacy record only; ignored for every decision."},
+                              "dispatch_sequence": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+                              "sequence_scope": {"type": "string", "minLength": 1, "maxLength": 128},
+                              "install_b64": {"type": "string", "description": "Install request bytes (JSON), base64."}},
+                             ["lease_id", "token", "install_b64"])},
+    {"name":"case_request","scope":"jumphost:run","read_only":True,
+     "description":"Read request_id without a lease or device operation. Every answer includes found, "
+                   "gateway_time, gc_before, journal_id, journal_since and resolved subject. Before dispatch "
+                   "freeze journal_id and subject; not found proves non-execution only for the same journal_id "
+                   "and submit subject. Timestamps are recording only; absence never proves non-execution. "
+                   "Found answers include state/stage/reached_device; pending contact is null and must be polled. "
+                   "task_id appears only after confirmed runner start.",
+     "input_schema":_schema({"request_id":{"type":"string"},"sequence_scope":{"type":"string"}},["request_id"])},
     {"name": "case_status", "scope": "jumphost:run", "read_only": True,
      "description": "State of a submitted run (running/done/lost) with the last lines of its log. "
                     "lost means the runner died without recording an end (gateway restart, OOM, "
                     "operator kill); nothing more will come from that run.",
      "input_schema": _schema({"task_id": {"type": "string"}}, ["task_id"])},
     {"name": "case_results", "scope": "jumphost:run", "read_only": True,
-     "description": "Per-case results of a finished run from the framework result database, with "
-                    "each case's framework log. Logs older than the delivery time are marked stale "
-                    "and must not be read as this run's evidence. Every case that is not a pass "
-                    "also carries sessions: the tail of each device CLI session (apv_<ip>.txt) and "
-                    "trigger-host session of that case in this run. rc is the framework process's "
-                    "exit status; run_dir / report_dir / submit_autoid / module say where the run "
-                    "lives on the jump host. channel=runner_lost means the run died before "
-                    "finishing and has no verdicts; resubmit it.",
+     "description": "Per-case results, owned logs and sessions for this task_id only; echoes request_id. "
+                    "ownership=staging_directory means a unique delivery directory was verified, not a time "
+                    "window. ownership=none and ownership_reason disclose legacy_layout, no_report or "
+                    "ambiguous_reports; early channels disclose not_determined_runner_lost or "
+                    "not_determined_not_completed. Inspect this dispatch evidence rather than repeatedly reading. "
+                    "Missing or overwritten database rows remain missing, never borrowed from another run. "
+                    "channel identifies ready, missing_after_done, query_error, not_completed or runner_lost. "
+                    "rc is the process exit code and does not itself establish a case verdict.",
      "input_schema": _schema({"task_id": {"type": "string"}}, ["task_id"])},
     {"name": "probe_show", "scope": "jumphost:run", "read_only": True,
      "description": "Run one read-only show/get command on a device and return its output. "
@@ -157,48 +204,249 @@ class Gateway:
         self.cfg = cfg
         self.state = StateStore(cfg.state_dir, cfg.lease_ttl_s)
         self.auth = auth or StaticSecretAuth.from_config(cfg)
+        self._progress = threading.local()
         self._grammar_lock = threading.Lock()
         self._grammar: tuple[tuple[int, int], dict[str, Any]] | None = None
         self._literals: tuple[float, frozenset[str]] | None = None
+        # The build env_prepare saw the devices report, by lease: the runner's --build (its result table) follows it.
+        self._observed_builds: dict[str, str] = {}
         self.audit_path = cfg.state_dir / "audit.log"
         self._audit = AuditChain(self.audit_path)
+        self._audit_delivery_lock = threading.Lock()
         self.handlers: dict[str, Callable[[Caller, dict[str, Any]], dict[str, Any]]] = {
             "lease_acquire": self.lease_acquire, "lease_heartbeat": self.lease_heartbeat,
             "lease_release": self.lease_release, "lease_status": self.lease_status,
-            "env_prepare": self.env_prepare, "case_submit": self.case_submit,
-            "case_status": self.case_status, "case_results": self.case_results,
+            "env_prepare": self.env_prepare, "case_submit": self.case_submit, "build_install": self.build_install,
+            "case_request": self.case_request, "case_status": self.case_status, "case_results": self.case_results,
             "probe_show": self.probe_show, "bed_topology": self.bed_topology,
             "init_device": self.init_device,
         }
 
     # ── 公共 ──────────────────────────────────────────────
-    def audit(self, event: str, **fields: Any) -> None:
-        """哈希链审计（gateway/audit_chain.py）；`cexg audit-verify` 复核。"""
-        self._audit.append({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                            "event": event, **fields})
+    def audit(self, event: str, **fields: Any) -> bool:
+        """Append a hash-chain event; expose whether AuditChain actually persisted it."""
+        with self._audit_delivery_lock:
+            previous = self._audit._prev  # AuditChain advances this only after a successful write.
+            self._audit.append({'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+                                'event':event,**fields})
+            return self._audit._prev != previous
+
+    def flush_request_audit(self):
+        self.state.flush_request_events(lambda event:self.audit('request_state',**event))
 
     def call(self, caller: Caller, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return self._call(caller, name, args)
+        except RedactionUnavailable:
+            # Do not put the failed scan's source bytes or the unfiltered result in the receipt or audit.
+            self.audit('redaction_unavailable', tool=name, subject=caller.subject)
+            return {'ok': False, 'error': 'framework credential literal scan unavailable; device text withheld',
+                    'stage': 'redaction', 'reached_device': getattr(self._progress, 'reached', False),
+                    'next_action': 'Repair unreadable or invalid framework sources, then retry this read to refresh the literal set'}
+
+    def _call(self, caller: Caller, name: str, args: dict[str, Any]) -> dict[str, Any]:
         spec = next((s for s in TOOL_SPECS if s["name"] == name), None)
         if spec is None:
-            return {"ok": False, "error": f"unknown tool {name!r}"}
+            return {"ok": False, "error": f"unknown tool {name!r}", "stage":"admission", "reached_device":False}
         if spec["scope"] not in caller.scopes or "jumphost:run" not in caller.scopes:
-            return {"ok": False, "error": f"your token lacks the {spec['scope']} scope"}
+            return {"ok": False, "error": f"your token lacks the {spec['scope']} scope", "stage":"admission", "reached_device":False}
         if not isinstance(args, dict):
-            return {"ok": False, "error": "arguments must be an object"}
+            return {"ok": False, "error": "arguments must be an object", "stage":"admission", "reached_device":False}
+        if name in SUBMIT_TOOLS and any(field in args for field in ("request_id", "not_after", "dispatch_sequence", "sequence_scope")):
+            result = self._request_submit(caller, args, name)
+        else:
+            result = self._invoke(caller, name, args)
+        if name in SUBMIT_TOOLS and 'not_after' in args:
+            result = {**result,'not_after_ignored':True,'not_after':args['not_after']}
+        if name in SUBMIT_TOOLS or name == 'case_request':
+            result.update(self.state.journal_identity(), subject=caller.subject)
+        return result
+
+    def _admission_refusal(self, caller, args, message, tool='case_submit'):
+        reply = framework.redact({'ok':False,'error':message,'stage':'admission',
+                                  'reached_device':False},self.secrets())
+        self.audit('tool_refused',tool=tool,subject=caller.subject,
+                   request_id=args.get('request_id'),stage='admission',reached_device=False,
+                   reason=reply['error'])
+        return reply
+
+    def _set_stage(self, stage):
+        self._progress.stage = stage
+        rid = getattr(self._progress, 'request_id', None)
+        if rid:
+            self.state.update_request(rid, stage=stage)
+
+    def _invoke(self, caller, name, args):
+        self._progress.request_id = args.get('request_id') if name in SUBMIT_TOOLS else None
+        self._progress.stage, self._progress.reached = "admission", False
         try:
             result = self.handlers[name](caller, args)
-        except (LeaseError, ToolError, gates.GateError, framework.FrameworkError) as exc:
+        except (LeaseError, ToolError, gates.GateError, framework.FrameworkError, OSError, ValueError) as exc:
+            if name in SUBMIT_TOOLS and args.get('request_id'):
+                row, _, _ = self.state.request_snapshot(args['request_id'],caller.subject)
+                if row and row['task_id']:
+                    paths = framework.task_paths(self.cfg,row['task_id'])
+                    if paths['start'].exists() or (paths['alive'].exists() and
+                                                   not framework.runner_gone(self.cfg,row['task_id'])):
+                        return framework.redact({'ok':True,**self._task_receipt(
+                            self.state.task(row['task_id']))},self.secrets())
+            stage, reached = self._progress.stage, self._progress.reached
             secrets = self.secrets()
             problems = getattr(exc, "problems", None)
             self.audit("tool_refused", tool=name, subject=caller.subject,
+                       request_id=args.get("request_id"),stage=stage,reached_device=reached,
                        reason=framework.redact(str(exc)[:500], secrets))
-            return framework.redact({"ok": False, "error": str(exc),
+            return framework.redact({"ok": False, "error": str(exc), "stage":stage,"reached_device":reached,
+                                     **({'request_record':'none'} if name in SUBMIT_TOOLS and not args.get('request_id') else {}),
                                      **({"problems": problems} if problems else {})}, secrets)
+        finally:
+            self._progress.request_id = None
         # 日志尾、每案日志、探测回显、结果库报错……回给客户端的一切都过一遍已知口令
-        return framework.redact({"ok": True, **result}, self.secrets())
+        return framework.redact({"ok": True, **({"request_record": "none"} if name in SUBMIT_TOOLS else {}),
+                                 **result}, self.secrets())
+
+    def reconcile_request(self, rid, holder):
+        row, _, _ = self.state.request_snapshot(rid,holder)
+        if not row or row['state'] not in ('received','starting'):
+            return row
+        # Nonblocking: a live admission/launch owns this lock. Never turn its work into a refusal.
+        path = self.state.request_lock_path(rid)
+        fd = os.open(path,os.O_RDWR | os.O_CREAT,0o600)
+        try:
+            try:
+                fcntl.flock(fd,fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                if row['task_id'] and framework.task_paths(self.cfg, row['task_id'])['start'].exists():
+                    return self._recover_request_row(row)
+                return row
+            row, _, _ = self.state.request_snapshot(rid,holder)
+            if row['state'] not in ('received','starting'):
+                return row
+            return self._recover_request_row(row)
+        finally:
+            os.close(fd)
+
+    def _task_receipt(self, task):
+        install = framework.is_install_staging(self.cfg, task['staging_dir'])
+        staged = Path(task['staging_dir']) / (framework.INSTALL_REQUEST if install else 'case.xlsx')
+        receipt = {'task_id':task['task_id'],'sha256':task['xlsx_sha256'],
+                   'bytes':staged.stat().st_size,
+                   'case_ids':task['case_ids'],'deliver_epoch':round(task['deliver_epoch'], 6),
+                   'submit_autoid':task['autoid'],'module':task['module']}
+        if install:
+            request = framework.install_request(task['staging_dir'])
+            image = str(request.get('image') or '')
+            receipt.update(build=request.get('build'), image=image, target_version=framework.image_version(image))
+        return receipt
+
+    def _recover_request_row(self, row):
+        paths = framework.task_paths(self.cfg,row['task_id']) if row['task_id'] else None
+        if paths and paths['start'].exists():
+            state,reached,reason = 'started',True,None
+        elif paths and paths['alive'].exists() and not framework.runner_gone(self.cfg,row['task_id']):
+            return row
+        else:
+            state,reached,reason = 'not_started',False,'gateway stopped before runner start; submit a new request_id'
+        fields = dict(state=state,reached_device=int(reached),stage=row['stage'] if reached else 'interrupted')
+        if not row['reply']:
+            if reached:
+                reply = {'ok':True,**self._task_receipt(self.state.task(row['task_id']))}
+            else:
+                reply = {'ok':True,'state':'not_started','stage':'interrupted','interrupted_stage':row['stage'],
+                         'next_action':reason,'reached_device':False}
+            reply.update(request_id=row['request_id'],request_record='recorded')
+            fields['reply'] = json.dumps(framework.redact(reply,self.secrets()))
+        self.state.update_request(row['request_id'],**fields)
+        self.flush_request_audit()
+        return {**row,**fields,'reason':reason}
+
+    def case_request(self, caller, args):
+        rid = args.get('request_id')
+        if not isinstance(rid,str) or not re.fullmatch(r'[A-Za-z0-9:._-]{1,128}',rid):
+            raise ToolError('invalid request_id; supply the id from the submit receipt')
+        self.reconcile_request(rid,caller.subject)
+        row,now,floor = self.state.request_snapshot(rid,caller.subject)
+        result = {'found':bool(row),'gateway_time':now,'gc_before':floor,'subject':caller.subject, 'sequence_floor':self.state.sequence_floor(caller.subject,args.get('sequence_scope',caller.subject))}
+        if row:
+            result.update(request_id=rid,state=row['state'],stage=row['stage'],
+                          reached_device=(None if row['state'] in ('received','starting') else bool(row['reached_device'])),
+                          xlsx_sha256=row['xlsx_sha256'] or None,received_at=row['received_at'],
+                          not_after=row['not_after'], not_after_ignored=True, dispatch_sequence=row.get('dispatch_sequence'), sequence_scope=row.get('sequence_scope'))
+            if row['reached_device'] and row['task_id']:
+                result['task_id'] = row['task_id']
+            if row['state'] in ('received','starting'):
+                result['next_action'] = 'admission or runner launch is active; poll case_request with this request_id'
+            elif row['state'] == 'not_started':
+                result['reason'] = 'gateway stopped before runner start; submit a new request_id'
+        return result
+
+    def _request_submit(self, caller, args, tool='case_submit'):
+        payload = SUBMIT_TOOLS[tool]
+        try:
+            rid = args.get('request_id')
+            if 'request_id' not in args:
+                raise ToolError('request_id is required with the dispatch sequence')
+            if not isinstance(rid,str) or not re.fullmatch(r'[A-Za-z0-9:._-]{1,128}',rid):
+                raise ToolError('request_id must contain 1 to 128 ASCII letters, digits or :._-')
+            sequence = args.get('dispatch_sequence')
+            scope = args.get('sequence_scope')
+            if type(sequence) is not int or not 1 <= sequence <= 9007199254740991 or not isinstance(scope,str) or not 1 <= len(scope) <= 128:
+                raise ToolError('dispatch_sequence and sequence_scope are required together with request_id')
+            deadline = args.get('not_after')  # Preserve old bytes; never compare an external timestamp.
+        except (ToolError,ValueError,binascii.Error) as exc:
+            return self._admission_refusal(caller,args,str(exc),tool)
+        module_error = None
+        if tool == 'build_install':
+            module = INSTALL_MODULE
+        else:
+            try:
+                module = framework.safe(args.get('module') or self.cfg.default_module, 'module')
+            except framework.FrameworkError as exc:
+                module, module_error = None, str(exc)
+        decode_error = None
+        try:
+            raw = base64.b64decode(str(args.get(payload) or ''),validate=True)
+            digest = hashlib.sha256(raw).hexdigest()
+        except (ValueError,binascii.Error):
+            digest = ''  # No submitted bytes exist; never present this as their hash.
+            decode_error = f'{payload} is not valid base64; fix the encoding and use a new request_id'
+        with self.state.request_lock(rid):
+            row, fresh = self.state.reserve_request(rid, caller.subject, digest, deadline, admission_error=decode_error or module_error, module=module, dispatch_sequence=sequence, sequence_scope=scope)
+            if row.get('collected'):
+                return {**self._admission_refusal(caller, args, 'request falls within collected history; inspect the original dispatch before using a new request_id', tool), 'request_record': 'collected', 'stage':'collected', 'reached_device':None}
+            if row['holder'] != caller.subject or row['xlsx_sha256'] != digest or row['module'] != module:
+                return self._admission_refusal(caller,args,
+                    'request_id conflicts with an existing request; use a new request_id',tool)
+            if not fresh:
+                return {**self._admission_refusal(caller,args,'request_id already recorded; query case_request, never submit it again',tool), 'request_record':'recorded', 'replayed':True, 'request_id':rid, 'stage':'duplicate', 'reached_device':None if row['state'] in ('received','starting') else bool(row['reached_device'])}
+            self.flush_request_audit()
+            if row['reply']:
+                reply = json.loads(row['reply'])
+            elif decode_error:
+                reply = {'ok':False,'error':decode_error,'stage':'admission','reached_device':False}
+            else:
+                reply = self._invoke(caller,tool,args)
+            if not reply['ok'] and reply.get('stage') == 'admission':
+                self.audit('tool_refused',tool=tool,subject=caller.subject,
+                           request_id=rid,stage='admission',reached_device=False,
+                           reason=reply['error'])
+            reply.update(request_id=rid,request_record='recorded', dispatch_sequence=sequence, sequence_scope=scope, **({'not_after_ignored':True,'not_after':deadline} if 'not_after' in args else {}))
+            marked = (reply['ok'] and reply.get('task_id') and
+                      framework.task_paths(self.cfg,reply['task_id'])['start'].exists())
+            state = ('started' if marked else 'starting') if reply['ok'] else 'rejected'
+            self.state.update_request(rid,reply=json.dumps(reply),state=state,
+                                      stage=reply.get('stage'),reached_device=int(bool(marked)))
+            self.flush_request_audit()
+            return reply
 
     def _lease(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
+        self._set_stage("lease")
         return self.state.check(caller.subject, str(args.get("lease_id") or ""), args.get("token"))
+
+    def _runner_build(self, lease: dict[str, Any]) -> str:
+        """The build the runner is started with: what env_prepare saw the devices report under this lease, else the
+        configured build (a client that never ran env_prepare, or a gateway restarted in between)."""
+        return self._observed_builds.get(lease["lease_id"], self.cfg.build)
 
     def grammar(self) -> dict[str, Any]:
         """自毁规则等文法：跳板机本地文件（hub.grammar_file），由运维随 hub 的规则资产更新，按 mtime 重读。
@@ -249,7 +497,10 @@ class Gateway:
             try:
                 self.credential_literals()
             except (ToolError, OSError):
-                self._literals = (time.monotonic(), frozenset())
+                if cached is None:
+                    raise RedactionUnavailable('no successful framework credential literal scan') from None
+                # Keep its original timestamp: the next call retries rather than caching a failed empty scan.
+
         values = set(self._literals[1] if self._literals else ()) | framework.conf_secrets(self.cfg)
         values.add(framework.mysql_password(self.cfg))
         return tuple(sorted((v for v in values if len(v) >= framework.MIN_SECRET_LEN),
@@ -268,6 +519,7 @@ class Gateway:
 
     def lease_release(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
         self.state.release(caller.subject, str(args.get("lease_id") or ""), args.get("token"))
+        self._observed_builds.pop(str(args.get("lease_id") or ""), None)
         self.audit("lease_released", subject=caller.subject, lease_id=args.get("lease_id"))
         return {"released": True}
 
@@ -281,14 +533,14 @@ class Gateway:
 
     # ── 环境自检 ──────────────────────────────────────────
     def env_prepare(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
-        self._lease(caller, args)
-        # 客户端按哪个构建编的用例：与本床不符就不用往下查了（老客户端不带，照查但注明没核对）
+        # 客户端按哪个构建编的用例：与设备自述的构建不符就不 ready（老客户端不带，照查但注明没核对）。床上装的构建
+        # 以设备自述为准（build_install 之后就变了）；配置的 hub.build 只定框架登录设备用哪一段凭据。
         wanted = args.get("device_build")
         build_checked = wanted not in (None, "")
-        if build_checked and mysql_safe_build(str(wanted)) != self.cfg.build:
-            raise ToolError(f"device_build {str(wanted)!r} is not this bed's build "
-                            f"{self.cfg.build!r}; compile against {self.cfg.build!r} or use the "
-                            "gateway of the bed that runs your build")
+        if build_checked and not mysql_safe_build(str(wanted)):
+            raise ToolError(f"device_build {str(wanted)!r} is not a build name")
+        lease = self._lease(caller, args)
+        self._set_stage('precheck')
         checks: list[dict[str, Any]] = []
 
         def add(key: str, ok: bool, detail: str = "") -> None:
@@ -327,23 +579,38 @@ class Gateway:
         except ToolError as exc:
             add("credential_literals", False, str(exc))
         probe_spec = (grammar.get("bed_probes") or {}).get("build") or {}
+        reported = None
         if ips and probe_spec.get("cmd") and probe_spec.get("extract"):
+            self._set_stage('bed_busy')
             with self.state.bed_lock() as locked:
                 if not locked:
                     add("device_build", False, "bed busy (a run is in progress)")
                 else:
+                    self._set_stage("probe")
                     out = framework.probe(cfg, str(probe_spec["cmd"]), cfg.build, 0)
+                    self._progress.reached |= bool(out.get("reached_device"))
                     match = re.search(str(probe_spec["extract"]), out.get("output") or "")
                     if match is None:
                         add("device_build", False, out.get("error") or "build not found in output")
                     else:
-                        device_build = mysql_safe_build(match.group(1).strip())
-                        add("device_build", device_build == cfg.build,
-                            f"device reports {device_build}, gateway bundle is {cfg.build}")
+                        reported = mysql_safe_build(match.group(1).strip())
+                        family = framework.credential_sections(parser, reported) == \
+                            framework.credential_sections(parser, cfg.build)
+                        asked = not build_checked or mysql_safe_build(str(wanted)) == reported
+                        add("device_build", family and asked,
+                            f"device reports {reported}"
+                            + ("" if family else f", which the framework logs into with other credentials than the "
+                               f"gateway's {cfg.build}")
+                            + ("" if asked else f", not the client's {mysql_safe_build(str(wanted))}"))
+                        if family:
+                            # The runner names its result table after the build the devices run.
+                            self._observed_builds[lease["lease_id"]] = reported
         else:
             add("device_build", False, "no bed_probes.build in the bundle grammar")
         out = {"ready": all(c["ok"] for c in checks), "checks": checks,
-               "build_checked": build_checked, "device_count": len(ips)}
+               "build_checked": build_checked, "device_count": len(ips),
+               **({"device_build": reported} if reported else {}),
+               "stage":self._progress.stage,"reached_device":self._progress.reached}
         # conf 读不到就没有 conf 字段：空数组会冒充“读到了、零台设备”
         if conf is not None:
             out["conf"] = conf
@@ -351,45 +618,113 @@ class Gateway:
 
     # ── 上机 ──────────────────────────────────────────────
     def case_submit(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
-        lease = self._lease(caller, args)
         try:
             data = base64.b64decode(str(args.get("xlsx_b64") or ""), validate=True)
         except (binascii.Error, ValueError):
             raise ToolError("xlsx_b64 is not valid base64") from None
         module = framework.safe(args.get("module") or self.cfg.default_module, "module")
+        lease = self._lease(caller, args)
+        self._set_stage("precheck")
         frozen = gates.freeze(data)
         device_count = len(framework.device_ips(framework.read_conf(self.cfg)))
         gates.check(frozen, grammar=self.grammar(), credential_literals=self.credential_literals(),
                     device_count=device_count)
         submit = framework.safe(frozen.autoids[0], "autoid")
+        self._set_stage("bed_busy")
         fd = self.state.try_bed_lock()
         if fd is None:
             raise ToolError("bed busy: another run or device operation is in progress")
         try:
             # 冻结、取规则、抽凭据字面量可能要几十秒：租约在这期间过期或被接管，就不能再上机
             lease = self._lease(caller, args)
-            staged = framework.stage_case(self.cfg, module, submit, frozen.data, frozen.sha256)
-            task_id = f"cex_{module}_{submit}_{int(time.time() * 1000)}"
+            self._set_stage("staging")
+            task_id = f"cex_{random_secrets.token_hex(16)}"
+            staged = framework.stage_case(self.cfg, module, submit, frozen.data, frozen.sha256, task_id)
             deliver_epoch = time.time()
-            framework.launch_run(self.cfg, task_id, module, submit, self.cfg.build, fd)
+            build = self._runner_build(lease)
+            self.state.record_task(
+                task_id=task_id, lease_id=lease["lease_id"], token=lease["token"],
+                holder=caller.subject, module=module, autoid=submit, build=build,
+                case_ids=list(frozen.autoids), xlsx_sha256=frozen.sha256,
+                staging_dir=staged["staging_dir"], deliver_epoch=deliver_epoch,
+                created_at=time.time(), request_id=args.get("request_id"))
+            if args.get('request_id'):
+                self.flush_request_audit()
+            self._set_stage("launch")
+            framework.launch_run(self.cfg, task_id, module, submit, build, fd)
         finally:
             os.close(fd)
-        self.state.record_task(
-            task_id=task_id, lease_id=lease["lease_id"], token=lease["token"],
-            holder=caller.subject, module=module, autoid=submit, build=self.cfg.build,
-            case_ids=list(frozen.autoids), xlsx_sha256=frozen.sha256,
-            staging_dir=staged["staging_dir"], deliver_epoch=deliver_epoch,
-            created_at=time.time())
         self.audit("case_submitted", subject=caller.subject, task_id=task_id,
                    sha256=frozen.sha256, cases=len(frozen.autoids))
         return {"task_id": task_id, "sha256": frozen.sha256, "bytes": frozen.size,
-                "case_ids": list(frozen.autoids), "deliver_epoch": int(deliver_epoch),
+                "case_ids": list(frozen.autoids), "deliver_epoch": round(deliver_epoch, 6),
                 "submit_autoid": submit, "module": module}
+
+    def build_install(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
+        try:
+            data = base64.b64decode(str(args.get("install_b64") or ""), validate=True)
+            request = json.loads(data.decode("utf-8"))
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            raise ToolError("install_b64 is not base64 of a UTF-8 JSON request") from None
+        if not isinstance(request, dict) or request.get("schema") != INSTALL_SCHEMA \
+                or not {"schema", "build", "image"} <= set(request) <= {"schema", "build", "image", "attempt"}:
+            raise ToolError(f"the install request is {{schema: '{INSTALL_SCHEMA}', build, image}} and an optional attempt")
+        # The issuer dispatches the same bytes once; another try of the same build is a new request with its attempt.
+        attempt = request.get("attempt")
+        if attempt is not None and (type(attempt) is not int or not 1 <= attempt <= 1000):
+            raise ToolError("attempt is which try this is: a whole number from 1 to 1000")
+        build = framework.safe(request["build"], "build")
+        image = str(request["image"])
+        target = framework.image_version(image)
+        if target is None:
+            raise ToolError("image must be an image file name of letters, digits and . _ - ending .click or .array, "
+                            "with a '-' before the build it carries")
+        if target != build.replace("_", "."):
+            raise ToolError(f"image {image} installs {target} (as the upgrade case reads it), not build {build}")
+        digest = hashlib.sha256(data).hexdigest()
+        lease = self._lease(caller, args)
+        self._set_stage("precheck")
+        cases = framework.upgrade_case_files(self.cfg, len(framework.device_ips(framework.read_conf(self.cfg))))
+        stage = framework.stage_request(self.cfg, image)
+        self._set_stage("bed_busy")
+        fd = self.state.try_bed_lock()
+        if fd is None:
+            raise ToolError("bed busy: another run or device operation is in progress")
+        try:
+            lease = self._lease(caller, args)
+            self._set_stage("staging")
+            task_id = f"cex_{random_secrets.token_hex(16)}"
+            staged = framework.stage_install(self.cfg, task_id, data, digest, cases)
+            deliver_epoch = time.time()
+            case_ids = [case for case, _ in cases]
+            runner_build = self._runner_build(lease)
+            self.state.record_task(
+                task_id=task_id, lease_id=lease["lease_id"], token=lease["token"],
+                holder=caller.subject, module=INSTALL_MODULE, autoid=case_ids[0], build=runner_build,
+                case_ids=case_ids, xlsx_sha256=digest, staging_dir=staged["staging_dir"],
+                deliver_epoch=deliver_epoch, created_at=time.time(), request_id=args.get("request_id"))
+            if args.get('request_id'):
+                self.flush_request_audit()
+            self._set_stage("launch")
+            framework.launch_install(self.cfg, task_id, cases, image, runner_build, fd, stage)
+        finally:
+            os.close(fd)
+        self.audit("build_install_submitted", subject=caller.subject, task_id=task_id, sha256=digest,
+                   image=image, cases=len(case_ids))
+        return {"task_id": task_id, "sha256": digest, "bytes": len(data), "case_ids": case_ids,
+                "deliver_epoch": round(deliver_epoch, 6), "submit_autoid": case_ids[0], "module": INSTALL_MODULE,
+                "build": build, "image": image, "target_version": target, "cases": staged["cases"],
+                **({"attempt": attempt} if attempt is not None else {}),
+                "image_staging": ({"host": stage["host"], "dir": stage["dir"], "source": stage["source"]}
+                                  if stage is not None else None)}
 
     def _own_task(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
         task = self.state.task(str(args.get("task_id") or ""))
         if task is None or task["holder"] != caller.subject:
             raise ToolError("unknown task_id (or not yours)")
+        rid = self.state.task_request(task['task_id'])
+        if rid:
+            self.reconcile_request(rid,caller.subject)
         return task
 
     def case_status(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
@@ -401,32 +736,26 @@ class Gateway:
 
     def case_results(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
         task = self._own_task(caller, args)
+        identity = {'task_id':task['task_id'],'request_id':self.state.task_request(task['task_id']),
+                    'ownership':'none', 'complete':False, 'xlsx_sha256':task['xlsx_sha256'],
+                    'submitted_at':datetime.fromtimestamp(round(task['deliver_epoch'], 6), timezone.utc).isoformat(timespec='microseconds')}
         status = framework.read_status(self.cfg, task["task_id"])
         if status.get("state") == "lost":
-            return {"task_id": task["task_id"], "channel": "runner_lost", "state": "lost",
+            return {**identity, "channel": "runner_lost", "state": "lost",
+                    "ownership_reason": "not_determined_runner_lost",
+                    "next_action": "Have the operator recover this task's runner and dispatch evidence before determining report ownership",
                     "rc": None, "explanation": RUNNER_LOST}
         if status.get("state") != "done":
-            return {"task_id": task["task_id"], "channel": "not_completed",
+            return {**identity, "channel": "not_completed",
+                    "ownership_reason": "not_determined_not_completed",
+                    "next_action": "Poll case_status for this task until done or lost, then read case_results",
                     "state": status.get("state", "unknown")}
-        finished = status.get("finished_at")
-        max_epoch = float(finished) + 60 if finished else None
-        # 同一落位目录的下一次投递之后才出现的报告目录属于那次任务：结束后 60 秒的宽限
-        # 挡不住紧接着的下一轮（返工重投常常一两分钟内就到）
-        following = self.state.next_delivery(task["module"], task["autoid"], task["deliver_epoch"])
-        if following is not None:
-            max_epoch = following if max_epoch is None else min(max_epoch, following)
-        run_dir = framework.report_run_dir(
-            self.cfg, task["module"], task["autoid"], task["deliver_epoch"] - 3, max_epoch)
-        # 找不到本次运行的报告目录就没有本次的判定：宁可 not_run，也不借用别的运行留下的行
-        queried = (framework.query_results(self.cfg, task["build"], task["case_ids"],
-                                           run_dir=run_dir)
-                   if run_dir else {"results": {}})
-        # 日志与判定同源：只取本次运行的报告目录；找不到就不给日志，也不借别的运行的
-        logs = (framework.batch_logs(self.cfg, task["module"], task["autoid"],
-                                     task["deliver_epoch"] - 3, run_dir=run_dir)
-                if run_dir else {})
-        base = (framework.run_report_base(self.cfg, task["module"], task["autoid"], run_dir)
-                if run_dir else None)
+        ownership = framework.delivery_report_lookup(self.cfg,task['staging_dir'])
+        base = ownership['base']
+        run_dir = base.relative_to(self.cfg.apv_src / 'report').parts[0] if base else None
+        queried = (framework.query_results(self.cfg,task['build'],task['case_ids'],run_dir=run_dir,
+                    report_path=base.relative_to(self.cfg.apv_src).as_posix()) if base else {'results':{}})
+        logs = framework.delivery_logs(base) if base else {}
         cases = []
         results = queried.get("results") or {}
         for case_id in task["case_ids"]:
@@ -443,12 +772,19 @@ class Gateway:
             channel = "missing_after_done"
         else:
             channel = "ready"
-        return {"task_id": task["task_id"], "channel": channel, "rc": status.get("rc"),
+        complete = (channel == 'ready' and base is not None and bool(cases)
+                    and len(cases) == len(set(task['case_ids']))
+                    and all(str(c['result']).upper() in ('PASS', 'FAIL')
+                            and c['log'] and not c['log_stale'] for c in cases))
+        return {**identity, "complete":bool(complete),
+                "ownership":"staging_directory" if base is not None else "none", "ownership_reason":ownership['reason'], "channel": channel, "rc": status.get("rc"),
                 "xlsx_sha256": task["xlsx_sha256"], "cases": cases, "run_dir": run_dir,
                 "submit_autoid": task["autoid"], "module": task["module"],
                 "report_dir": (base.relative_to(self.cfg.apv_src).as_posix()
                                if base is not None else None),
                 "ignored_rows": queried.get("ignored_rows", 0),
+                **({'next_action':'Inspect this dispatch log, collector layout and owned result-store rows; ask the operator to restore retained evidence or report an ownership capability gap before a new request_id'}
+                   if channel != 'ready' else {}),
                 **({"query_error": queried["error"]} if "error" in queried else {})}
 
     # ── 只读探测 ──────────────────────────────────────────
@@ -462,10 +798,14 @@ class Gateway:
                             "digits, spaces and _ . , : / @ % + = * \" ' -)")
         self._lease(caller, args)
         index = int(args.get("device_index") or 0)
+        self._set_stage('bed_busy')
         with self.state.bed_lock() as locked:
             if not locked:
                 raise ToolError("bed busy: a run is in progress")
+            self._set_stage('probe')
             result = framework.probe(self.cfg, command.strip(), self.cfg.build, index)
+        self._set_stage("probe")
+        self._progress.reached = bool(result.get("reached_device"))
         if "error" in result:
             raise ToolError(f"probe failed: {result['error']}")
         return result
@@ -482,15 +822,21 @@ class Gateway:
                 return {**json.loads(cache.read_text(encoding="utf-8")), **services}
             except (OSError, ValueError):
                 pass
+        def topology_probe(index):
+            self._set_stage('probe')
+            result = framework.probe(self.cfg,'show ip address',self.cfg.build,index)
+            self._progress.reached |= bool(result.get('reached_device'))
+            return result.get('output') or ''
+        self._set_stage('bed_busy')
         with self.state.bed_lock() as locked:
             if not locked:
                 raise ToolError("bed busy: a run is in progress")
+            self._set_stage('probe')
             try:
                 result = bed.collect(
                     self.cfg,
                     hosts=lambda hosts: framework.bed_hosts(self.cfg, hosts),
-                    probe_show_ip=lambda index: framework.probe(
-                        self.cfg, "show ip address", self.cfg.build, index).get("output") or "",
+                    probe_show_ip=topology_probe,
                     reachable=framework.device_reachable)
             except framework.FrameworkError as exc:
                 raise ToolError(str(exc)) from None
@@ -531,10 +877,14 @@ class Gateway:
                             for idx in indices]}
 
     def init_device(self, caller: Caller, args: dict[str, Any]) -> dict[str, Any]:
-        lease = self._lease(caller, args)
         step = args.get("step")
+        if step not in ('prepare', 'confirm'):
+            raise ToolError('step must be prepare or confirm')
+        plan = self._init_plan(args) if step == 'prepare' else None
+        if step == 'confirm' and not args.get('confirmation'):
+            raise ToolError('confirmation is required; call init_device with step=prepare')
+        lease = self._lease(caller, args)
         if step == "prepare":
-            plan = self._init_plan(args)
             code = self.state.new_challenge(caller.subject, lease["lease_id"], plan)
             self.audit("init_prepared", subject=caller.subject,
                        devices=[d["device"] for d in plan["devices"]])
@@ -543,16 +893,20 @@ class Gateway:
                             "init_device with step=confirm and this confirmation code."}
         if step != "confirm":
             raise ToolError("step must be prepare or confirm")
+        self._set_stage('admission')
         plan = self.state.consume_challenge(str(args.get("confirmation") or ""),
                                             caller.subject, lease["lease_id"])
+        self._set_stage('initialization')
         parser = framework.read_conf(self.cfg)
         creds = framework.device_credentials(parser, self.cfg.build)
         results = []
+        self._set_stage('bed_busy')
         with self.state.bed_lock() as locked:
             if not locked:
                 raise ToolError("bed busy: a run is in progress")
             for device in plan["devices"]:
                 argv = [part.format(tty=device["tty"]) for part in self.cfg.console_command]
+                self._set_stage("initialization")
                 outcome = console.init_one(
                     device["device"], console_argv=argv, tty=device["tty"],
                     hostname=creds.get("hostname") or "", user=creds["user"],
@@ -560,12 +914,14 @@ class Gateway:
                     long_commands=self.cfg.init_long_commands,
                     step_timeout=self.cfg.init_step_timeout_s,
                     login_timeout=self.cfg.login_timeout_s)
+                self._set_stage("initialization")
+                self._progress.reached |= outcome.reached_device
                 results.append(outcome.as_dict())
         ok = sum(r["status"] == "ok" for r in results)
         self.audit("init_done", subject=caller.subject, ok=ok, total=len(results),
                    failed=[r["device"] for r in results if r["status"] != "ok"])
         return {"initialized": ok, "failed": len(results) - ok, "total": len(results),
-                "details": results}
+                "details": results,"stage":self._progress.stage,"reached_device":self._progress.reached}
 
 
 def load_gateway(config_path: Path) -> Gateway:

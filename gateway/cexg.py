@@ -25,6 +25,7 @@ if __package__ in (None, ""):
 
 import gateway  # noqa: E402
 from gateway.config import ConfigError, load  # noqa: E402
+from gateway.state import JournalError  # noqa: E402
 
 # 按包的位置找样例：源码运行与 PyInstaller 打包后（数据文件在 _internal/gateway/）都对
 SAMPLE = Path(gateway.__file__).resolve().parent / "gateway.example.toml"
@@ -41,9 +42,20 @@ def cmd_check(config: Path) -> int:
         return 2
     from gateway.auth import check_secret_file
 
-    gateway = Gateway(cfg)
-    checks = []
+    try:
+        gateway = Gateway(cfg)
+    except JournalError as exc:
+        journal = cfg.state_dir.with_name(cfg.state_dir.name + '.request-journal') / 'requests.db'
+        print(json.dumps({"ok": False, "error": str(exc), "checks": [
+            {"check": "request_journal", "ok": False, "path": str(journal), "error": str(exc)}
+        ]}, ensure_ascii=False))
+        return 2
+    checks = [{"check": "request_journal", "ok": True, "path": str(gateway.state.request_db_path)}]
     checks.append({"check": "hub_secret", **check_secret_file(cfg.hub_secret_file)})
+    if cfg.hub_previous_secret_file:
+        checks.append({"check": "hub_previous_secret", **(
+            check_secret_file(cfg.hub_previous_secret_file) if cfg.hub_previous_secret_file.exists()
+            else {"ok": True, "active": False})})
     if cfg.hub_admin_secret_file:
         checks.append({"check": "hub_admin_secret", **check_secret_file(cfg.hub_admin_secret_file)})
     checks.append({"check": "py38", "ok": cfg.py38.is_file()})
@@ -69,10 +81,15 @@ def cmd_serve(config: Path) -> int:
 
     try:
         cfg = load(config)
+        gateway = Gateway(cfg)
     except ConfigError as exc:
         print(f"配置错误：{exc}", file=sys.stderr)
         return 2
-    httpd = build_server(Gateway(cfg))
+    except JournalError as exc:
+        print(f"请求日志错误：{exc}", file=sys.stderr)
+        return 2
+    gateway.flush_request_audit()
+    httpd = build_server(gateway)
     scheme = "https" if cfg.tls_cert else "http"
     print(f"cexg 监听 {scheme}://{cfg.host}:{cfg.port}/mcp", file=sys.stderr)
     try:
@@ -102,19 +119,54 @@ def cmd_gc(config: Path, days: float, apply: bool) -> int:
 
     try:
         plan = prune.run(load(config), days, apply=apply)
-    except (ConfigError, prune.PruneError, OSError) as exc:
+    except (ConfigError, JournalError, prune.PruneError, OSError) as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
         return 2
     print(json.dumps(prune.report(plan, applied=apply), ensure_ascii=False, indent=1))
     return 0
 
 
+def cmd_journal_reset(config: Path, reason: str) -> int:
+    from gateway.state import StateStore, JournalError
+    try:
+        cfg = load(config)
+        identity = StateStore(cfg.state_dir).reset_journal_identity(reason)
+    except (ConfigError, JournalError, OSError) as exc:
+        print(json.dumps({'ok': False, 'error': str(exc)}))
+        return 2
+    print(json.dumps({'ok': True, **identity}))
+    return 0
+
+
+def cmd_journal_gc(config: Path, holder: str, scope: str, through: int, apply: bool) -> int:
+    from gateway.state import StateStore, JournalError
+    try:
+        cfg = load(config)
+        store = StateStore(cfg.state_dir, cfg.lease_ttl_s)
+        with store.bed_lock() as idle:
+            if not idle:
+                raise JournalError('bed busy; reconcile before sequence collection')
+            count = store.gc_requests(through, holder, scope) if apply else store.count_gc_requests(through, holder, scope)
+        print(json.dumps({'ok':True,'requests':count,'through_sequence':through,'applied':apply}))
+        return 0
+    except (ConfigError, JournalError, OSError) as exc:
+        print(json.dumps({'ok':False,'error':str(exc)}))
+        return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="cexg", description="compile-excel 跳板机网关")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("serve", "check", "audit-verify", "gc"):
+    for name in ("serve", "check", "audit-verify", "gc", "journal-reset", "journal-gc"):
         p = sub.add_parser(name)
         p.add_argument("--config", required=True)
+        if name == "journal-reset":
+            p.add_argument("--reason", required=True)
+        if name == 'journal-gc':
+            p.add_argument('--holder', required=True)
+            p.add_argument('--sequence-scope', required=True)
+            p.add_argument('--through-sequence', required=True, type=int)
+            p.add_argument('--apply', action='store_true')
         if name == "gc":
             p.add_argument("--days", type=float, default=30,
                            help="只清最近一次写入早于这么多天前的（默认 30）")
@@ -125,6 +177,10 @@ def main(argv: list[str] | None = None) -> int:
         print(SAMPLE.read_text(encoding="utf-8"))
         return 0
     config = Path(args.config).expanduser()
+    if args.command == 'journal-gc':
+        return cmd_journal_gc(config,args.holder,args.sequence_scope,args.through_sequence,args.apply)
+    if args.command == "journal-reset":
+        return cmd_journal_reset(config, args.reason)
     if args.command == "audit-verify":
         return cmd_audit_verify(config)
     if args.command == "gc":

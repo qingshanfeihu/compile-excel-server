@@ -86,8 +86,11 @@ def test_env_prepare_checks_the_client_build(fake_env, monkeypatch):
     monkeypatch.setattr(framework, "device_reachable", lambda ip, **_: True)
     monkeypatch.setattr(framework, "probe", lambda cfg, cmd, build, idx: {
         "output": f"Software Version : {BUILD}\n"})
+    # The client's build is compared with what the devices report, not with the gateway's configured build.
     wrong = gw.call(ALICE, "env_prepare", {**lease, "device_build": "OTHER_BUILD_9"})
-    assert wrong["ok"] is False and "OTHER_BUILD_9" in wrong["error"] and BUILD in wrong["error"]
+    assert wrong["ok"] and wrong["build_checked"] is True and wrong["ready"] is False, wrong
+    check = next(c for c in wrong["checks"] if c["check"] == "device_build")
+    assert "OTHER_BUILD_9" in check["detail"] and BUILD in check["detail"]
     matched = gw.call(ALICE, "env_prepare", {**lease, "device_build": BUILD})
     assert matched["ok"] and matched["build_checked"] is True and matched["ready"], matched
     legacy = gw.call(ALICE, "env_prepare", lease)
