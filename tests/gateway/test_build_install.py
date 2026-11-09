@@ -105,7 +105,7 @@ def test_a_failed_upgrade_case_reports_fail_with_its_log_and_sessions(fake_env):
     _wait_done(gw, ALICE, submitted["task_id"])
     results = gw.call(ALICE, "case_results", {"task_id": submitted["task_id"]})
     by_case = {case["case_id"]: case for case in results["cases"]}
-    assert by_case["999999990"]["result"] == "PASS" and "sessions" not in by_case["999999990"]
+    assert by_case["999999990"]["result"] == "PASS" and by_case["999999990"]["sessions"] == {}
     assert by_case["999999991"]["result"] == "FAIL" and "end case: 999999991" in by_case["999999991"]["log"]
     assert by_case["999999991"]["sessions"] == {}
     assert folder.is_dir()
