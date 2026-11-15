@@ -47,7 +47,7 @@ def test_missing_prompt_stays_incomplete(monkeypatch):
     out, complete, raw = read(monkeypatch, Channel([b'partial']))
     assert not complete and out == raw == 'partial'
 
-def test_probe_never_enters_configuration_mode(monkeypatch):
+def test_probe_never_enters_configuration_mode_and_sends_no_page_at_the_enable_prompt(monkeypatch):
     import sys
     import types
     ch = Channel([b'SYNTH>'])
@@ -65,9 +65,11 @@ def test_probe_never_enters_configuration_mode(monkeypatch):
     monkeypatch.setattr(agent.time, 'sleep', clock.sleep)
     out = agent.op_probe({'ip':'192.0.2.70','user':'synthetic','passwd':'synthetic','command':'show version'})
     assert calls == ['login']
-    assert not any(s.strip() in ('config terminal','no page','exit') for s in ch.sent)
+    assert ch.sent == ['enable\n', 'no page\n', 'show version\n', ' ']
+    assert not any(s.strip() in ('config terminal', 'exit', 'terminal length 0') for s in ch.sent)
     assert 'raw_output' in out and '--More--' in out['raw_output']
     assert '--More--' not in out['output']
+    assert 'note' not in out and 'truncated' not in out
 
 def test_ansi_prompt_and_pager_keep_wire_bytes(monkeypatch):
     clock = Clock()
@@ -250,7 +252,7 @@ def test_pager_requires_page_data_not_only_an_ansi_reset(monkeypatch):
 def test_probe_does_not_issue_command_after_incomplete_terminal_setup(monkeypatch):
     import sys
     import types
-    for missing in ('banner', 'enable', 'terminal length 0'):
+    for missing in ('banner', 'enable', 'no page'):
         channel = Channel([b'incomplete' if missing == 'banner' else b'SYNTH>'])
         original_send = channel.send
         def send(value):
@@ -363,6 +365,71 @@ def test_probe_pages_the_recorded_pager_shape_without_waiting_for_the_timeout(mo
     monkeypatch.setattr(agent.time, 'monotonic', clock.tick)
     monkeypatch.setattr(agent.time, 'sleep', clock.sleep)
     reply = agent.op_probe({'ip':'192.0.2.70','user':'synthetic','passwd':'synthetic','command':'show version'})
-    assert channel.sent == ['enable\n', 'terminal length 0\n', 'show version\n', ' ']
+    assert channel.sent == ['enable\n', 'no page\n', 'show version\n', ' ']
     assert reply['output'] == 'line one\nline two\nSYNTH#'
-    assert 'truncated' not in reply and clock.now < agent.COMMAND_WAIT_S
+    assert 'truncated' not in reply and 'note' not in reply and clock.now < agent.COMMAND_WAIT_S
+
+
+class Scripted(Channel):
+    """Answers each line sent from a table: line (stripped; ' ' for a page key) -> replies in order, one chunk each."""
+    def __init__(self, replies):
+        Channel.__init__(self, [b'SYNTH>'])
+        self.replies = {key: list(value) for key, value in replies.items()}
+    def send(self, value):
+        self.sent.append(value)
+        queue = self.replies.get(value if value == ' ' else value.strip())
+        self.chunks.append(queue.pop(0) if queue else b'SYNTH#')
+
+
+def run_probe(monkeypatch, replies, command='show version'):
+    import sys
+    import types
+    channel = Scripted(replies)
+    client = types.SimpleNamespace(set_missing_host_key_policy=lambda p: None,
+        connect=lambda **kw: None, invoke_shell=lambda: channel, close=lambda: None)
+    monkeypatch.setitem(sys.modules, 'paramiko', types.SimpleNamespace(SSHClient=lambda: client, AutoAddPolicy=object))
+    clock = Clock()
+    monkeypatch.setattr(agent.time, 'monotonic', clock.tick)
+    monkeypatch.setattr(agent.time, 'sleep', clock.sleep)
+    monkeypatch.setattr(agent, 'COMMAND_WAIT_S', 1)
+    reply = agent.op_probe({'ip':'192.0.2.70','user':'synthetic','passwd':'synthetic','command':command})
+    return reply, channel
+
+
+@pytest.mark.parametrize('answer', [b'no page\r\nSYNTH#', b'no page\r\n\r\nSYNTH#', b'SYNTH#'])
+def test_an_accepted_no_page_is_silent_and_pages_are_not_walked(monkeypatch, answer):
+    reply, channel = run_probe(monkeypatch, {'no page': [answer], 'show version': [b'show version\r\nbuild line\r\nSYNTH#']})
+    assert channel.sent == ['enable\n', 'no page\n', 'show version\n']
+    assert reply['output'] == 'build line\nSYNTH#'
+    assert 'note' not in reply and 'truncated' not in reply and 'error' not in reply
+
+
+@pytest.mark.parametrize('answer', [b'no page\r\n    ^\r\n% Invalid input\r\nSYNTH#', b'no page\r\n^\r\nSYNTH#', b'no page\r\nsome text\r\nSYNTH#'])
+def test_a_rejected_no_page_is_noted_and_pages_are_still_walked(monkeypatch, answer):
+    erase = b'\b' * 10 + b' ' * 10 + b'\b' * 10
+    reply, channel = run_probe(monkeypatch, {'no page': [answer],
+        'show version': [b'show version\r\nline one\r\n --More-- '], ' ': [erase + b'line two\r\nSYNTH#']})
+    assert channel.sent == ['enable\n', 'no page\n', 'show version\n', ' ']
+    assert reply['output'] == 'line one\nline two\nSYNTH#'
+    assert 'paging not switched off' in reply['note'] and 'no device prompt' not in reply['note']
+    assert 'truncated' not in reply and 'error' not in reply and reply['reached_device'] is True
+
+
+def test_no_page_answered_at_a_user_prompt_is_noted(monkeypatch):
+    reply, channel = run_probe(monkeypatch, {'enable': [b'enable\r\nSYNTH>'], '': [b'\r\nSYNTH>'],
+        'no page': [b'no page\r\nSYNTH>'], 'show version': [b'show version\r\nbuild line\r\nSYNTH>']})
+    assert channel.sent == ['enable\n', '\n', 'no page\n', 'show version\n']
+    assert 'paging not switched off' in reply['note'] and reply['output'] == 'build line\nSYNTH>'
+
+
+def test_a_rejected_no_page_and_a_missing_prompt_keep_both_notes(monkeypatch):
+    reply, channel = run_probe(monkeypatch, {'no page': [b'no page\r\n^\r\nSYNTH#'], 'show version': [b'show version\r\nline one\r\n']})
+    assert reply['truncated'] is True
+    assert 'paging not switched off' in reply['note'] and 'no device prompt' in reply['note']
+    assert 'config terminal\n' not in channel.sent and 'exit\n' not in channel.sent
+
+
+def test_a_rejected_no_page_and_a_syntax_error_in_the_command_keep_the_note(monkeypatch):
+    reply, channel = run_probe(monkeypatch, {'no page': [b'no page\r\n^\r\nSYNTH#'], 'show nothing': [b'show nothing\r\n   ^\r\nSYNTH#']},
+                               command='show nothing')
+    assert reply['syntax_error'] is True and 'paging not switched off' in reply['note']

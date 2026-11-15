@@ -26,7 +26,7 @@ _PASSWORD_END = re.compile(r"(?:^|[\r\n])[^\r\n]*assword:?[ \t]*$", re.I)
 # 所以标记前允许空白；锚在缓冲区末尾，输出中间的字面 --More-- 不算。
 _PAGER_LINE = re.compile(r"(?:^|[\r\n])([ \t]*--More--[ \t\b]*)$", re.I)
 _PAGER_WIDTH = len("--More--")
-PROMPT_WAIT_S = 5.0      # 登录后与 enable/terminal length 各等多久提示符
+PROMPT_WAIT_S = 5.0      # 登录后与 enable/no page 各等多久提示符
 COMMAND_WAIT_S = 45.0    # 探测命令本身最多等多久（大输出分好几块到）
 QUIET_S = 0.3            # 看到提示符后再静候这么久没有新数据才算收完
 
@@ -247,6 +247,16 @@ def _probe_wire_capture(chunks):
             "raw_output_base64": base64.b64encode(data).decode("ascii")}
 
 
+def _no_page_accepted(reply, prompt):
+    """An accepted `no page` is answered by its echo and a bare enable prompt ('#'), nothing else.
+
+    Anything more (a caret line, an error text) or a '>' prompt means the device did not take it."""
+    lines = [ln.strip() for ln in reply.splitlines() if ln.strip()]
+    if not lines or not prompt.search("\n" + lines[-1]) or not lines[-1].endswith("#"):
+        return False
+    return all(ln == "no page" for ln in lines[:-1])
+
+
 def op_probe(req):
     import paramiko
 
@@ -256,6 +266,7 @@ def op_probe(req):
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     reached = False
     wire_bytes = []
+    notes = []
     try:
         ssh.connect(hostname=req["ip"], port=22, username=req["user"], password=req["passwd"],
                 timeout=15, look_for_keys=False, allow_agent=False)
@@ -282,10 +293,15 @@ def op_probe(req):
             _, complete = read_until_prompt(chan, prompt, PROMPT_WAIT_S)
             if not complete:
                 raise RuntimeError("terminal enable completion was not observed")
-        chan.send("terminal length 0\n")
-        _, complete = read_until_prompt(chan, prompt, PROMPT_WAIT_S)
+        # 只关本次登录的分页：在 enable 提示符下直接发，不进配置模式、不发 exit（InfoTest 框架同样在
+        # enable 级发 no page）。被拒不算失败：记一条 note，照常按 --More-- 逐页翻读。
+        chan.send("no page\n")
+        paging, complete = read_until_prompt(chan, prompt, PROMPT_WAIT_S)
         if not complete:
             raise RuntimeError("terminal paging setup prompt was not completely observed")
+        if not _no_page_accepted(paging, prompt):
+            notes.append("paging not switched off ('no page' was not accepted); "
+                         "output is read page by page")
         chan.send(cmd + "\n")
         out, complete = read_until_prompt(chan, prompt, COMMAND_WAIT_S, raw_bytes=wire_bytes)
     except Exception as exc:
@@ -304,13 +320,17 @@ def op_probe(req):
         result = {"command": cmd, "syntax_error": True, "reached_device": True,
                   "output": "%% Invalid input: command %r is invalid on this device" % cmd}
         result.update(_probe_wire_capture(wire_bytes))
+        if notes:
+            result["note"] = "; ".join(notes)
         return result
     result = {"command": cmd, "output": "\n".join(lines), "reached_device": True}
     result.update(_probe_wire_capture(wire_bytes))
     if not complete:
         # 等不到设备提示符：输出可能不全，不能当完整回显用
-        result.update(truncated=True, note="no device prompt within %ds; output may be "
-                                           "incomplete" % int(COMMAND_WAIT_S))
+        result["truncated"] = True
+        notes.append("no device prompt within %ds; output may be incomplete" % int(COMMAND_WAIT_S))
+    if notes:
+        result["note"] = "; ".join(notes)
     return result
 
 
