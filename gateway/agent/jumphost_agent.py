@@ -16,6 +16,7 @@ import json
 import re
 import sys
 import time
+import codecs
 
 # 设备提示符：缓冲区最后一行以 # 或 > 结尾（锚在缓冲区末尾，回显中间的 '#' 不算）
 _PROMPT_END = re.compile(r"(?:^|[\r\n])([^\r\n]*?)(?:\([^)\r\n]*\))?[#>][ \t]*$")
@@ -103,29 +104,40 @@ def op_results(req):
     return {"results": results, "ignored_rows": ignored}
 
 
-def read_until_prompt(chan, prompt, timeout, quiet=None):
-    """读到缓冲区末尾是提示符、且 quiet 秒内没有新数据为止；返回 (文本, 是否等到了提示符)。
-
-    旧做法是缓冲区里出现第一个 '#' 就停：回显里有 '#'（注释、配置片段）或分块到达时，
-    输出被悄悄截断。这里只认锚在末尾的提示符，等不到就如实报超时。"""
+def read_until_prompt(chan, prompt, timeout, quiet=None, raw=None):
+    """Read a terminal frame; only a pager at the buffer tail sends a space."""
     quiet = QUIET_S if quiet is None else quiet
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    pager = re.compile(r"(?:^|[\r\n])((?:\x1b\[[0-?]*[ -/]*[@-~])*--More--(?:\x1b\[[0-?]*[ -/]*[@-~]|[ \t\b])*)$", re.I)
     buf = ""
-    end = time.time() + timeout
+    end = time.monotonic() + timeout
     seen_at = None
-    while time.time() < end:
+    while time.monotonic() < end:
         if chan.recv_ready():
             data = chan.recv(65535)
             if not data:
                 break
-            buf += data.decode("utf-8", "replace")
-            seen_at = time.time() if prompt.search(buf) else None
+            text = decoder.decode(data)
+            if raw is not None:
+                raw.append(text)
+            buf += text
+            marker = pager.search(buf)
+            if marker:
+                buf = buf[:marker.start(1)]
+                chan.send(" ")
+                seen_at = None
+                continue
+            seen_at = time.monotonic() if prompt.search(buf) else None
             continue
-        if seen_at is not None and time.time() - seen_at >= quiet:
+        if seen_at is not None and time.monotonic() - seen_at >= quiet:
             return buf, True
         if getattr(chan, "closed", False):
             break
         time.sleep(0.05)
-    return buf, bool(prompt.search(buf))
+    tail = decoder.decode(b"", final=True)
+    if raw is not None:
+        raw.append(tail)
+    return buf + tail, False
 
 
 def op_probe(req):
@@ -159,7 +171,8 @@ def op_probe(req):
         chan.send("terminal length 0\n")
         read_until_prompt(chan, prompt, PROMPT_WAIT_S)
         chan.send(cmd + "\n")
-        out, complete = read_until_prompt(chan, prompt, COMMAND_WAIT_S)
+        wire = []
+        out, complete = read_until_prompt(chan, prompt, COMMAND_WAIT_S, raw=wire)
     except Exception as exc:
         return {"error": "%s: %s" % (type(exc).__name__, exc), "reached_device": reached}
     finally:
@@ -173,7 +186,7 @@ def op_probe(req):
     if core and re.match(r"^\^+$", core):
         return {"command": cmd, "syntax_error": True, "reached_device": True,
                 "output": "%% Invalid input: command %r is invalid on this device" % cmd}
-    result = {"command": cmd, "output": "\n".join(lines), "reached_device": True}
+    result = {"command": cmd, "output": "\n".join(lines), "raw_output": "".join(wire), "reached_device": True}
     if not complete:
         # 等不到设备提示符：输出可能不全，不能当完整回显用
         result.update(truncated=True, note="no device prompt within %ds; output may be "
