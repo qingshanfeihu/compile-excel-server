@@ -600,14 +600,23 @@ def probe(cfg: GatewayConfig, command: str, build: str, device_index: int) -> di
     import uuid
     marker = cfg.state_dir / ('probe-' + uuid.uuid4().hex + '.login')
     try:
-        result = agent_call(cfg, {"op": "probe", "ip": ips[device_index], "user": creds["user"],
-                                  "passwd": creds["passwd"], "command": command,
-                                  "login_marker": str(marker)}, timeout=90)
-        result['reached_device'] = bool(result.get('reached_device')) or marker.exists()
+        reply = agent_call(cfg, {"op": "probe", "ip": ips[device_index], "user": creds["user"],
+                                 "passwd": creds["passwd"], "command": command,
+                                 "login_marker": str(marker)}, timeout=90)
+        # Raw terminal captures are internal: an opaque encoding bypasses text scrubbing.
+        text_fields = ("command", "output", "note", "error", "stderr")
+        flag_fields = ("reached_device", "syntax_error", "truncated")
+        valid = isinstance(reply, dict) and ('output' in reply or 'error' in reply) and all(
+            key not in reply or isinstance(reply[key], str) for key in text_fields
+        ) and all(key not in reply or isinstance(reply[key], bool) for key in flag_fields)
+        if not valid:
+            result = {"error": "agent returned malformed probe fields"}
+        else:
+            result = {key: scrub_text(reply[key]) for key in text_fields if key in reply}
+            result.update({key: reply[key] for key in flag_fields if key in reply})
+        result['reached_device'] = result.get('reached_device') is True or marker.exists()
     finally:
         marker.unlink(missing_ok=True)
-    if "output" in result:
-        result["output"] = scrub_text(result["output"])
     return result
 
 

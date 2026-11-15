@@ -17,6 +17,7 @@ import re
 import sys
 import time
 import codecs
+import base64
 
 # 设备提示符：缓冲区最后一行以 # 或 > 结尾（锚在缓冲区末尾，回显中间的 '#' 不算）
 _PROMPT_END = re.compile(r"(?:^|[\r\n])([^\r\n]*?)(?:\([^)\r\n]*\))?[#>][ \t]*$")
@@ -104,40 +105,130 @@ def op_results(req):
     return {"results": results, "ignored_rows": ignored}
 
 
-def read_until_prompt(chan, prompt, timeout, quiet=None, raw=None):
-    """Read a terminal frame; only a pager at the buffer tail sends a space."""
+class _CsiView(object):
+    """Interpret only complete ANSI CSI controls; keep incomplete ones pending."""
+    def __init__(self):
+        self.phase = "text"
+        self.pending = []
+
+    def feed(self, text):
+        out = []
+        for char in text:
+            if self.phase == "text":
+                if char == "\x1b":
+                    self.pending = [char]
+                    self.phase = "escape"
+                else:
+                    out.append(char)
+                continue
+            if self.phase == "escape" and char == "[":
+                self.pending.append(char)
+                self.phase = "parameter"
+                continue
+            code = ord(char)
+            if self.phase == "parameter" and 0x30 <= code <= 0x3f:
+                self.pending.append(char)
+                continue
+            if self.phase in ("parameter", "intermediate") and 0x20 <= code <= 0x2f:
+                self.pending.append(char)
+                self.phase = "intermediate"
+                continue
+            if self.phase in ("parameter", "intermediate") and 0x40 <= code <= 0x7e:
+                self.pending = []
+                self.phase = "text"
+                continue
+            out.extend(self.pending)
+            self.pending = []
+            self.phase = "text"
+            if char == "\x1b":
+                self.pending = [char]
+                self.phase = "escape"
+            else:
+                out.append(char)
+        return "".join(out)
+
+    def finish(self):
+        remaining = "".join(self.pending)
+        self.pending = []
+        self.phase = "text"
+        return remaining
+
+
+def read_until_prompt(chan, prompt, timeout, quiet=None, raw=None, raw_bytes=None):
+    """Read one frame, preserving wire bytes while interpreting pager controls."""
     quiet = QUIET_S if quiet is None else quiet
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
-    pager = re.compile(r"(?:^|[\r\n])((?:\x1b\[[0-?]*[ -/]*[@-~])*--More--(?:\x1b\[[0-?]*[ -/]*[@-~]|[ \t\b])*)$", re.I)
+    view = _CsiView()
+    pager = re.compile(r"(?:^|[\r\n])(--More--[ \t\b]*)$", re.I)
+    erase_forms = ("\b" * 8 + " " * 8 + "\b" * 8, "\b \b" * 8)
+    erase_pending = ""
+    erase_expected = False
+    awaiting_page = False
     buf = ""
     end = time.monotonic() + timeout
     seen_at = None
+    eof = False
     while time.monotonic() < end:
         if chan.recv_ready():
             data = chan.recv(65535)
             if not data:
+                eof = True
                 break
+            if raw_bytes is not None:
+                raw_bytes.append(data)
             text = decoder.decode(data)
             if raw is not None:
                 raw.append(text)
+            text = view.feed(text)
+            if erase_expected:
+                erase_pending += text
+                matched = next((form for form in erase_forms
+                                if erase_pending.startswith(form)), None)
+                if matched is not None:
+                    text = erase_pending[len(matched):]
+                    erase_pending = ""
+                    erase_expected = False
+                elif any(form.startswith(erase_pending) for form in erase_forms):
+                    continue
+                else:
+                    text = erase_pending
+                    erase_pending = ""
+                    erase_expected = False
+            if text:
+                awaiting_page = False
             buf += text
             marker = pager.search(buf)
             if marker:
                 buf = buf[:marker.start(1)]
                 chan.send(" ")
+                erase_expected = True
+                awaiting_page = True
                 seen_at = None
                 continue
-            seen_at = time.monotonic() if prompt.search(buf) else None
+            ready = not decoder.getstate()[0] and not view.pending and not awaiting_page and prompt.search(buf)
+            seen_at = time.monotonic() if ready else None
             continue
         if seen_at is not None and time.monotonic() - seen_at >= quiet:
             return buf, True
         if getattr(chan, "closed", False):
+            eof = True
             break
         time.sleep(0.05)
+    incomplete_utf8 = bool(decoder.getstate()[0])
     tail = decoder.decode(b"", final=True)
     if raw is not None:
         raw.append(tail)
-    return buf + tail, False
+    incomplete_csi = bool(view.pending)
+    buf += erase_pending + view.feed(tail) + view.finish()
+    complete = eof and not incomplete_utf8 and not incomplete_csi and not awaiting_page and bool(prompt.search(buf))
+    return buf, complete
+
+
+def _probe_wire_capture(chunks):
+    data = b"".join(chunks)
+    return {"raw_output": data.decode("utf-8", "replace"),
+            "raw_output_encoding": "utf-8-replace",
+            "raw_output_base64": base64.b64encode(data).decode("ascii")}
 
 
 def op_probe(req):
@@ -148,6 +239,7 @@ def op_probe(req):
     # 设备常被重装，主机密钥会变；与 InfoTest 现行做法一致
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     reached = False
+    wire_bytes = []
     try:
         ssh.connect(hostname=req["ip"], port=22, username=req["user"], password=req["passwd"],
                 timeout=15, look_for_keys=False, allow_agent=False)
@@ -156,7 +248,9 @@ def op_probe(req):
             with open(req['login_marker'], 'w') as marker:
                 marker.write('logged in')
         chan = ssh.invoke_shell()
-        banner, _ = read_until_prompt(chan, _PROMPT_END, PROMPT_WAIT_S)
+        banner, complete = read_until_prompt(chan, _PROMPT_END, PROMPT_WAIT_S)
+        if not complete:
+            raise RuntimeError("terminal login prompt was not completely observed")
         # 登录后的那一行提示符定下主机名；命令输出要等到“主机名[(模式)]#”出现在末尾才算完
         match = _PROMPT_END.search(banner)
         host = match.group(1).strip() if match and match.group(1).strip() else ""
@@ -164,17 +258,24 @@ def op_probe(req):
             if host else _PROMPT_END
         either = re.compile("|".join((prompt.pattern, _PASSWORD_END.pattern)), re.I)
         chan.send("enable\n")
-        echo, _ = read_until_prompt(chan, either, PROMPT_WAIT_S)
+        echo, complete = read_until_prompt(chan, either, PROMPT_WAIT_S)
+        if not complete:
+            raise RuntimeError("terminal enable prompt was not completely observed")
         if _PASSWORD_END.search(echo) or not re.search(r"#[ \t]*$", echo.rstrip("\r\n")):
             chan.send("\n")
-            read_until_prompt(chan, prompt, PROMPT_WAIT_S)
+            _, complete = read_until_prompt(chan, prompt, PROMPT_WAIT_S)
+            if not complete:
+                raise RuntimeError("terminal enable completion was not observed")
         chan.send("terminal length 0\n")
-        read_until_prompt(chan, prompt, PROMPT_WAIT_S)
+        _, complete = read_until_prompt(chan, prompt, PROMPT_WAIT_S)
+        if not complete:
+            raise RuntimeError("terminal paging setup prompt was not completely observed")
         chan.send(cmd + "\n")
-        wire = []
-        out, complete = read_until_prompt(chan, prompt, COMMAND_WAIT_S, raw=wire)
+        out, complete = read_until_prompt(chan, prompt, COMMAND_WAIT_S, raw_bytes=wire_bytes)
     except Exception as exc:
-        return {"error": "%s: %s" % (type(exc).__name__, exc), "reached_device": reached}
+        result = {"error": "%s: %s" % (type(exc).__name__, exc), "reached_device": reached}
+        result.update(_probe_wire_capture(wire_bytes))
+        return result
     finally:
         ssh.close()
     raw = out.splitlines()
@@ -184,9 +285,12 @@ def op_probe(req):
         tail.pop()
     core = "\n".join(tail).strip()
     if core and re.match(r"^\^+$", core):
-        return {"command": cmd, "syntax_error": True, "reached_device": True,
-                "output": "%% Invalid input: command %r is invalid on this device" % cmd}
-    result = {"command": cmd, "output": "\n".join(lines), "raw_output": "".join(wire), "reached_device": True}
+        result = {"command": cmd, "syntax_error": True, "reached_device": True,
+                  "output": "%% Invalid input: command %r is invalid on this device" % cmd}
+        result.update(_probe_wire_capture(wire_bytes))
+        return result
+    result = {"command": cmd, "output": "\n".join(lines), "reached_device": True}
+    result.update(_probe_wire_capture(wire_bytes))
     if not complete:
         # 等不到设备提示符：输出可能不全，不能当完整回显用
         result.update(truncated=True, note="no device prompt within %ds; output may be "
