@@ -1,5 +1,6 @@
 """Synthetic terminal protocol checks; no SSH client or real device is used."""
 import re
+import pytest
 from gateway.agent import jumphost_agent as agent
 
 class Channel:
@@ -304,3 +305,64 @@ def test_public_probe_scrubs_secret_exception_and_all_text_fields(tmp_path):
     reply.clear()
     reply['raw_output_base64'] = 'opaque-private'
     assert scope['probe'](types.SimpleNamespace(state_dir=tmp_path), 'show version', 'synthetic', 0) == invalid
+
+
+# The pager prompt as the gateway recorded the device drawing it: newline, blank, --More--, blank.
+# The device wipes what it drew before the next page: the width it drew, or the bare marker's 8.
+PAGER_FORMS = [(marker, width, spelling)
+               for marker in (b' --More-- ', b'--More-- ', b' --More--', b'--More--')
+               for width in sorted({8, len(marker)})
+               for spelling in ('backspace-blank-backspace', 'backspace-blank-repeated')]
+
+
+def erase_for(width, spelling):
+    if spelling == 'backspace-blank-backspace':
+        return b'\b' * width + b' ' * width + b'\b' * width
+    return b'\b \b' * width
+
+
+@pytest.mark.parametrize('marker,width,spelling', PAGER_FORMS)
+def test_pager_line_with_blanks_is_paged_and_its_erase_is_not_page_text(monkeypatch, marker, width, spelling):
+    channel = Channel([b'show version\r\nline one\r\n' + marker], [[erase_for(width, spelling) + b'line two\r\nSYNTH#']])
+    out, complete, raw = read(monkeypatch, channel)
+    assert complete and channel.sent == [' ']
+    assert out == 'show version\r\nline one\r\nline two\r\nSYNTH#'
+
+
+def test_recorded_pager_shape_over_two_pages_with_split_chunks(monkeypatch):
+    erase = b'\b' * 10 + b' ' * 10 + b'\b' * 10
+    channel = Channel([b'show version\r\nline one\r\n --Mo', b're-- '],
+                      [[erase[:7], erase[7:] + b'line two\r\n --More-- '], [erase + b'line three\r\nSYNTH#']])
+    out, complete, raw = read(monkeypatch, channel)
+    assert complete and channel.sent == [' ', ' ']
+    assert out == 'show version\r\nline one\r\nline two\r\nline three\r\nSYNTH#'
+
+
+def test_an_indented_marker_inside_a_line_is_not_a_pager(monkeypatch):
+    channel = Channel([b'  --More-- is printed when paging is on\r\nSYNTH#'])
+    out, complete, raw = read(monkeypatch, channel)
+    assert complete and channel.sent == [] and out == raw
+
+
+def test_probe_pages_the_recorded_pager_shape_without_waiting_for_the_timeout(monkeypatch):
+    import sys
+    import types
+    erase = b'\b' * 10 + b' ' * 10 + b'\b' * 10
+    answers = {'show version\n': [b'show version\r\nline one\r\n --More-- '],
+               ' ': [erase + b'line two\r\nSYNTH#']}
+    channel = Channel([b'SYNTH>'])
+    original_send = channel.send
+    def send(value):
+        original_send(value)
+        channel.chunks.extend(answers.get(value, [b'SYNTH#']))
+    channel.send = send
+    client = types.SimpleNamespace(set_missing_host_key_policy=lambda p: None,
+        connect=lambda **kw: None, invoke_shell=lambda: channel, close=lambda: None)
+    monkeypatch.setitem(sys.modules, 'paramiko', types.SimpleNamespace(SSHClient=lambda: client, AutoAddPolicy=object))
+    clock = Clock()
+    monkeypatch.setattr(agent.time, 'monotonic', clock.tick)
+    monkeypatch.setattr(agent.time, 'sleep', clock.sleep)
+    reply = agent.op_probe({'ip':'192.0.2.70','user':'synthetic','passwd':'synthetic','command':'show version'})
+    assert channel.sent == ['enable\n', 'terminal length 0\n', 'show version\n', ' ']
+    assert reply['output'] == 'line one\nline two\nSYNTH#'
+    assert 'truncated' not in reply and clock.now < agent.COMMAND_WAIT_S

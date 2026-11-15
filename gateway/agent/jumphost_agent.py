@@ -22,6 +22,10 @@ import base64
 # 设备提示符：缓冲区最后一行以 # 或 > 结尾（锚在缓冲区末尾，回显中间的 '#' 不算）
 _PROMPT_END = re.compile(r"(?:^|[\r\n])([^\r\n]*?)(?:\([^)\r\n]*\))?[#>][ \t]*$")
 _PASSWORD_END = re.compile(r"(?:^|[\r\n])[^\r\n]*assword:?[ \t]*$", re.I)
+# 分页提示行：设备实际画的是“换行、空格、--More--、空格”（网关留存的真实回答里就是这个形状），
+# 所以标记前允许空白；锚在缓冲区末尾，输出中间的字面 --More-- 不算。
+_PAGER_LINE = re.compile(r"(?:^|[\r\n])([ \t]*--More--[ \t\b]*)$", re.I)
+_PAGER_WIDTH = len("--More--")
 PROMPT_WAIT_S = 5.0      # 登录后与 enable/terminal length 各等多久提示符
 COMMAND_WAIT_S = 45.0    # 探测命令本身最多等多久（大输出分好几块到）
 QUIET_S = 0.3            # 看到提示符后再静候这么久没有新数据才算收完
@@ -154,13 +158,24 @@ class _CsiView(object):
         return remaining
 
 
+def _erase_forms(drawn):
+    """What a pager may send to wipe its prompt before the next page, longest first.
+
+    Two spellings, each for the width the device drew (`drawn`, blanks included) and for the bare
+    marker: w backspaces, w blanks, w backspaces; or w times backspace, blank, backspace."""
+    forms = []
+    for width in sorted({_PAGER_WIDTH, len(drawn)}, reverse=True):
+        forms.append("\b" * width + " " * width + "\b" * width)
+        forms.append("\b \b" * width)
+    return tuple(forms)
+
+
 def read_until_prompt(chan, prompt, timeout, quiet=None, raw=None, raw_bytes=None):
     """Read one frame, preserving wire bytes while interpreting pager controls."""
     quiet = QUIET_S if quiet is None else quiet
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     view = _CsiView()
-    pager = re.compile(r"(?:^|[\r\n])(--More--[ \t\b]*)$", re.I)
-    erase_forms = ("\b" * 8 + " " * 8 + "\b" * 8, "\b \b" * 8)
+    erase_forms = ()
     erase_pending = ""
     erase_expected = False
     awaiting_page = False
@@ -197,8 +212,9 @@ def read_until_prompt(chan, prompt, timeout, quiet=None, raw=None, raw_bytes=Non
             if text:
                 awaiting_page = False
             buf += text
-            marker = pager.search(buf)
+            marker = _PAGER_LINE.search(buf)
             if marker:
+                erase_forms = _erase_forms(marker.group(1).strip("\b"))
                 buf = buf[:marker.start(1)]
                 chan.send(" ")
                 erase_expected = True
