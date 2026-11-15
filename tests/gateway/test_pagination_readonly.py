@@ -67,3 +67,240 @@ def test_probe_never_enters_configuration_mode(monkeypatch):
     assert not any(s.strip() in ('config terminal','no page','exit') for s in ch.sent)
     assert 'raw_output' in out and '--More--' in out['raw_output']
     assert '--More--' not in out['output']
+
+def test_ansi_prompt_and_pager_keep_wire_bytes(monkeypatch):
+    clock = Clock()
+    monkeypatch.setattr(agent.time, 'monotonic', clock.tick)
+    monkeypatch.setattr(agent.time, 'sleep', clock.sleep)
+    chunks = [b'colored\r\n\x1b[7m--More--\x1b[0m']
+    page = [b'next\r\n\x1b[32mSYNTH#\x1b[0m']
+    channel = Channel(chunks, [page])
+    raw_bytes = []
+    out, complete = agent.read_until_prompt(channel, re.compile(r'(?:^|[\r\n])SYNTH#[ \t]*$'), 1, quiet=.1, raw_bytes=raw_bytes)
+    assert complete and out == 'colored\r\nnext\r\nSYNTH#'
+    assert b''.join(raw_bytes) == b''.join(chunks + page)
+    assert channel.sent == [' ']
+
+
+def test_split_pager_erase_is_control_not_next_page_text(monkeypatch):
+    erase = b'\b' * 8 + b' ' * 8 + b'\b' * 8
+    channel = Channel([b'first\r\n--More--'], [[erase[:11], erase[11:] + b'  indented\r\nSYNTH#']])
+    out, complete, raw = read(monkeypatch, channel)
+    assert complete and out == 'first\r\n  indented\r\nSYNTH#'
+    assert erase.decode() in raw
+
+
+def test_eof_after_prompt_proves_end_without_quiet_delay(monkeypatch):
+    channel = Channel([b'complete\r\nSYNTH#', b''])
+    out, complete, raw = read(monkeypatch, channel)
+    assert complete and out == raw == 'complete\r\nSYNTH#'
+
+
+def test_incomplete_utf8_after_prompt_is_not_complete(monkeypatch):
+    channel = Channel([b'not finished\r\nSYNTH#', b'\xe5'])
+    out, complete, raw = read(monkeypatch, channel)
+    assert not complete and out.endswith('\ufffd') and raw.endswith('\ufffd')
+
+def test_split_ansi_marker_and_repeated_backspace_erase(monkeypatch):
+    erase = b'\b \b' * 8
+    channel = Channel([b'first\r\n\x1b[7', b'm--More--\x1b[0m'], [[erase[:4], erase[4:] + b'next\r\nSYNTH#']])
+    out, complete, raw = read(monkeypatch, channel)
+    assert complete and out == 'first\r\nnext\r\nSYNTH#'
+    assert '\x1b[7m--More--\x1b[0m' in raw
+    assert channel.sent == [' ']
+
+
+def test_unanswered_pager_is_incomplete_even_after_an_earlier_prompt(monkeypatch):
+    channel = Channel([b'SYNTH#\r\n--More--', b''])
+    out, complete, raw = read(monkeypatch, channel)
+    assert not complete and channel.sent == [' ']
+    assert out == 'SYNTH#\r\n' and raw.endswith('--More--')
+
+
+def test_deadline_before_quiet_does_not_claim_complete(monkeypatch):
+    clock = Clock()
+    monkeypatch.setattr(agent.time, 'monotonic', clock.tick)
+    monkeypatch.setattr(agent.time, 'sleep', clock.sleep)
+    channel = Channel([b'SYNTH#'])
+    out, complete = agent.read_until_prompt(channel, re.compile(r'(?:^|[\r\n])SYNTH#[ \t]*$'), .05, quiet=.1)
+    assert out == 'SYNTH#' and not complete
+
+
+def test_a_literal_marker_at_a_payload_tail_is_not_a_pager(monkeypatch):
+    channel = Channel([b'documentation --More--', b'\r\nSYNTH#'])
+    out, complete, raw = read(monkeypatch, channel)
+    assert complete and channel.sent == [] and out == raw
+
+
+def test_probe_raw_bytes_are_exact_and_decoded_view_is_labeled(monkeypatch):
+    import base64
+    import sys
+    import types
+    command_wire = b'payload\xff\r\nSYNTH#'
+    channel = Channel([b'SYNTH>'])
+    original_send = channel.send
+    def send(value):
+        original_send(value)
+        channel.chunks.append(command_wire if value == 'show version\n' else b'SYNTH#')
+    channel.send = send
+    client = types.SimpleNamespace(set_missing_host_key_policy=lambda p: None,
+        connect=lambda **kw: None, invoke_shell=lambda: channel, close=lambda: None)
+    monkeypatch.setitem(sys.modules, 'paramiko', types.SimpleNamespace(SSHClient=lambda: client, AutoAddPolicy=object))
+    clock = Clock()
+    monkeypatch.setattr(agent.time, 'monotonic', clock.tick)
+    monkeypatch.setattr(agent.time, 'sleep', clock.sleep)
+    reply = agent.op_probe({'ip':'192.0.2.70','user':'synthetic','passwd':'synthetic','command':'show version'})
+    assert base64.b64decode(reply['raw_output_base64']) == command_wire
+    assert reply['raw_output_encoding'] == 'utf-8-replace'
+    assert '\ufffd' in reply['raw_output']
+
+
+def test_public_probe_boundary_excludes_raw_bytes_text_and_unreviewed_metadata(tmp_path):
+    """Compile the actual boundary function without importing the missing vendor.
+
+    This is a component test of its field selection and scrub invocation, not a
+    substitute for collecting the complete gateway integration suite.
+    """
+    import ast
+    import base64
+    import types
+    from pathlib import Path
+    source = Path(__file__).resolve().parents[2] / 'gateway' / 'framework.py'
+    tree = ast.parse(source.read_text(encoding='utf-8'))
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'probe')
+    future = ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)
+    isolated = ast.fix_missing_locations(ast.Module(body=[future, function], type_ignores=[]))
+    secret = 'password=synthetic-private-secret'
+    scrubbed = []
+    def scrub(text):
+        scrubbed.append(text)
+        return text.replace(secret, 'password=***')
+    raw = {'command':'show version','output':secret,'raw_output':secret,
+           'raw_output_base64':base64.b64encode(secret.encode()).decode(),
+           'raw_output_encoding':'utf-8-replace','raw_output_sha256':'private-hash',
+           'raw_reference':'private-reference','reached_device':True}
+    scope = {'read_conf':lambda cfg: None,'device_ips':lambda parser: ['192.0.2.70'],
+             'device_credentials':lambda parser, build: {'user':'synthetic','passwd':'synthetic'},
+             'agent_call':lambda *args, **kw: raw,'scrub_text':scrub,'FrameworkError':RuntimeError}
+    exec(compile(isolated, str(source), 'exec'), scope)
+    reply = scope['probe'](types.SimpleNamespace(state_dir=tmp_path), 'show version', 'synthetic', 0)
+    assert reply == {'command':'show version','output':'password=***','reached_device':True}
+    assert scrubbed == ['show version', secret]
+    assert raw['output'] == secret
+
+
+def test_probe_keeps_received_prefix_on_transport_error(monkeypatch):
+    import base64
+    import sys
+    import types
+    prefix = b'partial\xe5'
+    channel = Channel([b'SYNTH>'])
+    original_send = channel.send
+    original_recv = channel.recv
+    in_command = [False]
+    def send(value):
+        original_send(value)
+        in_command[0] = value == 'show version\n'
+        channel.chunks.append(prefix if in_command[0] else b'SYNTH#')
+    def recv(size):
+        data = original_recv(size)
+        if data == prefix:
+            channel.chunks.append(None)
+        elif data is None:
+            raise OSError('synthetic receive failure')
+        return data
+    channel.send = send
+    channel.recv = recv
+    client = types.SimpleNamespace(set_missing_host_key_policy=lambda p: None,
+        connect=lambda **kw: None, invoke_shell=lambda: channel, close=lambda: None)
+    monkeypatch.setitem(sys.modules, 'paramiko', types.SimpleNamespace(SSHClient=lambda: client, AutoAddPolicy=object))
+    clock = Clock()
+    monkeypatch.setattr(agent.time, 'monotonic', clock.tick)
+    monkeypatch.setattr(agent.time, 'sleep', clock.sleep)
+    reply = agent.op_probe({'ip':'192.0.2.70','user':'synthetic','passwd':'synthetic','command':'show version'})
+    assert 'error' in reply and reply['reached_device'] is True
+    assert base64.b64decode(reply['raw_output_base64']) == prefix
+    assert reply['raw_output'] == 'partial\ufffd'
+
+
+def test_failed_login_is_not_retried(monkeypatch):
+    import sys
+    import types
+    calls = []
+    def connect(**kwargs):
+        calls.append('login')
+        raise RuntimeError('password=synthetic-private-secret')
+    client = types.SimpleNamespace(set_missing_host_key_policy=lambda p: None,
+        connect=connect, invoke_shell=lambda: calls.append('shell'), close=lambda: calls.append('close'))
+    monkeypatch.setitem(sys.modules, 'paramiko', types.SimpleNamespace(SSHClient=lambda: client, AutoAddPolicy=object))
+    reply = agent.op_probe({'ip':'192.0.2.70','user':'synthetic','passwd':'synthetic','command':'show version'})
+    assert calls == ['login', 'close']
+    assert reply['reached_device'] is False and 'error' in reply
+    assert 'password=synthetic-private-secret' in reply['error']
+    assert reply['raw_output_base64'] == ''
+
+
+def test_pager_requires_page_data_not_only_an_ansi_reset(monkeypatch):
+    channel = Channel([b'SYNTH#\n--More--'], [[b'\x1b[0m', b'']])
+    out, complete, raw = read(monkeypatch, channel)
+    assert not complete and channel.sent == [' ']
+
+
+def test_probe_does_not_issue_command_after_incomplete_terminal_setup(monkeypatch):
+    import sys
+    import types
+    for missing in ('banner', 'enable', 'terminal length 0'):
+        channel = Channel([b'incomplete' if missing == 'banner' else b'SYNTH>'])
+        original_send = channel.send
+        def send(value):
+            original_send(value)
+            channel.chunks.append(b'incomplete' if value.strip() == missing else b'SYNTH#')
+        channel.send = send
+        client = types.SimpleNamespace(set_missing_host_key_policy=lambda p: None,
+            connect=lambda **kw: None, invoke_shell=lambda: channel, close=lambda: None)
+        monkeypatch.setitem(sys.modules, 'paramiko', types.SimpleNamespace(SSHClient=lambda: client, AutoAddPolicy=object))
+        clock = Clock()
+        monkeypatch.setattr(agent.time, 'monotonic', clock.tick)
+        monkeypatch.setattr(agent.time, 'sleep', clock.sleep)
+        monkeypatch.setattr(agent, 'PROMPT_WAIT_S', .2)
+        monkeypatch.setattr(agent, 'QUIET_S', .05)
+        reply = agent.op_probe({'ip':'192.0.2.70','user':'synthetic','passwd':'synthetic','command':'show version'})
+        assert 'error' in reply, missing
+        assert 'show version\n' not in channel.sent, missing
+        assert reply['reached_device'] is True
+
+
+
+def test_public_probe_scrubs_secret_exception_and_all_text_fields(tmp_path):
+    import ast
+    import types
+    from pathlib import Path
+    source = Path(__file__).resolve().parents[2] / 'gateway' / 'framework.py'
+    tree = ast.parse(source.read_text(encoding='utf-8'))
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'probe')
+    future = ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)
+    isolated = ast.fix_missing_locations(ast.Module(body=[future, function], type_ignores=[]))
+    secret = 'password=synthetic-private-secret'
+    reply = {'command':'show version','output':secret,'error':'RuntimeError: ' + secret,
+             'note':secret,'stderr':secret,'raw_output':secret,'raw_output_base64':'opaque-private',
+             'raw_output_sha256':'private-hash','raw_reference':'private-ref','reached_device':True}
+    seen = []
+    def scrub(text):
+        seen.append(text)
+        return text.replace(secret, 'password=***')
+    scope = {'read_conf':lambda cfg: None,'device_ips':lambda parser: ['192.0.2.70'],
+             'device_credentials':lambda parser, build: {'user':'synthetic','passwd':'synthetic'},
+             'agent_call':lambda *args, **kw: reply,'scrub_text':scrub,'FrameworkError':RuntimeError}
+    exec(compile(isolated, str(source), 'exec'), scope)
+    public = scope['probe'](types.SimpleNamespace(state_dir=tmp_path), 'show version', 'synthetic', 0)
+    assert public['error'] == 'RuntimeError: password=***'
+    assert public['note'] == public['output'] == public['stderr'] == 'password=***'
+    assert set(public) == {'command','output','error','note','stderr','reached_device'}
+    assert seen == ['show version', secret, secret, 'RuntimeError: ' + secret, secret]
+    # A malformed flag must not disclose its string or be coerced into a confirmed login.
+    reply['reached_device'] = secret
+    invalid = scope['probe'](types.SimpleNamespace(state_dir=tmp_path), 'show version', 'synthetic', 0)
+    assert invalid == {'error':'agent returned malformed probe fields','reached_device':False}
+    reply.clear()
+    reply['raw_output_base64'] = 'opaque-private'
+    assert scope['probe'](types.SimpleNamespace(state_dir=tmp_path), 'show version', 'synthetic', 0) == invalid
