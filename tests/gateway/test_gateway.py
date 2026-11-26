@@ -491,7 +491,7 @@ def test_env_prepare_omits_conf_when_it_cannot_be_read(fake_env):
     assert out["ready"] is False
 
 
-def test_results_name_the_run_and_carry_sessions_of_cases_that_did_not_pass(fake_env, tmp_path):
+def test_results_name_the_run_and_carry_the_sessions_of_every_case(fake_env, tmp_path):
     gw, apv = fake_env["gateway"], fake_env["apv"]
     a, b = "202610080000000011", "202610080000000012"
     (apv / "fake_verdicts.json").write_text(json.dumps({b: "FAIL"}), encoding="utf-8")
@@ -506,6 +506,6 @@ def test_results_name_the_run_and_carry_sessions_of_cases_that_did_not_pass(fake
     assert out["report_dir"].startswith(f"report/{out['run_dir']}/")
     assert out["report_dir"].endswith(f"ist_staging_sdns/{a}/test_xlsx/case.xlsx")
     cases = {c["case_id"]: c for c in out["cases"]}
-    assert "sessions" not in cases[a], "a pass carries no session dumps"
+    assert cases[a]["sessions"] == {"apv_192.0.2.10.txt": f"APV(config)#show sdns node\nnode1 {a} {submitted['task_id']}\n"}, "a pass carries its session dumps too"
     assert cases[b]["sessions"] == {"apv_192.0.2.10.txt": f"APV(config)#show sdns node\nnode1 {b} {submitted['task_id']}\n"}
     assert "######################      FAIL      ####################" in cases[b]["log"]

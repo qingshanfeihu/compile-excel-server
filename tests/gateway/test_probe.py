@@ -32,8 +32,8 @@ class FakeChan:
 
 
 def _probe(monkeypatch, output_chunks, command="show running-config"):
-    chan = FakeChan({"enable": ["enable\r\n", "APV#"], "terminal length 0":
-                     ["terminal length 0\r\nAPV#"], command: output_chunks})
+    chan = FakeChan({"enable": ["enable\r\n", "APV#"], "no page":
+                     ["no page\r\nAPV#"], command: output_chunks})
     client = types.SimpleNamespace(set_missing_host_key_policy=lambda policy: None,
                                    connect=lambda **kw: None, invoke_shell=lambda: chan,
                                    close=lambda: None)

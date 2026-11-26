@@ -762,8 +762,9 @@ class Gateway:
             log = logs.get(case_id) or {}
             case = {"case_id": case_id, "result": results.get(case_id),
                     "log_stale": bool(log.get("stale")), "log": log.get("log", "")}
-            # 归因要看设备当时回了什么：没过的案带上本次运行里它的设备会话与触发机会话
-            if base is not None and str(case["result"] or "").lower() != "pass":
+            # 归因要看设备当时回了什么：每个案都带上本次运行里它的设备会话与触发机会话。通过的案也带
+            # （0.4.7）：框架日志只记发出的命令，核验方要从会话里看“通过”是否建立在被设备拒绝的命令上
+            if base is not None:
                 case["sessions"] = framework.case_sessions(base, case_id)
             cases.append(case)
         if "error" in queried:
